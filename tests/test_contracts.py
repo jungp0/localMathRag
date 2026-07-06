@@ -67,6 +67,8 @@ def test_object_service_imports() -> None:
     assert "qwen3-embedding-06b" in text
     assert "qwen3-reranker-06b" in text
     assert "qwen3-vl-8b-instruct" in text
+    assert "runtime_model_name" in text
+    assert '"/models/Qwen3-8B-Q4_K_M.gguf"' in text
 
 
 def test_windows_launcher_exists() -> None:
@@ -131,6 +133,13 @@ def test_ragflow_patch_workflow_exists() -> None:
     assert "Discord" in patch_text
     assert "/v1/models/local" in patch_text
     assert "OpenAiAPICompatible" in patch_text
+    assert "_check_local_chat_completion" in patch_text
+
+
+def test_docker_compose_mounts_ragflow_backend_overrides() -> None:
+    compose = read_text(ROOT / "docker" / "docker-compose.localmathrag.yml")
+    assert "provider_api_service.py:/ragflow/api/apps/services/provider_api_service.py:ro" in compose
+    assert "llm_app.py:/ragflow/api/apps/llm_app.py:ro" in compose
 
 
 def test_agent_rules_document_root_resolution() -> None:
@@ -153,6 +162,7 @@ def main() -> None:
     test_object_service_imports()
     test_windows_launcher_exists()
     test_ragflow_patch_workflow_exists()
+    test_docker_compose_mounts_ragflow_backend_overrides()
     print("contract checks passed")
 
 

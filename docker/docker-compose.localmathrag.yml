@@ -3,6 +3,8 @@ services:
     volumes:
       - ${LOCALMATHRAG_ROOT}/extensions/local_math_rag:/localmathrag/extensions/local_math_rag:ro
       - ${LOCALMATHRAG_ROOT}/data/models:/localmathrag/models:ro
+      - ${LOCALMATHRAG_ROOT}/third_party/ragflow/api/apps/services/provider_api_service.py:/ragflow/api/apps/services/provider_api_service.py:ro
+      - ${LOCALMATHRAG_ROOT}/third_party/ragflow/api/apps/llm_app.py:/ragflow/api/apps/llm_app.py:ro
     environment:
       LOCALMATHRAG_OBJECT_SERVICE_URL: http://localmathrag-object-service:8088
       LOCALMATHRAG_EXTENSION_DIR: /localmathrag/extensions/local_math_rag
@@ -12,6 +14,8 @@ services:
     volumes:
       - ${LOCALMATHRAG_ROOT}/extensions/local_math_rag:/localmathrag/extensions/local_math_rag:ro
       - ${LOCALMATHRAG_ROOT}/data/models:/localmathrag/models:ro
+      - ${LOCALMATHRAG_ROOT}/third_party/ragflow/api/apps/services/provider_api_service.py:/ragflow/api/apps/services/provider_api_service.py:ro
+      - ${LOCALMATHRAG_ROOT}/third_party/ragflow/api/apps/llm_app.py:/ragflow/api/apps/llm_app.py:ro
     environment:
       LOCALMATHRAG_OBJECT_SERVICE_URL: http://localmathrag-object-service:8088
       LOCALMATHRAG_EXTENSION_DIR: /localmathrag/extensions/local_math_rag

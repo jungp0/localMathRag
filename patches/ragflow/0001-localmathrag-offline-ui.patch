@@ -1,3 +1,160 @@
+diff --git a/api/apps/llm_app.py b/api/apps/llm_app.py
+index 690d54b..4c387aa 100644
+--- a/api/apps/llm_app.py
++++ b/api/apps/llm_app.py
+@@ -44,6 +44,34 @@ def _resolve_my_llm_is_tools(o_dict: dict) -> bool:
+         return False
+ 
+ 
++def _is_local_openai_compatible(factory: str, base_url: str | None) -> bool:
++    if factory not in {"OpenAI-API-Compatible", "VLLM", "LM-Studio"}:
++        return False
++    normalized = (base_url or "").lower()
++    return any(
++        marker in normalized
++        for marker in (
++            "127.0.0.1",
++            "localhost",
++            "host.docker.internal",
++            "localmathrag",
++            "llama",
++        )
++    )
++
++
++def _check_local_chat_completion(mdl) -> bool:
++    response = mdl.client.chat.completions.create(
++        model=mdl.model_name,
++        messages=[{"role": "user", "content": "Hi"}],
++        temperature=0,
++        max_completion_tokens=1,
++        stream=False,
++        extra_body={"enable_thinking": False},
++    )
++    return bool(getattr(response, "choices", None))
++
++
+ @manager.route("/factories", methods=["GET"])  # noqa: F821
+ @login_required
+ def factories():
+@@ -111,6 +139,18 @@ async def set_api_key():
+             assert factory in ChatModel, f"Chat model from {factory} is not supported yet."
+             mdl = ChatModel[factory](req["api_key"], llm.llm_name, base_url=base_url, **extra)
+             try:
++                if _is_local_openai_compatible(factory, base_url):
++                    local_timeout = max(timeout_seconds, int(os.environ.get("LOCAL_LLM_VERIFY_TIMEOUT_SECONDS", 60)))
++                    result = await asyncio.wait_for(
++                        asyncio.to_thread(_check_local_chat_completion, mdl),
++                        timeout=local_timeout,
++                    )
++                    if result:
++                        chat_passed = True
++                    else:
++                        raise Exception("No valid response received")
++                    continue
++
+                 async def check_streamly():
+                     async for chunk in mdl.async_chat_streamly(
+                         None,
+@@ -335,19 +375,28 @@ async def add_llm():
+                 **extra,
+             )
+             try:
+-                async def check_streamly():
+-                    async for chunk in mdl.async_chat_streamly(
+-                        None,
+-                        [{"role": "user", "content": "Hi"}],
+-                        {"temperature": 0.9},
+-                    ):
+-                        if chunk and isinstance(chunk, str) and chunk.find("**ERROR**:") < 0:
+-                            return True
+-                    return False
+-
+-                result = await asyncio.wait_for(check_streamly(), timeout=timeout_seconds)
+-                if not result:
+-                    raise Exception("No valid response received")
++                if _is_local_openai_compatible(factory, model_base_url):
++                    local_timeout = max(timeout_seconds, int(os.environ.get("LOCAL_LLM_VERIFY_TIMEOUT_SECONDS", 60)))
++                    result = await asyncio.wait_for(
++                        asyncio.to_thread(_check_local_chat_completion, mdl),
++                        timeout=local_timeout,
++                    )
++                    if not result:
++                        raise Exception("No valid response received")
++                else:
++                    async def check_streamly():
++                        async for chunk in mdl.async_chat_streamly(
++                            None,
++                            [{"role": "user", "content": "Hi"}],
++                            {"temperature": 0.9},
++                        ):
++                            if chunk and isinstance(chunk, str) and chunk.find("**ERROR**:") < 0:
++                                return True
++                        return False
++
++                    result = await asyncio.wait_for(check_streamly(), timeout=timeout_seconds)
++                    if not result:
++                        raise Exception("No valid response received")
+             except Exception as e:
+                 msg += f"\nFail to access model({factory}/{mdl_nm})." + str(e)
+ 
+diff --git a/api/apps/services/provider_api_service.py b/api/apps/services/provider_api_service.py
+index 795885d..20f2179 100644
+--- a/api/apps/services/provider_api_service.py
++++ b/api/apps/services/provider_api_service.py
+@@ -42,6 +42,34 @@ def _factory_model_types(llm: dict) -> list[str]:
+     return [model_type] if model_type else []
+ 
+ 
++def _is_local_openai_compatible(provider_name: str, base_url: str | None) -> bool:
++    if provider_name not in {"OpenAI-API-Compatible", "VLLM", "LM-Studio"}:
++        return False
++    normalized = (base_url or "").lower()
++    return any(
++        marker in normalized
++        for marker in (
++            "127.0.0.1",
++            "localhost",
++            "host.docker.internal",
++            "localmathrag",
++            "llama",
++        )
++    )
++
++
++def _check_local_chat_completion(mdl) -> bool:
++    response = mdl.client.chat.completions.create(
++        model=mdl.model_name,
++        messages=[{"role": "user", "content": "Hi"}],
++        temperature=0,
++        max_completion_tokens=1,
++        stream=False,
++        extra_body={"enable_thinking": False},
++    )
++    return bool(getattr(response, "choices", None))
++
++
+ def _normalize_provider_base_url(provider_name: str, base_url: str | None):
+     if provider_name != "VLLM" or not base_url:
+         return base_url
+@@ -459,6 +487,17 @@ async def verify_api_key(provider_id_or_name: str, api_key: str | dict, base_url
+             assert provider_name in ChatModel, f"Chat model from {provider_name} is not supported yet."
+             mdl = ChatModel[provider_name](api_key_str, llm["llm_name"], base_url=base_url, **extra)
+             try:
++                if _is_local_openai_compatible(provider_name, base_url):
++                    local_timeout = max(timeout_seconds, int(os.environ.get("LOCAL_LLM_VERIFY_TIMEOUT_SECONDS", 60)))
++                    result = await asyncio.wait_for(
++                        asyncio.to_thread(_check_local_chat_completion, mdl),
++                        timeout=local_timeout,
++                    )
++                    if result:
++                        chat_passed = True
++                    else:
++                        raise Exception("No valid response received")
++                    continue
+ 
+                 async def check_streamly():
+                     async for chunk in mdl.async_chat_streamly(
 diff --git a/web/package.json b/web/package.json
 index 8a74385..f9a1e52 100644
 --- a/web/package.json
@@ -427,7 +584,7 @@ index 2d0d06b..f58171b 100644
      <>
        <Spotlight opcity={0.4} coverage={60} color={'rgb(128, 255, 248)'} />
 diff --git a/web/src/pages/user-setting/setting-model/components/un-add-model.tsx b/web/src/pages/user-setting/setting-model/components/un-add-model.tsx
-index 1039c7c..e27dee8 100644
+index 1039c7c..5a7641e 100644
 --- a/web/src/pages/user-setting/setting-model/components/un-add-model.tsx
 +++ b/web/src/pages/user-setting/setting-model/components/un-add-model.tsx
 @@ -1,12 +1,17 @@
@@ -454,7 +611,7 @@ index 1039c7c..e27dee8 100644
  
  export const mapModelKey = {
    image2text: 'VLM',
-@@ -20,83 +25,243 @@ export const mapModelKey = {
+@@ -20,83 +25,245 @@ export const mapModelKey = {
    ocr: 'OCR',
  };
  
@@ -494,6 +651,7 @@ index 1039c7c..e27dee8 100644
 -  );
 +type LocalModel = {
 +  name: string;
++  runtime_model_name?: string;
 +  file_name: string;
 +  path: string;
 +  relative_path: string;
@@ -509,6 +667,7 @@ index 1039c7c..e27dee8 100644
 +type RecommendedModel = {
 +  id: string;
 +  name: string;
++  runtime_model_name?: string;
 +  file_name: string;
 +  repo: string;
 +  url: string;
@@ -543,13 +702,13 @@ index 1039c7c..e27dee8 100644
 +const makeDefaults = (
 +  model: Pick<
 +    LocalModel | RecommendedModel,
-+    'name' | 'base_url' | 'model_type' | 'max_tokens'
++    'name' | 'runtime_model_name' | 'base_url' | 'model_type' | 'max_tokens'
 +  >,
 +): LocalModelDefaults => {
 +  const primaryType = getPrimaryType(model);
 +  return {
 +    instance_name: instanceNameByType[primaryType],
-+    model_name: model.name,
++    model_name: model.runtime_model_name || model.name,
 +    model_type: model.model_type,
 +    base_url: model.base_url,
 +    api_key: 'local',
@@ -764,7 +923,7 @@ index 1039c7c..e27dee8 100644
    };
  
    return (
-@@ -104,112 +269,193 @@ export const AvailableModels: FC<{
+@@ -104,112 +271,193 @@ export const AvailableModels: FC<{
        className="text-text-primary h-full flex flex-col"
        data-testid="available-models-section"
      >

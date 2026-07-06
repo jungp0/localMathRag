@@ -26,6 +26,7 @@ RECOMMENDED_MODELS = [
         "id": "qwen3-8b-q4-k-m",
         "name": "Qwen3-8B Q4_K_M",
         "file_name": "Qwen3-8B-Q4_K_M.gguf",
+        "runtime_model_name": "/models/Qwen3-8B-Q4_K_M.gguf",
         "repo": "Qwen/Qwen3-8B-GGUF",
         "url": "https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf",
         "model_type": ["chat"],
@@ -40,6 +41,7 @@ RECOMMENDED_MODELS = [
         "id": "qwen3-4b-q4-k-m",
         "name": "Qwen3-4B Q4_K_M",
         "file_name": "Qwen3-4B-Q4_K_M.gguf",
+        "runtime_model_name": "/models/Qwen3-4B-Q4_K_M.gguf",
         "repo": "Qwen/Qwen3-4B-GGUF",
         "url": "https://huggingface.co/Qwen/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf",
         "model_type": ["chat"],
@@ -261,8 +263,12 @@ def _llama_endpoint_status(timeout: float = 1.5) -> dict[str, Any]:
 def _model_payload(path: Path) -> dict[str, Any]:
     stat = path.stat()
     model_type = _infer_model_type(path)
+    runtime_model_name = path.stem
+    if path.suffix.lower() == ".gguf" and model_type[0] == "chat":
+        runtime_model_name = f"/models/{path.name}"
     return {
         "name": path.stem,
+        "runtime_model_name": runtime_model_name,
         "file_name": path.name,
         "path": str(path),
         "relative_path": str(path.relative_to(MODEL_DIR)),
