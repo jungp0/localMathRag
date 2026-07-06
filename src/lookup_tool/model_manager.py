@@ -16,15 +16,18 @@ DEFAULT_MODEL_URL = (
 
 
 def model_status(settings: dict[str, Any]) -> dict[str, Any]:
-    local_path = Path(str(settings.get("local_model_path") or ""))
+    local_path_raw = str(settings.get("local_model_path") or "").strip()
+    local_path = Path(local_path_raw) if local_path_raw else None
     base_url = str(settings.get("base_url") or "").rstrip("/")
+    installed_llama = find_installed_llama_server(settings)
     return {
         "settings": settings,
-        "local_model_exists": local_path.exists() if str(local_path) else False,
-        "local_model_path": str(local_path) if str(local_path) else None,
-        "local_model_size": local_path.stat().st_size if local_path.exists() else 0,
+        "local_model_exists": local_path.exists() if local_path else False,
+        "local_model_path": str(local_path) if local_path else None,
+        "local_model_size": local_path.stat().st_size if local_path and local_path.exists() else 0,
         "ollama_available": shutil.which("ollama") is not None,
-        "llama_available": shutil.which("llama") is not None or shutil.which("llama-server") is not None,
+        "llama_available": shutil.which("llama") is not None or shutil.which("llama-server") is not None or installed_llama is not None,
+        "llama_server_path": str(installed_llama) if installed_llama else None,
         "endpoint_ok": endpoint_ok(base_url),
         "available_ollama_models": list_ollama_models() if shutil.which("ollama") else [],
     }
@@ -40,6 +43,29 @@ def endpoint_ok(base_url: str) -> bool:
             return 200 <= response.status < 300
     except (OSError, URLError, TimeoutError):
         return False
+
+
+def find_installed_llama_server(settings: dict[str, Any]) -> Path | None:
+    configured_raw = str(settings.get("llama_server_path") or "").strip()
+    if configured_raw:
+        configured = Path(configured_raw)
+        if configured.exists():
+            return configured
+    search_roots: list[Path] = []
+    local_models_dir_raw = str(settings.get("local_models_dir") or "").strip()
+    local_model_path_raw = str(settings.get("local_model_path") or "").strip()
+    if local_models_dir_raw:
+        search_roots.append(Path(local_models_dir_raw).parent / "runtime" / "llama.cpp")
+    if local_model_path_raw:
+        search_roots.append(Path(local_model_path_raw).parent.parent / "runtime" / "llama.cpp")
+    search_roots.append(Path.cwd() / "data" / "runtime" / "llama.cpp")
+    for root in search_roots:
+        if not root.exists():
+            continue
+        found = sorted(root.glob("**/llama-server.exe"), key=lambda item: item.stat().st_mtime, reverse=True)
+        if found:
+            return found[0]
+    return None
 
 
 def list_ollama_models() -> list[str]:
@@ -102,6 +128,7 @@ def settings_from_request(payload: dict[str, Any]) -> dict[str, Any]:
         "timeout_seconds",
         "local_models_dir",
         "local_model_path",
+        "llama_server_path",
         "recommended_repo",
         "recommended_file",
     }
