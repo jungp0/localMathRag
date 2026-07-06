@@ -53,13 +53,25 @@ def test_windows_launcher_exists() -> None:
     project = ROOT / "launcher" / "LocalMathRAGFlow" / "LocalMathRAGFlow.csproj"
     program = ROOT / "launcher" / "LocalMathRAGFlow" / "Program.cs"
     build_script = ROOT / "scripts" / "build-launcher.ps1"
+    icon = ROOT / "launcher" / "LocalMathRAGFlow" / "Assets" / "ragflow.ico"
     assert project.exists()
     assert program.exists()
     assert build_script.exists()
-    assert "UseWindowsForms" in read_text(project)
+    assert icon.exists()
+    project_text = read_text(project)
+    assert "UseWindowsForms" in project_text
+    assert "ApplicationIcon" in project_text
     program_text = read_text(program)
     assert "StartDockerDesktop" in program_text
+    assert "TryBuildAutoLoginUrlAsync" in program_text
+    assert "EncryptRagflowPassword" in program_text
+    assert "ModernMenuRenderer" in program_text
+    assert "MenuGlyph" in program_text
     assert "installedRoot" in program_text
+    assert "HandleComposeOutput" in program_text
+    assert "downloading Docker images" in program_text
+    assert "WaitForHttpOkAsync" in program_text
+    assert "waiting for RAGFlow web" in program_text
     assert "third_party" in program_text
     assert "ragflow" in program_text
 
