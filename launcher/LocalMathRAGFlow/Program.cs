@@ -22,9 +22,9 @@ internal static class Program
 
 internal sealed partial class TrayContext : ApplicationContext
 {
-    private readonly NativeTrayIcon tray;
+    private NativeTrayIcon? tray;
     private readonly ContextMenuStrip menu;
-    private readonly Form menuHost;
+    private TrayHostForm? menuHost;
     private readonly ToolStripMenuItem statusItem;
     private readonly ToolStripMenuItem startItem;
     private readonly ToolStripMenuItem stopItem;
@@ -56,7 +56,6 @@ internal sealed partial class TrayContext : ApplicationContext
         startItem = MenuItem("Start services", async () => await StartServicesAsync(openBrowser: true), MenuGlyph.Play());
         stopItem = MenuItem("Stop services", async () => await StopServicesAsync(), MenuGlyph.Stop());
         restartItem = MenuItem("Restart services", async () => await RestartServicesAsync(), MenuGlyph.Restart());
-        menuHost = CreateMenuHost();
         menu = CreateMenu();
         menu.Items.Add(statusItem);
         menu.Items.Add(new ToolStripSeparator());
@@ -74,7 +73,19 @@ internal sealed partial class TrayContext : ApplicationContext
 
         menu.Opening += (_, _) => Log("TRAY menu opening");
         menu.Opened += (_, _) => Log("TRAY menu opened");
-        tray = new NativeTrayIcon(appIcon.Handle, "LocalMathRAGFlow");
+        Application.Idle += InitializeAfterMessageLoop;
+    }
+
+    private void InitializeAfterMessageLoop(object? sender, EventArgs e)
+    {
+        Application.Idle -= InitializeAfterMessageLoop;
+        menuHost = CreateMenuHost();
+        menuHost.HandleCreated += (_, _) => Log($"TRAY host handle created hwnd=0x{menuHost.Handle.ToInt64():X}");
+        menuHost.HandleDestroyed += (_, _) => Log("TRAY host handle destroyed");
+        MainForm = menuHost;
+        tray = new NativeTrayIcon(menuHost.Handle, appIcon.Handle, "LocalMathRAGFlow");
+        menuHost.ShellMessage += (_, message) => tray?.HandleShellMessage(message);
+        tray.Diagnostic += (_, message) => Log(message);
         tray.LeftClick += async (_, _) => await OpenFromTrayAsync("left click");
         tray.LeftDoubleClick += async (_, _) => await OpenFromTrayAsync("left double click");
         tray.RightClick += (_, _) =>
@@ -85,6 +96,12 @@ internal sealed partial class TrayContext : ApplicationContext
         tray.TaskbarCreated += (_, _) => Log("TRAY restored after Explorer taskbar recreation");
         tray.Show();
         Log("TRAY native icon created");
+        var hostHandle = menuHost.Handle;
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(2500);
+            Log($"TRAY host verify hwnd=0x{hostHandle.ToInt64():X}, alive={IsWindow(hostHandle)}, current=0x{menuHost.Handle.ToInt64():X}");
+        });
 
         _ = StartServicesAsync(openBrowser: true);
     }
@@ -181,7 +198,7 @@ internal sealed partial class TrayContext : ApplicationContext
             SetStatus("running");
             if (!webReady)
             {
-                tray.ShowBalloonTip(3000, "LocalMathRAGFlow", "Containers are running, but RAGFlow Web may still be warming up.", ToolTipIcon.Warning);
+                tray?.ShowBalloonTip(3000, "LocalMathRAGFlow", "Containers are running, but RAGFlow Web may still be warming up.", ToolTipIcon.Warning);
             }
             if (openBrowser)
             {
@@ -249,9 +266,9 @@ internal sealed partial class TrayContext : ApplicationContext
             await StopServicesAsync();
         }
         menu.Dispose();
-        tray.Dispose();
+        tray?.Dispose();
         appIcon.Dispose();
-        menuHost.Dispose();
+        menuHost?.Dispose();
         ExitThread();
     }
 
@@ -293,6 +310,11 @@ internal sealed partial class TrayContext : ApplicationContext
     {
         uiContext.Post(_ =>
         {
+            if (menuHost is null)
+            {
+                Log("TRAY menu skipped: menu host is not ready");
+                return;
+            }
             if (menu.Visible)
             {
                 menu.Close();
@@ -648,7 +670,10 @@ MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArq9XTUSeYr2+N1h3Afl/z8Dse/2yD0ZGrKwx
         }
         lastStatus = status;
         statusItem.Text = "Status: " + status;
-        tray.Text = status.Length > 40 ? "LocalMathRAGFlow" : $"LocalMathRAGFlow - {status}";
+        if (tray is not null)
+        {
+            tray.Text = status.Length > 40 ? "LocalMathRAGFlow" : $"LocalMathRAGFlow - {status}";
+        }
         Log("STATUS " + status);
     }
 
@@ -732,9 +757,9 @@ MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArq9XTUSeYr2+N1h3Afl/z8Dse/2yD0ZGrKwx
         return candidates.FirstOrDefault() ?? Directory.GetCurrentDirectory();
     }
 
-    private static Form CreateMenuHost()
+    private static TrayHostForm CreateMenuHost()
     {
-        var form = new Form
+        var form = new TrayHostForm
         {
             FormBorderStyle = FormBorderStyle.FixedToolWindow,
             ShowInTaskbar = false,
@@ -744,7 +769,6 @@ MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArq9XTUSeYr2+N1h3Afl/z8Dse/2yD0ZGrKwx
             Opacity = 0
         };
         form.Show();
-        form.Hide();
         return form;
     }
 
@@ -831,6 +855,22 @@ internal sealed partial class TrayContext
 
     [DllImport("user32.dll")]
     private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    [DllImport("user32.dll")]
+    private static extern bool IsWindow(IntPtr hWnd);
+}
+
+internal sealed class TrayHostForm : Form
+{
+    public event EventHandler<Message>? ShellMessage;
+
+    protected override bool ShowWithoutActivation => true;
+
+    protected override void WndProc(ref Message m)
+    {
+        ShellMessage?.Invoke(this, m);
+        base.WndProc(ref m);
+    }
 }
 
 internal sealed class NativeTrayIcon : IDisposable
@@ -838,31 +878,34 @@ internal sealed class NativeTrayIcon : IDisposable
     private const uint NimAdd = 0x00000000;
     private const uint NimModify = 0x00000001;
     private const uint NimDelete = 0x00000002;
+    private const uint NimSetVersion = 0x00000004;
     private const uint NifMessage = 0x00000001;
     private const uint NifIcon = 0x00000002;
     private const uint NifTip = 0x00000004;
     private const uint NifInfo = 0x00000010;
-    private const uint CallbackMessage = 0x8000 + 77;
+    private const uint CallbackMessage = 0x0400 + 77;
+    private const uint NotifyIconVersion4 = 4;
     private const int WmLButtonUp = 0x0202;
     private const int WmLButtonDblClk = 0x0203;
     private const int WmRButtonUp = 0x0205;
     private const int WmContextMenu = 0x007B;
 
-    private readonly TrayMessageWindow window;
+    private readonly IntPtr ownerHandle;
     private readonly IntPtr iconHandle;
     private readonly uint taskbarCreatedMessage;
     private string text;
     private bool visible;
     private bool disposed;
 
-    public NativeTrayIcon(IntPtr iconHandle, string text)
+    public NativeTrayIcon(IntPtr ownerHandle, IntPtr iconHandle, string text)
     {
+        this.ownerHandle = ownerHandle;
         this.iconHandle = iconHandle;
         this.text = text;
         taskbarCreatedMessage = RegisterWindowMessage("TaskbarCreated");
-        window = new TrayMessageWindow(this);
     }
 
+    public event EventHandler<string>? Diagnostic;
     public event EventHandler? LeftClick;
     public event EventHandler? LeftDoubleClick;
     public event EventHandler? RightClick;
@@ -889,6 +932,7 @@ internal sealed class NativeTrayIcon : IDisposable
         }
         visible = true;
         Add();
+        SetVersion();
     }
 
     public void ShowBalloonTip(int timeout, string title, string message, ToolTipIcon icon)
@@ -924,14 +968,13 @@ internal sealed class NativeTrayIcon : IDisposable
             Shell_NotifyIcon(NimDelete, ref data);
             visible = false;
         }
-        window.CloseNativeHandle();
-        window.Dispose();
     }
 
     private void Add()
     {
         var data = CreateData(NifMessage | NifIcon | NifTip);
-        Shell_NotifyIcon(NimAdd, ref data);
+        var ok = Shell_NotifyIcon(NimAdd, ref data);
+        Diagnostic?.Invoke(this, $"Shell_NotifyIcon add ok={ok}, hwnd=0x{ownerHandle.ToInt64():X}, callback=0x{CallbackMessage:X}");
     }
 
     private void Modify(uint flags)
@@ -940,12 +983,20 @@ internal sealed class NativeTrayIcon : IDisposable
         Shell_NotifyIcon(NimModify, ref data);
     }
 
+    private void SetVersion()
+    {
+        var data = CreateData(0);
+        data.uTimeoutOrVersion = NotifyIconVersion4;
+        var ok = Shell_NotifyIcon(NimSetVersion, ref data);
+        Diagnostic?.Invoke(this, $"Shell_NotifyIcon set version ok={ok}");
+    }
+
     private NOTIFYICONDATA CreateData(uint flags)
     {
         return new NOTIFYICONDATA
         {
             cbSize = Marshal.SizeOf<NOTIFYICONDATA>(),
-            hWnd = window.Handle,
+            hWnd = ownerHandle,
             uID = 1,
             uFlags = flags,
             uCallbackMessage = CallbackMessage,
@@ -954,7 +1005,7 @@ internal sealed class NativeTrayIcon : IDisposable
         };
     }
 
-    private void OnShellMessage(Message message)
+    public void HandleShellMessage(Message message)
     {
         if ((uint)message.Msg == taskbarCreatedMessage)
         {
@@ -972,6 +1023,7 @@ internal sealed class NativeTrayIcon : IDisposable
         }
 
         var mouseMessage = message.LParam.ToInt32();
+        Diagnostic?.Invoke(this, $"TRAY shell callback lparam=0x{mouseMessage:X}");
         switch (mouseMessage)
         {
             case WmLButtonUp:
@@ -984,32 +1036,6 @@ internal sealed class NativeTrayIcon : IDisposable
             case WmContextMenu:
                 RightClick?.Invoke(this, EventArgs.Empty);
                 break;
-        }
-    }
-
-    private sealed class TrayMessageWindow : Form
-    {
-        private readonly NativeTrayIcon owner;
-
-        public TrayMessageWindow(NativeTrayIcon owner)
-        {
-            this.owner = owner;
-            ShowInTaskbar = false;
-            FormBorderStyle = FormBorderStyle.FixedToolWindow;
-            StartPosition = FormStartPosition.Manual;
-            Size = new Size(1, 1);
-            Location = new Point(-32000, -32000);
-            CreateHandle();
-        }
-
-        protected override void SetVisibleCore(bool value) => base.SetVisibleCore(false);
-
-        public void CloseNativeHandle() => DestroyHandle();
-
-        protected override void WndProc(ref Message m)
-        {
-            owner.OnShellMessage(m);
-            base.WndProc(ref m);
         }
     }
 
