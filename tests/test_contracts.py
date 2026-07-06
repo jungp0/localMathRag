@@ -93,11 +93,15 @@ def test_windows_launcher_exists() -> None:
     assert "EncryptRagflowPassword" in program_text
     assert "ModernMenuRenderer" in program_text
     assert "MenuGlyph" in program_text
-    assert "ContextMenuStrip = menu" in program_text
+    assert "NativeTrayIcon" in program_text
+    assert "Shell_NotifyIcon" in program_text
+    assert "RegisterWindowMessage(\"TaskbarCreated\")" in program_text
+    assert "CallbackMessage" in program_text
     assert "menuHost" in program_text
     assert "OpenFromTrayAsync" in program_text
     assert "TRAY menu opening" in program_text
-    assert "TRAY mouse click" in program_text
+    assert "TRAY native right click" in program_text
+    assert "TRAY native icon created" in program_text
     assert "ShowTrayMenu" in program_text
     assert "OpenOrFocusAppWindow" in program_text
     assert "SetForegroundWindow" in program_text

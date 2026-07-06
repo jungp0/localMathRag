@@ -22,7 +22,7 @@ internal static class Program
 
 internal sealed partial class TrayContext : ApplicationContext
 {
-    private readonly NotifyIcon tray;
+    private readonly NativeTrayIcon tray;
     private readonly ContextMenuStrip menu;
     private readonly Form menuHost;
     private readonly ToolStripMenuItem statusItem;
@@ -74,29 +74,17 @@ internal sealed partial class TrayContext : ApplicationContext
 
         menu.Opening += (_, _) => Log("TRAY menu opening");
         menu.Opened += (_, _) => Log("TRAY menu opened");
-        tray = new NotifyIcon
+        tray = new NativeTrayIcon(appIcon.Handle, "LocalMathRAGFlow");
+        tray.LeftClick += async (_, _) => await OpenFromTrayAsync("left click");
+        tray.LeftDoubleClick += async (_, _) => await OpenFromTrayAsync("left double click");
+        tray.RightClick += (_, _) =>
         {
-            Icon = appIcon,
-            Text = "LocalMathRAGFlow",
-            ContextMenuStrip = menu,
-            Visible = true
+            Log("TRAY native right click");
+            ShowTrayMenu();
         };
-        tray.DoubleClick += async (_, _) => await OpenFromTrayAsync("double click");
-        tray.MouseDoubleClick += async (_, e) =>
-        {
-            if (e.Button == MouseButtons.Left)
-            {
-                await OpenFromTrayAsync("left mouse double click");
-            }
-        };
-        tray.MouseClick += async (_, e) =>
-        {
-            Log($"TRAY mouse click: {e.Button}, clicks={e.Clicks}");
-            if (e.Button == MouseButtons.Left && e.Clicks >= 2)
-            {
-                await OpenFromTrayAsync("left mouse click fallback");
-            }
-        };
+        tray.TaskbarCreated += (_, _) => Log("TRAY restored after Explorer taskbar recreation");
+        tray.Show();
+        Log("TRAY native icon created");
 
         _ = StartServicesAsync(openBrowser: true);
     }
@@ -260,10 +248,9 @@ internal sealed partial class TrayContext : ApplicationContext
         {
             await StopServicesAsync();
         }
-        tray.Visible = false;
-        appIcon.Dispose();
         menu.Dispose();
         tray.Dispose();
+        appIcon.Dispose();
         menuHost.Dispose();
         ExitThread();
     }
@@ -844,6 +831,216 @@ internal sealed partial class TrayContext
 
     [DllImport("user32.dll")]
     private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+}
+
+internal sealed class NativeTrayIcon : IDisposable
+{
+    private const uint NimAdd = 0x00000000;
+    private const uint NimModify = 0x00000001;
+    private const uint NimDelete = 0x00000002;
+    private const uint NifMessage = 0x00000001;
+    private const uint NifIcon = 0x00000002;
+    private const uint NifTip = 0x00000004;
+    private const uint NifInfo = 0x00000010;
+    private const uint CallbackMessage = 0x8000 + 77;
+    private const int WmLButtonUp = 0x0202;
+    private const int WmLButtonDblClk = 0x0203;
+    private const int WmRButtonUp = 0x0205;
+    private const int WmContextMenu = 0x007B;
+
+    private readonly TrayMessageWindow window;
+    private readonly IntPtr iconHandle;
+    private readonly uint taskbarCreatedMessage;
+    private string text;
+    private bool visible;
+    private bool disposed;
+
+    public NativeTrayIcon(IntPtr iconHandle, string text)
+    {
+        this.iconHandle = iconHandle;
+        this.text = text;
+        taskbarCreatedMessage = RegisterWindowMessage("TaskbarCreated");
+        window = new TrayMessageWindow(this);
+    }
+
+    public event EventHandler? LeftClick;
+    public event EventHandler? LeftDoubleClick;
+    public event EventHandler? RightClick;
+    public event EventHandler? TaskbarCreated;
+
+    public string Text
+    {
+        get => text;
+        set
+        {
+            text = value.Length > 127 ? value[..127] : value;
+            if (visible)
+            {
+                Modify(NifMessage | NifIcon | NifTip);
+            }
+        }
+    }
+
+    public void Show()
+    {
+        if (visible)
+        {
+            return;
+        }
+        visible = true;
+        Add();
+    }
+
+    public void ShowBalloonTip(int timeout, string title, string message, ToolTipIcon icon)
+    {
+        if (!visible)
+        {
+            return;
+        }
+        var data = CreateData(NifInfo);
+        data.szInfoTitle = title.Length > 63 ? title[..63] : title;
+        data.szInfo = message.Length > 255 ? message[..255] : message;
+        data.dwInfoFlags = icon switch
+        {
+            ToolTipIcon.Warning => 2,
+            ToolTipIcon.Error => 3,
+            ToolTipIcon.Info => 1,
+            _ => 0
+        };
+        data.uTimeoutOrVersion = (uint)Math.Max(timeout, 0);
+        Shell_NotifyIcon(NimModify, ref data);
+    }
+
+    public void Dispose()
+    {
+        if (disposed)
+        {
+            return;
+        }
+        disposed = true;
+        if (visible)
+        {
+            var data = CreateData(0);
+            Shell_NotifyIcon(NimDelete, ref data);
+            visible = false;
+        }
+        window.CloseNativeHandle();
+        window.Dispose();
+    }
+
+    private void Add()
+    {
+        var data = CreateData(NifMessage | NifIcon | NifTip);
+        Shell_NotifyIcon(NimAdd, ref data);
+    }
+
+    private void Modify(uint flags)
+    {
+        var data = CreateData(flags);
+        Shell_NotifyIcon(NimModify, ref data);
+    }
+
+    private NOTIFYICONDATA CreateData(uint flags)
+    {
+        return new NOTIFYICONDATA
+        {
+            cbSize = Marshal.SizeOf<NOTIFYICONDATA>(),
+            hWnd = window.Handle,
+            uID = 1,
+            uFlags = flags,
+            uCallbackMessage = CallbackMessage,
+            hIcon = iconHandle,
+            szTip = text.Length > 127 ? text[..127] : text
+        };
+    }
+
+    private void OnShellMessage(Message message)
+    {
+        if ((uint)message.Msg == taskbarCreatedMessage)
+        {
+            if (visible)
+            {
+                Add();
+            }
+            TaskbarCreated?.Invoke(this, EventArgs.Empty);
+            return;
+        }
+
+        if ((uint)message.Msg != CallbackMessage)
+        {
+            return;
+        }
+
+        var mouseMessage = message.LParam.ToInt32();
+        switch (mouseMessage)
+        {
+            case WmLButtonUp:
+                LeftClick?.Invoke(this, EventArgs.Empty);
+                break;
+            case WmLButtonDblClk:
+                LeftDoubleClick?.Invoke(this, EventArgs.Empty);
+                break;
+            case WmRButtonUp:
+            case WmContextMenu:
+                RightClick?.Invoke(this, EventArgs.Empty);
+                break;
+        }
+    }
+
+    private sealed class TrayMessageWindow : Form
+    {
+        private readonly NativeTrayIcon owner;
+
+        public TrayMessageWindow(NativeTrayIcon owner)
+        {
+            this.owner = owner;
+            ShowInTaskbar = false;
+            FormBorderStyle = FormBorderStyle.FixedToolWindow;
+            StartPosition = FormStartPosition.Manual;
+            Size = new Size(1, 1);
+            Location = new Point(-32000, -32000);
+            CreateHandle();
+        }
+
+        protected override void SetVisibleCore(bool value) => base.SetVisibleCore(false);
+
+        public void CloseNativeHandle() => DestroyHandle();
+
+        protected override void WndProc(ref Message m)
+        {
+            owner.OnShellMessage(m);
+            base.WndProc(ref m);
+        }
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct NOTIFYICONDATA
+    {
+        public int cbSize;
+        public IntPtr hWnd;
+        public uint uID;
+        public uint uFlags;
+        public uint uCallbackMessage;
+        public IntPtr hIcon;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
+        public string szTip;
+        public uint dwState;
+        public uint dwStateMask;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)]
+        public string szInfo;
+        public uint uTimeoutOrVersion;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)]
+        public string szInfoTitle;
+        public uint dwInfoFlags;
+        public Guid guidItem;
+        public IntPtr hBalloonIcon;
+    }
+
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+    private static extern bool Shell_NotifyIcon(uint dwMessage, ref NOTIFYICONDATA lpData);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern uint RegisterWindowMessage(string lpString);
 }
 
 internal sealed class ModernMenuRenderer : ToolStripProfessionalRenderer
