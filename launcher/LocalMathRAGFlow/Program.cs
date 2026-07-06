@@ -24,6 +24,7 @@ internal sealed partial class TrayContext : ApplicationContext
 {
     private readonly NotifyIcon tray;
     private readonly ContextMenuStrip menu;
+    private readonly Form menuHost;
     private readonly ToolStripMenuItem statusItem;
     private readonly ToolStripMenuItem startItem;
     private readonly ToolStripMenuItem stopItem;
@@ -54,13 +55,22 @@ internal sealed partial class TrayContext : ApplicationContext
         startItem = MenuItem("Start services", async () => await StartServicesAsync(openBrowser: true), MenuGlyph.Play());
         stopItem = MenuItem("Stop services", async () => await StopServicesAsync(), MenuGlyph.Stop());
         restartItem = MenuItem("Restart services", async () => await RestartServicesAsync(), MenuGlyph.Restart());
+        menuHost = CreateMenuHost();
         menu = CreateMenu();
 
         tray = new NotifyIcon
         {
             Icon = appIcon,
             Text = "LocalMathRAGFlow",
+            ContextMenuStrip = menu,
             Visible = true
+        };
+        tray.MouseClick += (_, e) =>
+        {
+            if (e.Button == MouseButtons.Right)
+            {
+                ShowTrayMenu();
+            }
         };
         tray.MouseUp += (_, e) =>
         {
@@ -82,7 +92,13 @@ internal sealed partial class TrayContext : ApplicationContext
         menu.Items.Add(MenuItem("View compose log", () => OpenPath(ComposeLogFile), MenuGlyph.Log()));
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(MenuItem("Exit", async () => await ExitAsync(), MenuGlyph.Exit()));
-        tray.DoubleClick += async (_, _) => await OpenRagflowAsync(CancellationToken.None);
+        tray.MouseDoubleClick += async (_, e) =>
+        {
+            if (e.Button == MouseButtons.Left)
+            {
+                await OpenRagflowAsync(CancellationToken.None);
+            }
+        };
 
         _ = StartServicesAsync(openBrowser: true);
     }
@@ -171,8 +187,9 @@ internal sealed partial class TrayContext : ApplicationContext
                 await RunPowerShellScriptAsync(Path.Combine(root, "scripts", "bootstrap-ragflow.ps1"), "", currentRun.Token);
             }
 
+            var allowLlama = await ConfirmLocalModelRuntimeAsync(currentRun.Token);
             SetStatus("starting containers");
-            await RunDockerComposeAsync("up -d --build", currentRun.Token);
+            await RunDockerComposeAsync("up -d --build", currentRun.Token, allowLlama);
             SetStatus("waiting for RAGFlow web");
             var webReady = await WaitForHttpOkAsync($"{WebUrl}/api/v1/system/config", TimeSpan.FromMinutes(3), currentRun.Token);
             SetStatus("running");
@@ -249,6 +266,7 @@ internal sealed partial class TrayContext : ApplicationContext
         appIcon.Dispose();
         menu.Dispose();
         tray.Dispose();
+        menuHost.Dispose();
         ExitThread();
     }
 
@@ -276,7 +294,17 @@ internal sealed partial class TrayContext : ApplicationContext
 
     private void ShowTrayMenu()
     {
-        menu.Show(Cursor.Position);
+        uiContext.Post(_ =>
+        {
+            if (menu.Visible)
+            {
+                menu.Close();
+            }
+            var position = Cursor.Position;
+            menuHost.Location = new Point(position.X, position.Y);
+            SetForegroundWindow(menuHost.Handle);
+            menu.Show(menuHost, menuHost.PointToClient(position));
+        }, null);
     }
 
     private async Task<string?> TryBuildAutoLoginUrlAsync(CancellationToken token)
@@ -325,7 +353,7 @@ MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArq9XTUSeYr2+N1h3Afl/z8Dse/2yD0ZGrKwx
         return Convert.ToBase64String(encrypted);
     }
 
-    private async Task RunDockerComposeAsync(string args, CancellationToken token)
+    private async Task RunDockerComposeAsync(string args, CancellationToken token, bool allowLlama = true)
     {
         var composeFiles = $"-f docker-compose.yml -f \"{OverrideCompose}\"";
         if (Directory.Exists(Path.Combine(root, "third_party", "ragflow", "web", "dist")) &&
@@ -334,15 +362,92 @@ MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArq9XTUSeYr2+N1h3Afl/z8Dse/2yD0ZGrKwx
             composeFiles += $" -f \"{WebDistCompose}\"";
         }
         var composeArgs = $"compose {composeFiles} {args}";
+        var profiles = BuildComposeProfiles(allowLlama);
         var env = new Dictionary<string, string?>
         {
             ["LOCALMATHRAG_ROOT"] = root,
             ["DOC_ENGINE"] = "elasticsearch",
             ["DEVICE"] = "cpu",
-            ["COMPOSE_PROFILES"] = "elasticsearch,cpu"
+            ["COMPOSE_PROFILES"] = string.Join(",", profiles)
         };
+        var modelName = FindDefaultGgufModelName();
+        if (modelName is not null)
+        {
+            env["LOCALMATHRAG_GGUF_MODEL"] = modelName;
+        }
         Action<string>? onOutput = args.StartsWith("up", StringComparison.OrdinalIgnoreCase) ? HandleComposeOutput : null;
         await RunProcessAsync("docker", composeArgs, RagflowDockerDir, ComposeLogFile, env, token, onOutput);
+    }
+
+    private List<string> BuildComposeProfiles(bool allowLlama)
+    {
+        var profiles = new List<string> { "elasticsearch", "cpu" };
+        var modelName = FindDefaultGgufModelName();
+        if (!allowLlama || modelName is null)
+        {
+            return profiles;
+        }
+
+        var llamaProfile = Environment.GetEnvironmentVariable("LOCALMATHRAG_LLAMA_PROFILE");
+        if (string.Equals(llamaProfile, "none", StringComparison.OrdinalIgnoreCase))
+        {
+            return profiles;
+        }
+        profiles.Add(string.Equals(llamaProfile, "cuda", StringComparison.OrdinalIgnoreCase)
+            ? "llama-cpp-cuda"
+            : "llama-cpp-cpu");
+        return profiles;
+    }
+
+    private async Task<bool> ConfirmLocalModelRuntimeAsync(CancellationToken token)
+    {
+        var modelName = FindDefaultGgufModelName();
+        if (modelName is null)
+        {
+            return false;
+        }
+        if (string.Equals(Environment.GetEnvironmentVariable("LOCALMATHRAG_LLAMA_PROFILE"), "none", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var image = GetLlamaDockerImage();
+        if (await DockerImageExistsAsync(image, token))
+        {
+            return true;
+        }
+
+        var result = MessageBox.Show(
+            $"Detected local model {modelName}, but the local llama.cpp Docker image is not installed yet.\n\nDownload image now?\n\nChoose No to start RAGFlow without the local model endpoint.",
+            "LocalMathRAGFlow",
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Question);
+        return result == DialogResult.Yes;
+    }
+
+    private string GetLlamaDockerImage()
+    {
+        return string.Equals(Environment.GetEnvironmentVariable("LOCALMATHRAG_LLAMA_PROFILE"), "cuda", StringComparison.OrdinalIgnoreCase)
+            ? "ghcr.io/ggml-org/llama.cpp:server-cuda"
+            : "ghcr.io/ggml-org/llama.cpp:server";
+    }
+
+    private async Task<bool> DockerImageExistsAsync(string image, CancellationToken token)
+    {
+        var code = await RunProcessAsync("docker", $"image inspect \"{image}\"", root, LogFile, null, token, throwOnError: false);
+        return code == 0;
+    }
+
+    private string? FindDefaultGgufModelName()
+    {
+        var modelDir = Path.Combine(root, "data", "models");
+        if (!Directory.Exists(modelDir))
+        {
+            return null;
+        }
+        return Directory.EnumerateFiles(modelDir, "*.gguf", SearchOption.TopDirectoryOnly)
+            .Select(Path.GetFileName)
+            .FirstOrDefault(name => !string.IsNullOrWhiteSpace(name));
     }
 
     private async Task RunPowerShellScriptAsync(string script, string args, CancellationToken token)
@@ -628,6 +733,22 @@ MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArq9XTUSeYr2+N1h3Afl/z8Dse/2yD0ZGrKwx
         }
 
         return candidates.FirstOrDefault() ?? Directory.GetCurrentDirectory();
+    }
+
+    private static Form CreateMenuHost()
+    {
+        var form = new Form
+        {
+            FormBorderStyle = FormBorderStyle.FixedToolWindow,
+            ShowInTaskbar = false,
+            StartPosition = FormStartPosition.Manual,
+            Size = new Size(1, 1),
+            Location = new Point(-32000, -32000),
+            Opacity = 0
+        };
+        form.Show();
+        form.Hide();
+        return form;
     }
 
     private void OpenOrFocusAppWindow(string url)

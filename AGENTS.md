@@ -41,6 +41,23 @@ Windows 启动器必须按以下逻辑选择 root：
 - 模型缺失时，必须弹窗确认后再下载；已有 `data/models` 中的模型必须优先复用。
 - 日常运行应保持离线优先，联网行为必须由用户显式确认。
 
+## Local Model Runtime Rules
+
+- `data/models/*.gguf` 是本地模型的唯一默认发现入口，launcher 和 `scripts/dev-up.ps1` 必须优先扫描这里。
+- 如果发现本地 GGUF，默认启动 `llama-cpp-cpu` compose profile，并设置 `LOCALMATHRAG_GGUF_MODEL=<文件名>`。
+- 如果本地 GGUF 已存在但 llama.cpp Docker image 尚未安装，launcher 必须弹窗确认后才允许拉取镜像；用户拒绝时只启动 RAGFlow，不启本地模型 endpoint。
+- 如需 GPU，使用 `LOCALMATHRAG_LLAMA_PROFILE=cuda` 切换到 `llama-cpp-cuda`；如需禁用本地模型服务，使用 `LOCALMATHRAG_LLAMA_PROFILE=none`。
+- 如果没有本地 GGUF，不允许自动下载模型，也不允许强行启动 llama.cpp 容器。
+- RAGFlow 模型提供商仍使用 OpenAI-compatible 形式，但 `base_url` 必须指向本地 `http://host.docker.internal:8080/v1` 或等价的本机离线端点。
+- `services/object_service` 必须暴露 `/v1/models/status`，用于确认模型文件数量和本地 llama endpoint 状态。
+- 当 RAGFlow 报 `No valid response received` 或 `Fail to access model` 时，优先检查 llama.cpp 容器是否已启动、8080 端口是否可访问、`LOCALMATHRAG_GGUF_MODEL` 是否与 `data/models` 文件名一致。
+
+## Tray Launcher Rules
+
+- 托盘菜单必须同时设置 `NotifyIcon.ContextMenuStrip` 和手动右键兜底逻辑，避免 Windows 托盘区域吞掉鼠标事件。
+- 手动菜单弹出必须使用隐藏 owner form，并在弹出前 `SetForegroundWindow`，否则右键菜单可能不显示或立即消失。
+- 左键双击托盘图标只打开或聚焦现有 WebApp 窗口，不创建多个独立窗口。
+
 ## Build And Release Rules
 
 - `scripts/build-launcher.ps1` 只负责生成本地 release 包，不提交 `dist/`。

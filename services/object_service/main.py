@@ -16,6 +16,7 @@ SCHEMA_DIR = Path(os.environ.get("LOCALMATHRAG_SCHEMA_DIR", "/schemas"))
 DATA_DIR = Path(os.environ.get("LOCALMATHRAG_DATA_DIR", "/data"))
 MODEL_DIR = Path(os.environ.get("LOCALMATHRAG_MODEL_DIR", DATA_DIR / "models"))
 MODEL_EXTENSIONS = {".gguf", ".safetensors", ".bin"}
+LLAMA_BASE_URL = os.environ.get("LOCALMATHRAG_LLAMA_BASE_URL", "http://host.docker.internal:8080/v1").rstrip("/")
 
 RECOMMENDED_MODELS = [
     {
@@ -28,7 +29,7 @@ RECOMMENDED_MODELS = [
         "max_tokens": 8192,
         "recommended_for": "Intel Ultra 9 + RTX 4060 + 32GB RAM",
         "provider": "OpenAI-API-Compatible",
-        "base_url": "http://host.docker.internal:8080/v1",
+        "base_url": LLAMA_BASE_URL,
     },
     {
         "id": "qwen3-4b-q4-k-m",
@@ -40,7 +41,7 @@ RECOMMENDED_MODELS = [
         "max_tokens": 8192,
         "recommended_for": "Lower memory fallback",
         "provider": "OpenAI-API-Compatible",
-        "base_url": "http://host.docker.internal:8080/v1",
+        "base_url": LLAMA_BASE_URL,
     },
 ]
 
@@ -122,6 +123,26 @@ def _model_files() -> list[Path]:
     )
 
 
+def _llama_endpoint_status(timeout: float = 1.5) -> dict[str, Any]:
+    url = f"{LLAMA_BASE_URL}/models"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            ok = 200 <= response.status < 300
+            return {
+                "base_url": LLAMA_BASE_URL,
+                "models_url": url,
+                "endpoint_ok": ok,
+                "status_code": response.status,
+            }
+    except Exception as exc:
+        return {
+            "base_url": LLAMA_BASE_URL,
+            "models_url": url,
+            "endpoint_ok": False,
+            "error": str(exc),
+        }
+
+
 def _model_payload(path: Path) -> dict[str, Any]:
     stat = path.stat()
     return {
@@ -133,7 +154,7 @@ def _model_payload(path: Path) -> dict[str, Any]:
         "size_gb": round(stat.st_size / 1024 / 1024 / 1024, 2),
         "extension": path.suffix.lower(),
         "provider": "OpenAI-API-Compatible",
-        "base_url": "http://host.docker.internal:8080/v1",
+        "base_url": LLAMA_BASE_URL,
         "model_type": ["chat"],
         "max_tokens": 8192,
     }
@@ -153,8 +174,10 @@ def health() -> dict[str, Any]:
 @app.get("/v1/models/local")
 def list_local_models() -> dict[str, Any]:
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    endpoint_status = _llama_endpoint_status()
     return {
         "model_dir": str(MODEL_DIR),
+        "endpoint_status": endpoint_status,
         "models": [_model_payload(path) for path in _model_files()],
     }
 
@@ -162,13 +185,24 @@ def list_local_models() -> dict[str, Any]:
 @app.get("/v1/models/recommended")
 def list_recommended_models() -> dict[str, Any]:
     local_names = {path.name for path in _model_files()}
+    endpoint_status = _llama_endpoint_status()
     models = []
     for model in RECOMMENDED_MODELS:
         item = dict(model)
         item["downloaded"] = item["file_name"] in local_names
         item["target_path"] = str(MODEL_DIR / item["file_name"])
+        item["endpoint_status"] = endpoint_status
         models.append(item)
     return {"models": models}
+
+
+@app.get("/v1/models/status")
+def model_status() -> dict[str, Any]:
+    return {
+        "model_dir": str(MODEL_DIR),
+        "model_count": len(_model_files()),
+        "endpoint_status": _llama_endpoint_status(timeout=3),
+    }
 
 
 @app.post("/v1/models/download")

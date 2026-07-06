@@ -2,8 +2,8 @@ param(
     [ValidateSet("cpu", "gpu")]
     [string]$Device = "cpu",
 
-    [ValidateSet("none", "cpu", "cuda")]
-    [string]$Llama = "none",
+    [ValidateSet("auto", "none", "cpu", "cuda")]
+    [string]$Llama = "auto",
 
     [ValidateSet("elasticsearch", "infinity", "opensearch")]
     [string]$DocEngine = "elasticsearch"
@@ -23,6 +23,23 @@ if (!(Test-Path $RagflowDocker)) {
 $env:LOCALMATHRAG_ROOT = $Root.Path
 $env:DOC_ENGINE = $DocEngine
 $env:DEVICE = $Device
+
+$ModelDir = Join-Path $Root "data\models"
+$DefaultModel = $null
+if (Test-Path $ModelDir) {
+    $DefaultModel = Get-ChildItem -Path $ModelDir -Filter "*.gguf" -File | Select-Object -First 1
+}
+if ($DefaultModel) {
+    $env:LOCALMATHRAG_GGUF_MODEL = $DefaultModel.Name
+}
+if ($Llama -eq "auto") {
+    if ($DefaultModel) {
+        $Llama = "cpu"
+    }
+    else {
+        $Llama = "none"
+    }
+}
 
 $profiles = @($DocEngine, $Device)
 if ($Llama -eq "cpu") {

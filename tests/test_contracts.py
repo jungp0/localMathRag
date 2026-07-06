@@ -59,6 +59,8 @@ def test_object_service_imports() -> None:
     assert "/v1/models/local" in text
     assert "/v1/models/recommended" in text
     assert "/v1/models/download" in text
+    assert "/v1/models/status" in text
+    assert "LLAMA_BASE_URL" in text
 
 
 def test_windows_launcher_exists() -> None:
@@ -79,9 +81,17 @@ def test_windows_launcher_exists() -> None:
     assert "EncryptRagflowPassword" in program_text
     assert "ModernMenuRenderer" in program_text
     assert "MenuGlyph" in program_text
+    assert "ContextMenuStrip = menu" in program_text
+    assert "menuHost" in program_text
     assert "ShowTrayMenu" in program_text
     assert "OpenOrFocusAppWindow" in program_text
     assert "SetForegroundWindow" in program_text
+    assert "BuildComposeProfiles" in program_text
+    assert "ConfirmLocalModelRuntimeAsync" in program_text
+    assert "DockerImageExistsAsync" in program_text
+    assert "FindDefaultGgufModelName" in program_text
+    assert "LOCALMATHRAG_GGUF_MODEL" in program_text
+    assert "llama-cpp-cpu" in program_text
     assert "up -d --build" in program_text
     assert "installedRoot" in program_text
     assert "HandleComposeOutput" in program_text
@@ -122,6 +132,8 @@ def test_agent_rules_document_root_resolution() -> None:
     assert "RAGFlow Patch Rules" in text
     assert "third_party/ragflow/docker/docker-compose.yml" in text
     assert "不允许从 `dist` 启动时重复下载 RAGFlow 或模型" in text
+    assert "Local Model Runtime Rules" in text
+    assert "Tray Launcher Rules" in text
 
 
 def main() -> None:
