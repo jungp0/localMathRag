@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 
@@ -31,15 +32,23 @@ def test_chinese_text_files_use_utf8_bom() -> None:
     suffixes = {".md", ".txt", ".ps1", ".py", ".yaml", ".yml"}
     ignored = {"data", "dist", "third_party", ".git"}
     offenders: list[str] = []
-    for path in ROOT.rglob("*"):
-        if not path.is_file() or path.suffix.lower() not in suffixes:
-            continue
-        if any(part in ignored for part in path.relative_to(ROOT).parts):
-            continue
-        raw = path.read_bytes()
-        if any(byte >= 0x80 for byte in raw) and not raw.startswith(b"\xef\xbb\xbf"):
-            offenders.append(str(path.relative_to(ROOT)))
+    for current_root, dirs, files in os.walk(ROOT):
+        dirs[:] = [name for name in dirs if name not in ignored]
+        root_path = Path(current_root)
+        for filename in files:
+            path = root_path / filename
+            if path.suffix.lower() not in suffixes:
+                continue
+            raw = path.read_bytes()
+            if any(byte >= 0x80 for byte in raw) and not raw.startswith(b"\xef\xbb\xbf"):
+                offenders.append(str(path.relative_to(ROOT)))
     assert not offenders, "Non-ASCII text files missing UTF-8 BOM: " + ", ".join(offenders)
+
+
+def test_no_unpruned_bom_scan() -> None:
+    text = read_text(ROOT / "tests" / "test_contracts.py")
+    assert "os.walk" in text
+    assert "dirs[:]" in text
 
 
 def test_object_service_imports() -> None:
@@ -47,6 +56,9 @@ def test_object_service_imports() -> None:
     text = read_text(service)
     assert "FastAPI" in text
     assert "/v1/objects/normalize" in text
+    assert "/v1/models/local" in text
+    assert "/v1/models/recommended" in text
+    assert "/v1/models/download" in text
 
 
 def test_windows_launcher_exists() -> None:
@@ -67,6 +79,10 @@ def test_windows_launcher_exists() -> None:
     assert "EncryptRagflowPassword" in program_text
     assert "ModernMenuRenderer" in program_text
     assert "MenuGlyph" in program_text
+    assert "ShowTrayMenu" in program_text
+    assert "OpenOrFocusAppWindow" in program_text
+    assert "SetForegroundWindow" in program_text
+    assert "up -d --build" in program_text
     assert "installedRoot" in program_text
     assert "HandleComposeOutput" in program_text
     assert "downloading Docker images" in program_text
@@ -76,11 +92,34 @@ def test_windows_launcher_exists() -> None:
     assert "ragflow" in program_text
 
 
+def test_ragflow_patch_workflow_exists() -> None:
+    apply_script = ROOT / "scripts" / "apply-ragflow-patches.ps1"
+    build_script = ROOT / "scripts" / "build-ragflow-web.ps1"
+    patch = ROOT / "patches" / "ragflow" / "0001-localmathrag-offline-ui.patch"
+    webdist_compose = ROOT / "docker" / "docker-compose.webdist.yml"
+    bootstrap = read_text(ROOT / "scripts" / "bootstrap-ragflow.ps1")
+    launcher = read_text(ROOT / "launcher" / "LocalMathRAGFlow" / "Program.cs")
+    assert apply_script.exists()
+    assert build_script.exists()
+    assert patch.exists()
+    assert webdist_compose.exists()
+    assert "apply-ragflow-patches.ps1" in bootstrap
+    assert "docker-compose.webdist.yml" in launcher
+    build_text = read_text(build_script)
+    assert "--ignore-scripts" in build_text
+    assert "--max-old-space-size=8192" in build_text
+    patch_text = read_text(patch)
+    assert "Discord" in patch_text
+    assert "/v1/models/local" in patch_text
+    assert "OpenAiAPICompatible" in patch_text
+
+
 def test_agent_rules_document_root_resolution() -> None:
     rules = ROOT / "AGENTS.md"
     assert rules.exists()
     text = read_text(rules)
     assert "Launcher Root Resolution" in text
+    assert "RAGFlow Patch Rules" in text
     assert "third_party/ragflow/docker/docker-compose.yml" in text
     assert "不允许从 `dist` 启动时重复下载 RAGFlow 或模型" in text
 
@@ -89,8 +128,10 @@ def main() -> None:
     test_json_schemas_are_valid()
     test_openapi_and_pipeline_exist()
     test_chinese_text_files_use_utf8_bom()
+    test_no_unpruned_bom_scan()
     test_object_service_imports()
     test_windows_launcher_exists()
+    test_ragflow_patch_workflow_exists()
     print("contract checks passed")
 
 

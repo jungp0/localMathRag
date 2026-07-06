@@ -19,6 +19,7 @@ Copy-Item -Recurse -Force (Join-Path $Root "docker") $Out
 Copy-Item -Recurse -Force (Join-Path $Root "scripts") $Out
 Copy-Item -Recurse -Force (Join-Path $Root "extensions") $Out
 Copy-Item -Recurse -Force (Join-Path $Root "services") $Out
+Copy-Item -Recurse -Force (Join-Path $Root "patches") $Out
 Copy-Item -Force (Join-Path $Root "README.md") $Out
 
 New-Item -ItemType Directory -Force (Join-Path $Out "data\models") | Out-Null

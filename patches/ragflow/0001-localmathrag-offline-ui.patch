@@ -1,0 +1,1034 @@
+diff --git a/web/package.json b/web/package.json
+index 8a74385..f9a1e52 100644
+--- a/web/package.json
++++ b/web/package.json
+@@ -29,7 +29,9 @@
+     "@floating-ui/react": "^0.27.19",
+     "@hookform/resolvers": "^3.9.1",
+     "@js-preview/excel": "^1.7.14",
++    "@lexical/code": "0.23.1",
+     "@lexical/react": "^0.23.1",
++    "@lexical/rich-text": "0.23.1",
+     "@mdx-js/rollup": "^3.1.1",
+     "@monaco-editor/react": "^4.6.0",
+     "@radix-ui/react-accordion": "^1.2.3",
+@@ -62,6 +64,7 @@
+     "@tanstack/react-query": "^5.40.0",
+     "@tanstack/react-query-devtools": "^5.51.5",
+     "@tanstack/react-table": "^8.20.5",
++    "@tanstack/table-core": "8.21.3",
+     "@types/papaparse": "^5.5.1",
+     "@uiw/react-markdown-preview": "^5.1.3",
+     "@welldone-software/why-did-you-render": "^8.0.3",
+@@ -74,6 +77,7 @@
+     "classnames": "^2.5.1",
+     "clsx": "^2.1.1",
+     "cmdk": "^1.0.4",
++    "date-fns": "4.4.0",
+     "dayjs": "^1.11.10",
+     "dompurify": "^3.3.2",
+     "embla-carousel-react": "^8.6.0",
+@@ -86,9 +90,11 @@
+     "js-base64": "^3.7.5",
+     "jsencrypt": "^3.3.2",
+     "jsoneditor": "^10.4.2",
++    "katex": "0.16.47",
+     "lexical": "^0.23.1",
+     "lodash": "^4.18.1",
+     "lucide-react": "^1.7.0",
++    "monaco-editor": "0.55.1",
+     "next-themes": "^0.4.6",
+     "openai-speech-stream-player": "^1.0.8",
+     "papaparse": "^5.5.3",
+@@ -131,6 +137,8 @@
+   },
+   "devDependencies": {
+     "@hookform/devtools": "^4.4.0",
++    "@react-dev-inspector/babel-plugin": "2.0.1",
++    "@react-dev-inspector/vite-plugin": "2.0.1",
+     "@react-router/dev": "^7.10.1",
+     "@redux-devtools/extension": "^3.3.0",
+     "@storybook/addon-docs": "^9.1.4",
+@@ -165,10 +173,10 @@
+     "eslint-plugin-react-refresh": "^0.4.26",
+     "eslint-plugin-storybook": "^9.1.4",
+     "html-loader": "^5.1.0",
+-    "lefthook": "^1.13.6",
+     "identity-obj-proxy": "^3.0.0",
+     "jest": "^29.7.0",
+     "jest-environment-jsdom": "^29.7.0",
++    "lefthook": "^1.13.6",
+     "less": "^4.4.2",
+     "postcss": "^8.5.6",
+     "postcss-loader": "^8.2.0",
+diff --git a/web/pnpm-lock.yaml b/web/pnpm-lock.yaml
+index 7a2ec41..beab376 100644
+--- a/web/pnpm-lock.yaml
++++ b/web/pnpm-lock.yaml
+@@ -29,9 +29,15 @@ importers:
+       '@js-preview/excel':
+         specifier: ^1.7.14
+         version: 1.7.14
++      '@lexical/code':
++        specifier: 0.23.1
++        version: 0.23.1
+       '@lexical/react':
+         specifier: ^0.23.1
+         version: 0.23.1(react-dom@18.3.1(react@18.3.1))(react@18.3.1)(yjs@13.6.31)
++      '@lexical/rich-text':
++        specifier: 0.23.1
++        version: 0.23.1
+       '@mdx-js/rollup':
+         specifier: ^3.1.1
+         version: 3.1.1(rollup@4.62.0)
+@@ -128,6 +134,9 @@ importers:
+       '@tanstack/react-table':
+         specifier: ^8.20.5
+         version: 8.21.3(react-dom@18.3.1(react@18.3.1))(react@18.3.1)
++      '@tanstack/table-core':
++        specifier: 8.21.3
++        version: 8.21.3
+       '@types/papaparse':
+         specifier: ^5.5.1
+         version: 5.5.2
+@@ -164,6 +173,9 @@ importers:
+       cmdk:
+         specifier: ^1.0.4
+         version: 1.1.1(@types/react-dom@18.3.7(@types/react@18.3.31))(@types/react@18.3.31)(react-dom@18.3.1(react@18.3.1))(react@18.3.1)
++      date-fns:
++        specifier: 4.4.0
++        version: 4.4.0
+       dayjs:
+         specifier: ^1.11.10
+         version: 1.11.21
+@@ -200,6 +212,9 @@ importers:
+       jsoneditor:
+         specifier: ^10.4.2
+         version: 10.4.3
++      katex:
++        specifier: 0.16.47
++        version: 0.16.47
+       lexical:
+         specifier: ^0.23.1
+         version: 0.23.1
+@@ -209,6 +224,9 @@ importers:
+       lucide-react:
+         specifier: ^1.7.0
+         version: 1.20.0(react@18.3.1)
++      monaco-editor:
++        specifier: 0.55.1
++        version: 0.55.1
+       next-themes:
+         specifier: ^0.4.6
+         version: 0.4.6(react-dom@18.3.1(react@18.3.1))(react@18.3.1)
+@@ -330,6 +348,12 @@ importers:
+       '@hookform/devtools':
+         specifier: ^4.4.0
+         version: 4.4.0(@types/react@18.3.31)(react-dom@18.3.1(react@18.3.1))(react@18.3.1)
++      '@react-dev-inspector/babel-plugin':
++        specifier: 2.0.1
++        version: 2.0.1
++      '@react-dev-inspector/vite-plugin':
++        specifier: 2.0.1
++        version: 2.0.1(eslint@8.57.1)(typescript@5.9.3)(webpack@5.107.2(@swc/core@1.15.41)(esbuild@0.27.7)(postcss@8.5.15))
+       '@react-router/dev':
+         specifier: ^7.10.1
+         version: 7.18.0(@types/node@24.13.2)(babel-plugin-macros@3.1.0)(jiti@1.21.7)(less@4.6.6)(react-router@7.18.0(react-dom@18.3.1(react@18.3.1))(react@18.3.1))(terser@5.48.0)(typescript@5.9.3)(vite@7.3.5(@types/node@24.13.2)(jiti@1.21.7)(less@4.6.6)(terser@5.48.0)(yaml@2.9.0))(yaml@2.9.0)
+diff --git a/web/src/layouts/components/header.tsx b/web/src/layouts/components/header.tsx
+index f2e9e0d..4f76916 100644
+--- a/web/src/layouts/components/header.tsx
++++ b/web/src/layouts/components/header.tsx
+@@ -1,4 +1,3 @@
+-import { IconFontFill } from '@/components/icon-font';
+ import { RAGFlowAvatar } from '@/components/ragflow-avatar';
+ import { Button } from '@/components/ui/button';
+ import {
+@@ -15,11 +14,7 @@ import {
+ import { cn } from '@/lib/utils';
+ import { TenantRole } from '@/pages/user-setting/constants';
+ import { Routes } from '@/routes';
+-import {
+-  LucideChevronDown,
+-  LucideCircleHelp,
+-  LucideLanguages,
+-} from 'lucide-react';
++import { LucideChevronDown, LucideCircleHelp, LucideLanguages } from 'lucide-react';
+ import React, { useMemo } from 'react';
+ import { Link, useLocation } from 'react-router';
+ import { BellButton } from './bell-button';
+@@ -100,28 +95,6 @@ export function Header({
+           )}
+           data-testid="auth-status"
+         >
+-          {!isCompact && (
+-            <>
+-              <a
+-                className="inline-flex p-2 text-text-secondary hover:text-text-primary focus-visible:text-text-primary"
+-                target="_blank"
+-                href="https://discord.com/invite/NjYzJD3GM3"
+-                rel="noreferrer noopener"
+-              >
+-                <IconFontFill name="a-DiscordIconSVGVectorIcon" />
+-              </a>
+-
+-              <a
+-                className="inline-flex p-2 text-text-secondary hover:text-text-primary focus-visible:text-text-primary"
+-                target="_blank"
+-                href="https://github.com/infiniflow/ragflow"
+-                rel="noreferrer noopener"
+-              >
+-                <IconFontFill name="GitHub" />
+-              </a>
+-            </>
+-          )}
+-
+           <DropdownMenu>
+             <DropdownMenuTrigger asChild>
+               <Button
+@@ -203,12 +176,6 @@ export function Header({
+           ref={expandedRightMeasureRef}
+           className="inline-flex shrink-0 items-center justify-end gap-4 text-text-badge"
+         >
+-          <a className="inline-flex p-2">
+-            <IconFontFill name="a-DiscordIconSVGVectorIcon" />
+-          </a>
+-          <a className="inline-flex p-2">
+-            <IconFontFill name="GitHub" />
+-          </a>
+           <Button variant="ghost" className="size-auto gap-1 px-4">
+             {currentLanguage?.displayName}
+             <LucideChevronDown className="size-[1em]" />
+diff --git a/web/src/layouts/components/mobile-menu-footer.tsx b/web/src/layouts/components/mobile-menu-footer.tsx
+index 36795b3..dcfeea7 100644
+--- a/web/src/layouts/components/mobile-menu-footer.tsx
++++ b/web/src/layouts/components/mobile-menu-footer.tsx
+@@ -1,9 +1,5 @@
+ import { useTranslation } from 'react-i18next';
+ 
+-function FooterDivider() {
+-  return <span className="text-border-button select-none">|</span>;
+-}
+-
+ function FooterLink({
+   children,
+   onClick,
+@@ -40,24 +36,6 @@ export function MobileMenuFooter({ onClose }: MobileMenuFooterProps) {
+   return (
+     <div className="shrink-0 border-t border-border-button px-4 py-4">
+       <div className="flex flex-wrap items-center justify-center gap-x-2 gap-y-1 text-sm">
+-        <FooterLink
+-          href="https://discord.com/invite/NjYzJD3GM3"
+-          target="_blank"
+-          rel="noreferrer noopener"
+-          onClick={onClose}
+-        >
+-          {t('header.discord')}
+-        </FooterLink>
+-        <FooterDivider />
+-        <FooterLink
+-          href="https://github.com/infiniflow/ragflow"
+-          target="_blank"
+-          rel="noreferrer noopener"
+-          onClick={onClose}
+-        >
+-          {t('header.github')}
+-        </FooterLink>
+-        <FooterDivider />
+         <FooterLink
+           href="https://ragflow.io/docs/dev/category/user-guides"
+           target="_blank"
+diff --git a/web/src/locales/config.ts b/web/src/locales/config.ts
+index 09f344b..9c6050d 100644
+--- a/web/src/locales/config.ts
++++ b/web/src/locales/config.ts
+@@ -1,37 +1,26 @@
+-import { LanguageAbbreviation } from '@/constants/common';
+ import storage from '@/utils/authorization-util';
+ import dayjs from 'dayjs';
+ import i18n from 'i18next';
+ import LanguageDetector from 'i18next-browser-languagedetector';
+-import { upperFirst } from 'lodash';
+ import { initReactI18next } from 'react-i18next';
+ import translation_en from './en';
++import translation_zh from './zh';
+ 
+ //The language is based on the .ng file stored in the client's local storage.
+ // The language stored in the database is for agent template resources, as these resources reside on the server.
+ // When a user logs in from a different machine, the login page language is the language configured by VITE_DEFAULT_LANGUAGE_CODE.
+ 
+-const languageImports: Record<string, () => Promise<{ default: any }>> = {
+-  [LanguageAbbreviation.En]: () => import('./en'),
+-  [LanguageAbbreviation.Zh]: () => import('./zh'),
+-  [LanguageAbbreviation.ZhTraditional]: () => import('./zh-traditional'),
+-  [LanguageAbbreviation.Id]: () => import('./id'),
+-  [LanguageAbbreviation.Ja]: () => import('./ja'),
+-  [LanguageAbbreviation.Es]: () => import('./es'),
+-  [LanguageAbbreviation.Vi]: () => import('./vi'),
+-  [LanguageAbbreviation.Ru]: () => import('./ru'),
+-  [LanguageAbbreviation.PtBr]: () => import('./pt-br'),
+-  [LanguageAbbreviation.De]: () => import('./de'),
+-  [LanguageAbbreviation.Fr]: () => import('./fr'),
+-  [LanguageAbbreviation.It]: () => import('./it'),
+-  [LanguageAbbreviation.Bg]: () => import('./bg'),
+-  [LanguageAbbreviation.Ar]: () => import('./ar'),
+-  [LanguageAbbreviation.Tr]: () => import('./tr'),
+-  [LanguageAbbreviation.Ko]: () => import('./ko'),
+-};
++const supportedLanguageCodes: Intl.UnicodeBCP47LocaleIdentifier[] = [
++  'en',
++  'zh-Hans',
++];
+ 
+-const supportedLanguageCodes: Intl.UnicodeBCP47LocaleIdentifier[] =
+-  Object.keys(languageImports);
++const upperFirstLetter = (value?: string): string => {
++  if (!value) {
++    return '';
++  }
++  return value.charAt(0).toLocaleUpperCase() + value.slice(1);
++};
+ 
+ export const supportedLanguages = supportedLanguageCodes.map((code) => {
+   const locale = new Intl.Locale(code);
+@@ -39,23 +28,24 @@ export const supportedLanguages = supportedLanguageCodes.map((code) => {
+   return {
+     code,
+     locale,
+-    displayName: upperFirst(
++    displayName: upperFirstLetter(
+       new Intl.DisplayNames(locale, { type: 'language' }).of(code)!,
+     ),
+   };
+ });
+ 
+ export const DEFAULT_LANGUAGE_CODE =
+-  import.meta.env.VITE_DEFAULT_LANGUAGE_CODE || LanguageAbbreviation.En;
++  import.meta.env.VITE_DEFAULT_LANGUAGE_CODE || 'en';
+ 
+ const resources = {
+-  [LanguageAbbreviation.En]: translation_en,
++  en: translation_en,
++  'zh-Hans': translation_zh,
+ };
+ 
+ const updateDocumentLocale = (lng: string) => {
+   document.documentElement.lang = lng;
+   document.documentElement.dir = 'ltr';
+-  dayjs.locale(lng === 'zh' ? 'zh-cn' : lng);
++  dayjs.locale(lng === 'zh-Hans' ? 'zh-cn' : lng);
+ };
+ 
+ i18n
+@@ -82,26 +72,14 @@ export const loadLanguageAsync = async (lng: string): Promise<void> => {
+     return;
+   }
+ 
+-  const importFn = languageImports[normalizedLng];
+-  if (!importFn) {
+-    console.warn(`Language ${lng} is not supported for lazy loading`);
+-    return;
+-  }
+-
+-  try {
+-    const module = await importFn();
+-    const translationData = module.default?.translation || module.default;
+-    i18n.addResourceBundle(normalizedLng, 'translation', translationData);
+-  } catch (error) {
+-    console.error(`Failed to load language ${lng}:`, error);
+-  }
++  console.warn(`Language ${lng} is not available in the local build`);
+ };
+ 
+ export const changeLanguageAsync = async (lng: string): Promise<void> => {
+   const normalizedLng = lng;
+ 
+   if (
+-    normalizedLng !== LanguageAbbreviation.En &&
++    normalizedLng !== 'en' &&
+     !i18n.hasResourceBundle(normalizedLng, 'translation')
+   ) {
+     await loadLanguageAsync(normalizedLng);
+@@ -115,7 +93,11 @@ export const changeLanguageAsync = async (lng: string): Promise<void> => {
+ };
+ 
+ export const initLanguage = async (): Promise<void> => {
+-  const currentLng = storage.getLanguage() || DEFAULT_LANGUAGE_CODE;
++  const storedLng = storage.getLanguage();
++  const currentLng =
++    storedLng && supportedLanguageCodes.includes(storedLng)
++      ? storedLng
++      : DEFAULT_LANGUAGE_CODE;
+ 
+   await changeLanguageAsync(currentLng);
+ };
+diff --git a/web/src/pages/login-next/index.tsx b/web/src/pages/login-next/index.tsx
+index 2d0d06b..f58171b 100644
+--- a/web/src/pages/login-next/index.tsx
++++ b/web/src/pages/login-next/index.tsx
+@@ -8,7 +8,7 @@ import {
+ } from '@/hooks/use-login-request';
+ import { useSystemConfig } from '@/hooks/use-system-request';
+ import { rsaPsw } from '@/utils';
+-import { useContext, useEffect, useState } from 'react';
++import { useContext, useEffect, useRef, useState } from 'react';
+ import { useTranslation } from 'react-i18next';
+ import { useNavigate } from 'react-router';
+ 
+@@ -268,12 +268,40 @@ const Login = () => {
+   const registerEnabled = config?.registerEnabled !== 0;
+ 
+   const { isLogin } = useAuth();
++  const autoLoginStarted = useRef(false);
++  const [autoLoginFallback, setAutoLoginFallback] = useState(false);
++
+   useEffect(() => {
+     if (isLogin) {
+       navigate('/');
+     }
+   }, [isLogin, navigate]);
+ 
++  useEffect(() => {
++    if (isLogin || autoLoginStarted.current) {
++      return;
++    }
++
++    autoLoginStarted.current = true;
++    const autoLogin = async () => {
++      try {
++        const code = await login({
++          email: 'admin@ragflow.io',
++          password: rsaPsw('admin') as string,
++        });
++        if (code === 0) {
++          navigate('/');
++          return;
++        }
++      } catch (error) {
++        console.warn('Local auto login failed:', error);
++      }
++      setAutoLoginFallback(true);
++    };
++
++    autoLogin();
++  }, [isLogin, login, navigate]);
++
+   const handleLoginWithChannel = async (channel: string) => {
+     await loginWithChannel(channel);
+   };
+@@ -355,6 +383,10 @@ const Login = () => {
+     }
+   };
+ 
++  if (!autoLoginFallback && !isLogin) {
++    return <></>;
++  }
++
+   return (
+     <>
+       <Spotlight opcity={0.4} coverage={60} color={'rgb(128, 255, 248)'} />
+diff --git a/web/src/pages/user-setting/setting-model/components/un-add-model.tsx b/web/src/pages/user-setting/setting-model/components/un-add-model.tsx
+index 1039c7c..1fe725a 100644
+--- a/web/src/pages/user-setting/setting-model/components/un-add-model.tsx
++++ b/web/src/pages/user-setting/setting-model/components/un-add-model.tsx
+@@ -1,12 +1,17 @@
+-// src/components/AvailableModels.tsx
+-import { LlmIcon } from '@/components/svg-icon';
+ import { Button } from '@/components/ui/button';
+ import { SearchInput } from '@/components/ui/input';
+-import { APIMapUrl } from '@/constants/llm';
+-import { useFetchAvailableProviders } from '@/hooks/use-llm-request';
+-import { ArrowUpRight, Plus } from 'lucide-react';
+-import { FC, useMemo, useState } from 'react';
++import { LLMFactory } from '@/constants/llm';
++import {
++  CheckCircle2,
++  Download,
++  ExternalLink,
++  HardDrive,
++  RefreshCw,
++  Settings,
++} from 'lucide-react';
++import { FC, useCallback, useEffect, useMemo, useState } from 'react';
+ import { useTranslation } from 'react-i18next';
++import type { LocalModelDefaults } from '../index';
+ 
+ export const mapModelKey = {
+   image2text: 'VLM',
+@@ -20,83 +25,162 @@ export const mapModelKey = {
+   ocr: 'OCR',
+ };
+ 
+-const orderMap: Record<ModelType, number> = {
+-  chat: 1,
+-  embedding: 2,
+-  rerank: 3,
+-  tts: 4,
+-  asr: 5,
+-  speech2text: 5,
+-  image2text: 6,
+-  vision: 6,
+-  ocr: 7,
++type LocalModel = {
++  name: string;
++  file_name: string;
++  path: string;
++  relative_path: string;
++  size_bytes: number;
++  size_gb: number;
++  extension: string;
++  provider: string;
++  base_url: string;
++  model_type: string[];
++  max_tokens: number;
+ };
+ 
+-type ModelType =
+-  | 'chat'
+-  | 'embedding'
+-  | 'rerank'
+-  | 'tts'
+-  | 'asr'
+-  | 'speech2text'
+-  | 'image2text'
+-  | 'vision'
+-  | 'ocr';
+-
+-const sortModelTypes = (modelTypes: string[]) => {
+-  return [...modelTypes].sort(
+-    (a, b) =>
+-      (orderMap[a as ModelType] || 999) - (orderMap[b as ModelType] || 999),
+-  );
++type RecommendedModel = {
++  id: string;
++  name: string;
++  file_name: string;
++  repo: string;
++  url: string;
++  model_type: string[];
++  max_tokens: number;
++  recommended_for: string;
++  provider: string;
++  base_url: string;
++  downloaded: boolean;
++  target_path: string;
+ };
+ 
++const OBJECT_SERVICE_URL = 'http://127.0.0.1:8088';
++
++const makeDefaults = (
++  model: Pick<
++    LocalModel | RecommendedModel,
++    'name' | 'base_url' | 'model_type' | 'max_tokens'
++  >,
++): LocalModelDefaults => ({
++  instance_name: 'local-llama-cpp',
++  model_name: model.name,
++  model_type: model.model_type,
++  base_url: model.base_url,
++  api_key: 'local',
++  max_tokens: model.max_tokens,
++});
++
++const formatSize = (sizeGb: number) =>
++  sizeGb > 0 ? `${sizeGb.toFixed(2)} GB` : '< 0.01 GB';
++
+ export const AvailableModels: FC<{
+-  handleAddModel: (factory: string) => void;
++  handleAddModel: (factory: string, defaults?: LocalModelDefaults) => void;
+ }> = ({ handleAddModel }) => {
+-  const { t } = useTranslation();
+-  const { data: factoryList } = useFetchAvailableProviders();
+-
++  const { i18n } = useTranslation();
++  const isZh = i18n.language.startsWith('zh');
++  const [localModels, setLocalModels] = useState<LocalModel[]>([]);
++  const [recommendedModels, setRecommendedModels] = useState<
++    RecommendedModel[]
++  >([]);
++  const [modelDir, setModelDir] = useState('');
+   const [searchTerm, setSearchTerm] = useState('');
+-  const [selectedTag, setSelectedTag] = useState<string | null>(null);
++  const [loading, setLoading] = useState(false);
++  const [downloadingId, setDownloadingId] = useState<string | null>(null);
++  const [error, setError] = useState('');
+ 
+-  const searchedModels = useMemo(() => {
+-    return factoryList.filter((model) =>
+-      model.name.toLowerCase().includes(searchTerm.toLowerCase()),
+-    );
+-  }, [factoryList, searchTerm]);
++  const copy = useMemo(
++    () => ({
++      title: isZh ? '本地模型' : 'Local models',
++      subtitle: isZh
++        ? '自动扫描本机 data/models。推荐模型只在点击下载后联网。'
++        : 'Scans local data/models first. Recommended models only connect when you click download.',
++      search: isZh ? '搜索本地模型或推荐模型' : 'Search local or recommended models',
++      refresh: isZh ? '重新扫描' : 'Rescan',
++      found: isZh ? '已发现' : 'Discovered',
++      empty: isZh
++        ? '未发现本地模型。可将 GGUF 放入目录，或从右侧推荐列表下载。'
++        : 'No local models found. Put GGUF files into the directory or download a recommended model.',
++      configure: isZh ? '配置' : 'Configure',
++      recommended: isZh ? '推荐下载' : 'Recommended downloads',
++      downloaded: isZh ? '已下载' : 'Downloaded',
++      download: isZh ? '下载' : 'Download',
++      open: isZh ? '打开 Hugging Face' : 'Open Hugging Face',
++      offline: isZh
++        ? '日常使用保持本地离线；下载需要你主动确认并联网。'
++        : 'Daily use stays local and offline. Downloads require an explicit online action.',
++      error: isZh ? '本地模型服务不可用' : 'Local model service is unavailable',
++    }),
++    [isZh],
++  );
+ 
+-  const filteredModels = useMemo(() => {
+-    if (selectedTag === null) {
+-      return searchedModels;
++  const loadModels = useCallback(async () => {
++    setLoading(true);
++    setError('');
++    try {
++      const [localResponse, recommendedResponse] = await Promise.all([
++        fetch(`${OBJECT_SERVICE_URL}/v1/models/local`),
++        fetch(`${OBJECT_SERVICE_URL}/v1/models/recommended`),
++      ]);
++      if (!localResponse.ok || !recommendedResponse.ok) {
++        throw new Error('model service request failed');
++      }
++      const localData = await localResponse.json();
++      const recommendedData = await recommendedResponse.json();
++      setLocalModels(localData.models ?? []);
++      setModelDir(localData.model_dir ?? '');
++      setRecommendedModels(recommendedData.models ?? []);
++    } catch (err) {
++      setError(err instanceof Error ? err.message : copy.error);
++    } finally {
++      setLoading(false);
+     }
+-    return searchedModels.filter((model) =>
+-      model.model_types.some((type) => type === selectedTag),
++  }, [copy.error]);
++
++  useEffect(() => {
++    loadModels();
++  }, [loadModels]);
++
++  const filteredLocalModels = useMemo(() => {
++    const needle = searchTerm.toLowerCase();
++    return localModels.filter(
++      (model) =>
++        model.name.toLowerCase().includes(needle) ||
++        model.file_name.toLowerCase().includes(needle),
+     );
+-  }, [searchedModels, selectedTag]);
+-
+-  // Number of providers matching each tag, respecting the current search term so
+-  // the badge always reflects how many cards are shown when the tag is selected.
+-  const tagCounts = useMemo(() => {
+-    return searchedModels.reduce<Record<string, number>>((acc, model) => {
+-      // Count each provider once per model type, even if listed more than once.
+-      new Set(model.model_types).forEach((type) => {
+-        acc[type] = (acc[type] || 0) + 1;
++  }, [localModels, searchTerm]);
++
++  const filteredRecommendedModels = useMemo(() => {
++    const needle = searchTerm.toLowerCase();
++    return recommendedModels.filter(
++      (model) =>
++        model.name.toLowerCase().includes(needle) ||
++        model.repo.toLowerCase().includes(needle),
++    );
++  }, [recommendedModels, searchTerm]);
++
++  const configureModel = (model: LocalModel | RecommendedModel) => {
++    handleAddModel(LLMFactory.OpenAiAPICompatible, makeDefaults(model));
++  };
++
++  const downloadModel = async (model: RecommendedModel) => {
++    setDownloadingId(model.id);
++    setError('');
++    try {
++      const response = await fetch(`${OBJECT_SERVICE_URL}/v1/models/download`, {
++        method: 'POST',
++        headers: { 'content-type': 'application/json' },
++        body: JSON.stringify({ id: model.id }),
+       });
+-      return acc;
+-    }, {});
+-  }, [searchedModels]);
+-
+-  const allTags = useMemo(() => {
+-    const tagsSet = new Set<string>();
+-    factoryList.forEach((model) => {
+-      model.model_types.forEach((type) => tagsSet.add(type));
+-    });
+-    const res = sortModelTypes(Array.from(tagsSet));
+-    return res;
+-  }, [factoryList]);
+-
+-  const handleTagClick = (tag: string) => {
+-    setSelectedTag(selectedTag === tag ? null : tag);
++      if (!response.ok) {
++        const data = await response.json().catch(() => ({}));
++        throw new Error(data.detail ?? 'download failed');
++      }
++      await loadModels();
++    } catch (err) {
++      setError(err instanceof Error ? err.message : copy.error);
++    } finally {
++      setDownloadingId(null);
++    }
+   };
+ 
+   return (
+@@ -104,112 +188,164 @@ export const AvailableModels: FC<{
+       className="text-text-primary h-full flex flex-col"
+       data-testid="available-models-section"
+     >
+-      <header className="p-4 space-y-3">
+-        <h3 className="text-text-primary text-base">
+-          {t('setting.availableModels')}
+-        </h3>
+-        {/* Search Bar */}
+-        <div>
+-          {/* <div className="relative"> */}
+-          <SearchInput
+-            data-testid="model-providers-search"
+-            type="text"
+-            placeholder={t('setting.search')}
+-            value={searchTerm}
+-            onChange={(e) => setSearchTerm(e.target.value)}
+-            className="w-full px-4 py-2 pl-10 bg-bg-input border border-border-default rounded-lg focus:outline-none focus:ring-1 focus:ring-border-button transition-colors"
+-          />
+-          {/* <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-5 h-5 text-text-secondary" /> */}
+-          {/* </div> */}
++      <header className="p-4 space-y-3 border-b border-border-button">
++        <div className="space-y-1">
++          <h3 className="text-text-primary text-base">{copy.title}</h3>
++          <p className="text-xs leading-5 text-text-secondary">
++            {copy.subtitle}
++          </p>
+         </div>
+-
+-        {/* Tags Filter */}
+-        <div className="flex flex-wrap gap-2">
++        <SearchInput
++          data-testid="model-providers-search"
++          type="text"
++          placeholder={copy.search}
++          value={searchTerm}
++          onChange={(e) => setSearchTerm(e.target.value)}
++          className="w-full px-4 py-2 pl-10 bg-bg-input border border-border-default rounded-lg focus:outline-none focus:ring-1 focus:ring-border-button transition-colors"
++        />
++        <div className="flex items-center justify-between gap-3">
++          <div className="min-w-0 text-xs text-text-secondary">
++            <div className="flex items-center gap-1.5">
++              <HardDrive size={14} />
++              <span className="truncate">{modelDir || 'data/models'}</span>
++            </div>
++          </div>
+           <Button
+-            variant={selectedTag === null ? 'default' : 'secondary'}
+-            size="auto"
+-            className="leading-none px-1 py-0.5 rounded-sm text-xs"
+-            onClick={() => setSelectedTag(null)}
++            variant="outline"
++            size="sm"
++            onClick={loadModels}
++            disabled={loading}
+           >
+-            All
+-            <span className="ml-1 tabular-nums opacity-60">
+-              {searchedModels.length}
+-            </span>
++            <RefreshCw size={14} className={loading ? 'animate-spin' : ''} />
++            {copy.refresh}
+           </Button>
++        </div>
++        {error && (
++          <div className="rounded-md border border-state-error/30 bg-state-error-5 px-3 py-2 text-xs text-state-error">
++            {copy.error}: {error}
++          </div>
++        )}
++      </header>
++
++      <div className="p-4 flex flex-col gap-5 overflow-auto h-full scrollbar-auto">
++        <section className="space-y-3">
++          <div className="flex items-center justify-between">
++            <h4 className="text-sm font-medium text-text-primary">
++              {copy.found}
++            </h4>
++            <span className="rounded-sm bg-bg-card px-2 py-0.5 text-xs text-text-secondary">
++              {filteredLocalModels.length}
++            </span>
++          </div>
++
++          {filteredLocalModels.length === 0 && (
++            <div className="rounded-lg border border-dashed border-border-button p-3 text-xs leading-5 text-text-secondary">
++              {copy.empty}
++            </div>
++          )}
+ 
+-          {allTags.map((tag) => (
+-            <Button
+-              variant={selectedTag === tag ? 'default' : 'secondary'}
+-              size="auto"
+-              className="leading-none px-1 py-0.5 rounded-sm text-xs"
+-              key={tag}
+-              onClick={() => handleTagClick(tag)}
++          {filteredLocalModels.map((model) => (
++            <div
++              key={model.path}
++              className="rounded-lg border border-border-button p-3 transition-colors hover:bg-bg-input"
++              data-testid="local-model-card"
+             >
+-              {mapModelKey[tag.trim() as keyof typeof mapModelKey] ||
+-                tag.trim()}
+-              <span className="ml-1 tabular-nums opacity-60">
+-                {tagCounts[tag] ?? 0}
+-              </span>
+-            </Button>
++              <div className="flex items-start justify-between gap-3">
++                <div className="min-w-0">
++                  <div className="truncate text-sm font-medium">
++                    {model.name}
++                  </div>
++                  <div className="mt-1 truncate text-xs text-text-secondary">
++                    {model.relative_path} · {formatSize(model.size_gb)}
++                  </div>
++                </div>
++                <Button
++                  size="sm"
++                  variant="outline"
++                  onClick={() => configureModel(model)}
++                >
++                  <Settings size={14} />
++                  {copy.configure}
++                </Button>
++              </div>
++            </div>
+           ))}
+-        </div>
+-      </header>
++        </section>
+ 
+-      {/* Models List */}
+-      <div className="p-4 pt-0 flex flex-col gap-4 overflow-auto h-full scrollbar-auto">
+-        {filteredModels.map((model) => (
+-          <div
+-            key={model.name}
+-            data-testid="available-model-card"
+-            data-provider={model.name}
+-            className="group border border-border-button rounded-lg p-3 hover:bg-bg-input transition-colors"
+-            onClick={() => handleAddModel(model.name)}
+-          >
+-            <div className="flex items-center space-x-3 mb-3">
+-              <LlmIcon name={model.name} imgClass="h-8 w-8 text-text-primary" />
+-              <div className="flex flex-1 gap-1.5 items-center">
+-                <div className="font-normal text-base truncate">
+-                  {model.name}
++        <section className="space-y-3">
++          <div className="space-y-1">
++            <h4 className="text-sm font-medium text-text-primary">
++              {copy.recommended}
++            </h4>
++            <p className="text-xs leading-5 text-text-secondary">
++              {copy.offline}
++            </p>
++          </div>
++
++          {filteredRecommendedModels.map((model) => (
++            <div
++              key={model.id}
++              className="rounded-lg border border-border-button p-3 transition-colors hover:bg-bg-input"
++              data-testid="recommended-model-card"
++            >
++              <div className="flex items-start justify-between gap-3">
++                <div className="min-w-0">
++                  <div className="flex items-center gap-2">
++                    <div className="truncate text-sm font-medium">
++                      {model.name}
++                    </div>
++                    {model.downloaded && (
++                      <CheckCircle2
++                        size={14}
++                        className="shrink-0 text-state-success"
++                      />
++                    )}
++                  </div>
++                  <div className="mt-1 truncate text-xs text-text-secondary">
++                    {model.repo}
++                  </div>
++                  <div className="mt-1 text-xs text-text-secondary">
++                    {model.recommended_for}
++                  </div>
+                 </div>
+-                {!!APIMapUrl[model.name as keyof typeof APIMapUrl] && (
++              </div>
++              <div className="mt-3 flex flex-wrap gap-2">
++                {model.downloaded ? (
++                  <Button
++                    size="sm"
++                    variant="outline"
++                    onClick={() => configureModel(model)}
++                  >
++                    <Settings size={14} />
++                    {copy.configure}
++                  </Button>
++                ) : (
+                   <Button
+-                    asLink
+-                    variant="ghost"
+-                    size="icon-xs"
+-                    className="size-4"
+-                    to={APIMapUrl[model.name as keyof typeof APIMapUrl]}
+-                    target="_blank"
+-                    rel="noopener noreferrer"
+-                    onClick={(e: React.MouseEvent<HTMLButtonElement>) =>
+-                      e.stopPropagation()
+-                    }
++                    size="sm"
++                    onClick={() => downloadModel(model)}
++                    disabled={downloadingId === model.id}
+                   >
+-                    <ArrowUpRight size={16} />
++                    <Download size={14} />
++                    {downloadingId === model.id
++                      ? `${copy.download}...`
++                      : copy.download}
+                   </Button>
+                 )}
+-              </div>
+-
+-              <Button
+-                size="xs"
+-                className="px-2 opacity-0 transition-all group-hover:opacity-100 group-focus-within:opacity-100"
+-              >
+-                <Plus size={12} />
+-                {t('setting.addTheModel')}
+-              </Button>
+-            </div>
+-
+-            <div className="flex flex-wrap gap-1">
+-              {sortModelTypes(model.model_types).map((type, index) => (
+-                <span
+-                  key={index}
+-                  className="px-1 flex items-center h-5 text-xs bg-bg-card text-text-secondary rounded-md"
++                <Button
++                  asLink
++                  variant="ghost"
++                  size="sm"
++                  to={`https://huggingface.co/${model.repo}`}
++                  target="_blank"
++                  rel="noreferrer noopener"
+                 >
+-                  {mapModelKey[type as keyof typeof mapModelKey] || type}
+-                </span>
+-              ))}
++                  <ExternalLink size={14} />
++                  {copy.open}
++                </Button>
++              </div>
+             </div>
+-          </div>
+-        ))}
++          ))}
++        </section>
+       </div>
+     </aside>
+   );
+diff --git a/web/src/pages/user-setting/setting-model/components/used-model.tsx b/web/src/pages/user-setting/setting-model/components/used-model.tsx
+index 0e02a87..1479627 100644
+--- a/web/src/pages/user-setting/setting-model/components/used-model.tsx
++++ b/web/src/pages/user-setting/setting-model/components/used-model.tsx
+@@ -29,13 +29,14 @@ import { useCallback, useMemo, useState } from 'react';
+ import { useTranslation } from 'react-i18next';
+ import { AddCustomModelDialog } from '../modal/provider-modal/components/add-custom-model-dialog';
+ import { useCustomModelFields } from '../modal/provider-modal/components/use-custom-model-fields';
++import type { LocalModelDefaults } from '../index';
+ import { mapModelKey } from './un-add-model';
+ 
+ export function UsedModel({
+   handleAddModel,
+   onEditInstance,
+ }: {
+-  handleAddModel: (factory: string) => void;
++  handleAddModel: (factory: string, defaults?: LocalModelDefaults) => void;
+   onEditInstance?: (
+     providerName: string,
+     instance: IProviderInstance,
+@@ -71,7 +72,7 @@ function ProviderCard({
+   onEditInstance,
+ }: {
+   provider: IAvailableProvider;
+-  handleAddModel: (factory: string) => void;
++  handleAddModel: (factory: string, defaults?: LocalModelDefaults) => void;
+   onEditInstance?: (
+     providerName: string,
+     instance: IProviderInstance,
+@@ -124,7 +125,7 @@ function InstanceRow({
+ }: {
+   instance: IProviderInstance;
+   providerName: string;
+-  handleAddModel: (factory: string) => void;
++  handleAddModel: (factory: string, defaults?: LocalModelDefaults) => void;
+   onEditInstance?: (
+     providerName: string,
+     instance: IProviderInstance,
+diff --git a/web/src/pages/user-setting/setting-model/index.tsx b/web/src/pages/user-setting/setting-model/index.tsx
+index e5254dc..c139f56 100644
+--- a/web/src/pages/user-setting/setting-model/index.tsx
++++ b/web/src/pages/user-setting/setting-model/index.tsx
+@@ -22,6 +22,15 @@ import ProviderModal, { IViewModeOkPayload } from './modal/provider-modal';
+ import SoMarkModal from './modal/somark-modal';
+ import { splitProviderPayload } from './payload-utils';
+ 
++export type LocalModelDefaults = {
++  instance_name?: string;
++  model_name?: string;
++  model_type?: string[];
++  base_url?: string;
++  api_key?: string;
++  max_tokens?: number;
++};
++
+ const ModelProviders = () => {
+   // Retained special modals
+   const {
+@@ -228,7 +237,9 @@ const ModelProviders = () => {
+   );
+ 
+   const handleAddModel = useCallback(
+-    (llmFactory: string) => {
++    (llmFactory: string, defaults?: LocalModelDefaults) => {
++      setViewMode(false);
++      setViewModeInitialValues(defaults);
+       if (isLocalLlmFactory(llmFactory)) {
+         setCurrentLlmFactory(llmFactory);
+         setProviderVisible(true);
+@@ -355,6 +366,7 @@ const ModelProviders = () => {
+   const hideProviderModal = useCallback(() => {
+     setProviderVisible(false);
+     setViewMode(false);
++    setViewModeInitialValues(undefined);
+   }, []);
+ 
+   const { onApiKeyVerifying: onSoMarkVerifying } = useVerifySettings({
+diff --git a/web/src/pages/user-setting/setting-model/modal/provider-modal/hooks/use-provider-fields.tsx b/web/src/pages/user-setting/setting-model/modal/provider-modal/hooks/use-provider-fields.tsx
+index 624d230..d1feccf 100644
+--- a/web/src/pages/user-setting/setting-model/modal/provider-modal/hooks/use-provider-fields.tsx
++++ b/web/src/pages/user-setting/setting-model/modal/provider-modal/hooks/use-provider-fields.tsx
+@@ -250,9 +250,9 @@ export const useProviderFields = ({
+   ]);
+ 
+   const defaultValues: FieldValues = useMemo(() => {
+-    // In editMode or viewMode, seed the form with the supplied
+-    // `initialValues` so the user sees the existing instance/model data.
+-    if ((editMode || viewMode) && initialValues) {
++    // Seed the form with supplied initial values. LocalMathRAG uses this for
++    // one-click local model configuration in normal add mode as well.
++    if (initialValues) {
+       return initialValues as FieldValues;
+     }
+     const result: FieldValues = {};

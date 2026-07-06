@@ -47,6 +47,14 @@ Windows 启动器必须按以下逻辑选择 root：
 - release 包可以包含 `docker/`、`scripts/`、`extensions/`、`services/` 等运行所需文件，但这些文件不能改变 root resolution 的优先级。
 - 如果修改 launcher root resolution，必须同时更新 `tests/test_contracts.py` 中的约束检查。
 
+## RAGFlow Patch Rules
+
+- `third_party/ragflow/` 是忽略目录，不能依赖直接提交其中的改动。
+- 所有 RAGFlow 二开改动必须同步生成到 `patches/ragflow/*.patch`。
+- `scripts/apply-ragflow-patches.ps1` 必须能够在干净 RAGFlow checkout 上应用补丁，也必须能在补丁已应用时安全跳过。
+- `scripts/build-ragflow-web.ps1` 是前端二开构建入口，负责先应用补丁，再安装依赖并生成 `third_party/ragflow/web/dist`。
+- 如果 `third_party/ragflow/web/dist` 存在，launcher 和 `scripts/dev-up.ps1` 必须挂载 `docker/docker-compose.webdist.yml`，让容器使用本地构建后的前端。
+
 ## Encoding Rule
 
 含中文的 `.md`、`.txt`、`.ps1`、`.py`、`.yaml`、`.yml` 文件必须使用 UTF-8 with BOM。测试会检查这一点。

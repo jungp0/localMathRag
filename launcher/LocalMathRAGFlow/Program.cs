@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Net.Http.Json;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -19,9 +20,10 @@ internal static class Program
     }
 }
 
-internal sealed class TrayContext : ApplicationContext
+internal sealed partial class TrayContext : ApplicationContext
 {
     private readonly NotifyIcon tray;
+    private readonly ContextMenuStrip menu;
     private readonly ToolStripMenuItem statusItem;
     private readonly ToolStripMenuItem startItem;
     private readonly ToolStripMenuItem stopItem;
@@ -30,6 +32,7 @@ internal sealed class TrayContext : ApplicationContext
     private readonly string root;
     private readonly string logDir;
     private readonly Icon appIcon;
+    private Process? browserProcess;
     private string lastStatus = "";
     private CancellationTokenSource? currentRun;
 
@@ -51,27 +54,34 @@ internal sealed class TrayContext : ApplicationContext
         startItem = MenuItem("Start services", async () => await StartServicesAsync(openBrowser: true), MenuGlyph.Play());
         stopItem = MenuItem("Stop services", async () => await StopServicesAsync(), MenuGlyph.Stop());
         restartItem = MenuItem("Restart services", async () => await RestartServicesAsync(), MenuGlyph.Restart());
+        menu = CreateMenu();
 
         tray = new NotifyIcon
         {
             Icon = appIcon,
             Text = "LocalMathRAGFlow",
-            Visible = true,
-            ContextMenuStrip = CreateMenu()
+            Visible = true
         };
-        tray.ContextMenuStrip.Items.Add(statusItem);
-        tray.ContextMenuStrip.Items.Add(new ToolStripSeparator());
-        tray.ContextMenuStrip.Items.Add(MenuItem("Open RAGFlow", async () => await OpenRagflowAsync(CancellationToken.None), MenuGlyph.Open()));
-        tray.ContextMenuStrip.Items.Add(MenuItem("Open object service", () => OpenUrl("http://127.0.0.1:8088/health"), MenuGlyph.Link()));
-        tray.ContextMenuStrip.Items.Add(startItem);
-        tray.ContextMenuStrip.Items.Add(stopItem);
-        tray.ContextMenuStrip.Items.Add(restartItem);
-        tray.ContextMenuStrip.Items.Add(new ToolStripSeparator());
-        tray.ContextMenuStrip.Items.Add(MenuItem("Open data directory", () => OpenPath(Path.Combine(root, "data")), MenuGlyph.Folder()));
-        tray.ContextMenuStrip.Items.Add(MenuItem("View launcher log", () => OpenPath(LogFile), MenuGlyph.Log()));
-        tray.ContextMenuStrip.Items.Add(MenuItem("View compose log", () => OpenPath(ComposeLogFile), MenuGlyph.Log()));
-        tray.ContextMenuStrip.Items.Add(new ToolStripSeparator());
-        tray.ContextMenuStrip.Items.Add(MenuItem("Exit", async () => await ExitAsync(), MenuGlyph.Exit()));
+        tray.MouseUp += (_, e) =>
+        {
+            if (e.Button == MouseButtons.Right)
+            {
+                ShowTrayMenu();
+            }
+        };
+        menu.Items.Add(statusItem);
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add(MenuItem("Open RAGFlow", async () => await OpenRagflowAsync(CancellationToken.None), MenuGlyph.Open()));
+        menu.Items.Add(MenuItem("Open object service", () => OpenUrl("http://127.0.0.1:8088/health"), MenuGlyph.Link()));
+        menu.Items.Add(startItem);
+        menu.Items.Add(stopItem);
+        menu.Items.Add(restartItem);
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add(MenuItem("Open data directory", () => OpenPath(Path.Combine(root, "data")), MenuGlyph.Folder()));
+        menu.Items.Add(MenuItem("View launcher log", () => OpenPath(LogFile), MenuGlyph.Log()));
+        menu.Items.Add(MenuItem("View compose log", () => OpenPath(ComposeLogFile), MenuGlyph.Log()));
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add(MenuItem("Exit", async () => await ExitAsync(), MenuGlyph.Exit()));
         tray.DoubleClick += async (_, _) => await OpenRagflowAsync(CancellationToken.None);
 
         _ = StartServicesAsync(openBrowser: true);
@@ -162,7 +172,7 @@ internal sealed class TrayContext : ApplicationContext
             }
 
             SetStatus("starting containers");
-            await RunDockerComposeAsync("up -d", currentRun.Token);
+            await RunDockerComposeAsync("up -d --build", currentRun.Token);
             SetStatus("waiting for RAGFlow web");
             var webReady = await WaitForHttpOkAsync($"{WebUrl}/api/v1/system/config", TimeSpan.FromMinutes(3), currentRun.Token);
             SetStatus("running");
@@ -237,12 +247,14 @@ internal sealed class TrayContext : ApplicationContext
         }
         tray.Visible = false;
         appIcon.Dispose();
+        menu.Dispose();
         tray.Dispose();
         ExitThread();
     }
 
     private string RagflowDockerDir => Path.Combine(root, "third_party", "ragflow", "docker");
     private string OverrideCompose => Path.Combine(root, "docker", "docker-compose.localmathrag.yml");
+    private string WebDistCompose => Path.Combine(root, "docker", "docker-compose.webdist.yml");
 
     private static Icon LoadAppIcon(string root)
     {
@@ -259,7 +271,12 @@ internal sealed class TrayContext : ApplicationContext
     private async Task OpenRagflowAsync(CancellationToken token)
     {
         var loginUrl = await TryBuildAutoLoginUrlAsync(token);
-        OpenUrl(loginUrl ?? WebUrl);
+        OpenOrFocusAppWindow(loginUrl ?? WebUrl);
+    }
+
+    private void ShowTrayMenu()
+    {
+        menu.Show(Cursor.Position);
     }
 
     private async Task<string?> TryBuildAutoLoginUrlAsync(CancellationToken token)
@@ -310,7 +327,13 @@ MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArq9XTUSeYr2+N1h3Afl/z8Dse/2yD0ZGrKwx
 
     private async Task RunDockerComposeAsync(string args, CancellationToken token)
     {
-        var composeArgs = $"compose -f docker-compose.yml -f \"{OverrideCompose}\" {args}";
+        var composeFiles = $"-f docker-compose.yml -f \"{OverrideCompose}\"";
+        if (Directory.Exists(Path.Combine(root, "third_party", "ragflow", "web", "dist")) &&
+            File.Exists(WebDistCompose))
+        {
+            composeFiles += $" -f \"{WebDistCompose}\"";
+        }
+        var composeArgs = $"compose {composeFiles} {args}";
         var env = new Dictionary<string, string?>
         {
             ["LOCALMATHRAG_ROOT"] = root,
@@ -607,6 +630,67 @@ MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArq9XTUSeYr2+N1h3Afl/z8Dse/2yD0ZGrKwx
         return candidates.FirstOrDefault() ?? Directory.GetCurrentDirectory();
     }
 
+    private void OpenOrFocusAppWindow(string url)
+    {
+        if (TryFocusBrowserProcess())
+        {
+            return;
+        }
+
+        var browser = FindChromiumBrowser();
+        if (browser is not null)
+        {
+            var profileDir = Path.Combine(root, "data", "launcher", "browser-profile");
+            Directory.CreateDirectory(profileDir);
+            browserProcess = Process.Start(new ProcessStartInfo
+            {
+                FileName = browser,
+                Arguments = $"--app=\"{url}\" --user-data-dir=\"{profileDir}\" --no-first-run",
+                UseShellExecute = false
+            });
+            return;
+        }
+
+        OpenUrl(url);
+    }
+
+    private bool TryFocusBrowserProcess()
+    {
+        try
+        {
+            if (browserProcess is null || browserProcess.HasExited)
+            {
+                return false;
+            }
+            browserProcess.Refresh();
+            if (browserProcess.MainWindowHandle == IntPtr.Zero)
+            {
+                return false;
+            }
+            ShowWindow(browserProcess.MainWindowHandle, ShowWindowRestore);
+            SetForegroundWindow(browserProcess.MainWindowHandle);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static string? FindChromiumBrowser()
+    {
+        var candidates = new[]
+        {
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Microsoft", "Edge", "Application", "msedge.exe"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Microsoft", "Edge", "Application", "msedge.exe"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Microsoft", "Edge", "Application", "msedge.exe"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Google", "Chrome", "Application", "chrome.exe"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Google", "Chrome", "Application", "chrome.exe"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Google", "Chrome", "Application", "chrome.exe")
+        };
+        return candidates.FirstOrDefault(File.Exists);
+    }
+
     private static void OpenUrl(string url) => Process.Start(new ProcessStartInfo { FileName = url, UseShellExecute = true });
 
     private static void OpenPath(string path)
@@ -618,6 +702,17 @@ MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArq9XTUSeYr2+N1h3Afl/z8Dse/2yD0ZGrKwx
         }
         Process.Start(new ProcessStartInfo { FileName = path, UseShellExecute = true });
     }
+}
+
+internal sealed partial class TrayContext
+{
+    private const int ShowWindowRestore = 9;
+
+    [DllImport("user32.dll")]
+    private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 }
 
 internal sealed class ModernMenuRenderer : ToolStripProfessionalRenderer

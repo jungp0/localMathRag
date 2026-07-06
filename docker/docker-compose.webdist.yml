@@ -1,0 +1,8 @@
+services:
+  ragflow-cpu:
+    volumes:
+      - ${LOCALMATHRAG_ROOT}/third_party/ragflow/web/dist:/ragflow/web/dist:ro
+
+  ragflow-gpu:
+    volumes:
+      - ${LOCALMATHRAG_ROOT}/third_party/ragflow/web/dist:/ragflow/web/dist:ro
