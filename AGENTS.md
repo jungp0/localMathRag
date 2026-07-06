@@ -1,0 +1,52 @@
+﻿# LocalMathRAGFlow Agent Rules
+
+本仓库已经从独立 Python/EXE RAG 工具切换为基于 RAGFlow Docker 的二开工作区。后续 agent 修改时必须遵守以下规则，避免再次出现从 `dist` 启动后误判根目录、重复下载依赖或模型的问题。
+
+## 目录职责
+
+- `D:\LookupTool` 是开发根目录，也是当前默认 workspace root。
+- `data/` 是本地持久化数据目录，始终被 git 忽略。这里保存模型、日志、知识库、运行缓存等，不要删除或提交。
+- `data/models/` 保存本地 GGUF 或其他模型文件。已存在模型必须优先复用，不要因为从 release/dist 启动而重复下载。
+- `third_party/ragflow/` 保存上游或 fork 后的 RAGFlow 源码，始终被 git 忽略。开发环境优先复用这里的源码。
+- `docker/` 保存 LocalMathRAGFlow 对 RAGFlow compose 的覆盖文件。
+- `extensions/local_math_rag/` 保存 schema、prompt、pipeline 和 API 合约。
+- `services/object_service/` 保存结构化对象 sidecar 服务。
+- `launcher/LocalMathRAGFlow/` 保存 Windows 托盘 EXE 启动器源码。
+- `dist/` 是构建产物目录，始终被 git 忽略。不要把它当成权威开发根目录，不要提交其中内容。
+
+## Launcher Root Resolution
+
+Windows 启动器必须按以下逻辑选择 root：
+
+1. 从 `AppContext.BaseDirectory` 开始向父目录扫描候选 root。
+2. 候选 root 必须同时包含：
+   - `docker/docker-compose.localmathrag.yml`
+   - `scripts/`
+3. 在候选 root 中，优先选择已经存在：
+   - `third_party/ragflow/docker/docker-compose.yml`
+4. 如果没有任何候选 root 已安装 RAGFlow，才使用第一个候选 root。
+5. 只有在选定 root 下缺少 `third_party/ragflow/docker` 时，才允许弹窗询问是否下载 RAGFlow。
+
+这意味着：
+
+- 从 `D:\LookupTool\dist\LocalMathRAGFlow-win-x64\LocalMathRAGFlow.exe` 启动时，如果父级 `D:\LookupTool\third_party/ragflow` 已存在，必须复用 `D:\LookupTool` 作为 root。
+- 不允许因为 `dist` 目录中也有 `docker/` 和 `scripts/` 就直接把 `dist` 当作最终 root。
+- 不允许从 `dist` 启动时重复下载 RAGFlow 或模型。
+
+## Dependency And Download Rules
+
+- Docker Desktop 未运行时，launcher 可以自动启动 Docker Desktop 并等待 Docker daemon ready。
+- Docker Desktop 未安装时，只能提示用户安装，不能静默安装。
+- RAGFlow 源码缺失时，必须弹窗确认后再下载。
+- 模型缺失时，必须弹窗确认后再下载；已有 `data/models` 中的模型必须优先复用。
+- 日常运行应保持离线优先，联网行为必须由用户显式确认。
+
+## Build And Release Rules
+
+- `scripts/build-launcher.ps1` 只负责生成本地 release 包，不提交 `dist/`。
+- release 包可以包含 `docker/`、`scripts/`、`extensions/`、`services/` 等运行所需文件，但这些文件不能改变 root resolution 的优先级。
+- 如果修改 launcher root resolution，必须同时更新 `tests/test_contracts.py` 中的约束检查。
+
+## Encoding Rule
+
+含中文的 `.md`、`.txt`、`.ps1`、`.py`、`.yaml`、`.yml` 文件必须使用 UTF-8 with BOM。测试会检查这一点。

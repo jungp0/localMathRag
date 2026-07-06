@@ -11,6 +11,8 @@ LocalMathRAGFlow 是基于 RAGFlow 的工程文档问答二开工作区。当前
 
 完整二开方案见 [docs/ragflow-secondary-development.md](docs/ragflow-secondary-development.md)。
 
+后续 agent 和维护者必须先阅读 [AGENTS.md](AGENTS.md)。其中固化了目录职责、launcher root resolution、依赖下载和 release 构建规则，防止从 `dist` 启动时重复下载 RAGFlow 或模型。
+
 ## 仓库结构
 
 ```text

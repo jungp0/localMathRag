@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 from pathlib import Path
@@ -62,6 +62,15 @@ def test_windows_launcher_exists() -> None:
     assert "installedRoot" in program_text
     assert "third_party" in program_text
     assert "ragflow" in program_text
+
+
+def test_agent_rules_document_root_resolution() -> None:
+    rules = ROOT / "AGENTS.md"
+    assert rules.exists()
+    text = read_text(rules)
+    assert "Launcher Root Resolution" in text
+    assert "third_party/ragflow/docker/docker-compose.yml" in text
+    assert "不允许从 `dist` 启动时重复下载 RAGFlow 或模型" in text
 
 
 def main() -> None:
