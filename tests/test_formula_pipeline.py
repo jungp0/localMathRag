@@ -12,9 +12,10 @@ from lookup_tool.parsers import DocumentParser
 class FormulaPipelineTest(unittest.TestCase):
     def test_non_ascii_text_files_use_utf8_bom(self) -> None:
         checked_suffixes = {".py", ".md", ".csv", ".txt", ".html", ".css", ".js"}
+        ignored_parts = {".git", ".venv", "venv", "env", "dist", "build", "bin", "obj", "__pycache__"}
         offenders: list[str] = []
         for path in Path(".").rglob("*"):
-            if not path.is_file() or ".git" in path.parts or path.suffix.lower() not in checked_suffixes:
+            if not path.is_file() or ignored_parts.intersection(path.parts) or path.suffix.lower() not in checked_suffixes:
                 continue
             data = path.read_bytes()
             try:

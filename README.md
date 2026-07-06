@@ -14,44 +14,23 @@
 
 ## 快速开始
 
-Windows 本机一键启动：
+Windows 本地桌面版以 `LocalMathRAG.exe` 为主入口：
 
-```powershell
-# 首次或更新 llama.cpp 运行器时执行一次，会访问 GitHub release 下载二进制包
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\Install-LlamaCpp.ps1 -Flavor cuda-12.4
+1. 从 GitHub Release 下载 `LocalMathRAG-win-x64.zip`。
+2. 解压到本地目录。
+3. 双击 `LocalMathRAG.exe`。
 
-# 之后直接双击或命令行运行
-.\scripts\Start-LocalMathRAG.cmd
+`LocalMathRAG.exe` 会静默启动 WebApp 和 llama.cpp，不弹出后端命令行窗口。
+首次运行时会自动下载 llama.cpp Windows 运行器和推荐 GGUF 模型，下载完成后
+日常使用保持本地离线。启动后默认打开：
+
+```text
+http://127.0.0.1:8765
 ```
 
-启动脚本会：
-
-- 查找 `data\runtime\llama.cpp\...\llama-server.exe`。
-- 用 `data\models\Qwen3-8B-Q4_K_M.gguf` 启动 `http://127.0.0.1:8080/v1`。
-- 加入 `--reasoning off`，让 Qwen3 直接返回 `message.content`。
-- 启动 WebApp `http://127.0.0.1:8765`。
-- 自动保存 WebApp 模型设置。
-
-停止：
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\Stop-LocalMathRAG.ps1
-```
-
-Docker 可选启动：
-
-```powershell
-# 仅启动 WebApp
-docker compose -f docker-compose.local.yml up --build webapp
-
-# WebApp + llama.cpp CPU
-docker compose -f docker-compose.local.yml --profile llama-cpu up --build
-
-# WebApp + llama.cpp CUDA，需要 Docker GPU runtime / NVIDIA Container Toolkit
-docker compose -f docker-compose.local.yml --profile llama-cuda up --build
-```
-
-本机 Windows + 4060 推荐优先使用 `Start-LocalMathRAG.cmd`，因为已经验证可直接调用 Windows CUDA 版 llama.cpp。Docker 更适合未来迁移到 Linux 工作站或服务器。
+系统托盘菜单支持打开 WebApp、启动/停止/重启服务、查看日志和打开数据目录。
+Docker 已归档为后续云端/局域网多客户端部署方案，见
+[`docs/deployment/docker-cloud.md`](docs/deployment/docker-cloud.md)。
 
 ```powershell
 # 使用当前 Codex bundled Python 示例
@@ -318,6 +297,35 @@ Compact output:
   ]
 }
 ```
+
+## 发布构建与故障排查
+
+普通用户不需要运行脚本。脚本只用于开发、CI 或故障排查。
+
+构建 GitHub Release 便携包：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\Build-Release.ps1
+```
+
+输出：
+
+```text
+dist/LocalMathRAG-win-x64.zip
+```
+
+开发时也可以直接启动脚本路径：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\Install-LlamaCpp.ps1 -Flavor cuda-12.4
+.\scripts\Start-LocalMathRAG.cmd
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\Stop-LocalMathRAG.ps1
+```
+
+这些脚本不是最终用户主入口；正式分发请使用 `LocalMathRAG.exe`。
+
+Docker 只作为后续云端/多客户端部署预留，详见
+[`docs/deployment/docker-cloud.md`](docs/deployment/docker-cloud.md)。
 
 ## 可选增强
 
