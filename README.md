@@ -21,8 +21,10 @@ Windows 本地桌面版以 `LocalMathRAG.exe` 为主入口：
 3. 双击 `LocalMathRAG.exe`。
 
 `LocalMathRAG.exe` 会静默启动 WebApp 和 llama.cpp，不弹出后端命令行窗口。
-首次运行时会自动下载 llama.cpp Windows 运行器和推荐 GGUF 模型，下载完成后
-日常使用保持本地离线。启动后默认打开：
+如果缺少 llama.cpp 运行器或推荐 GGUF 模型，程序会先弹出确认窗口；你可以
+一键下载到默认数据目录，也可以选择自定义数据/下载目录。模型、运行器、
+下载缓存、日志和知识库都会放在该数据目录下。下载完成后日常使用保持本地离线。
+启动后默认打开：
 
 ```text
 http://127.0.0.1:8765

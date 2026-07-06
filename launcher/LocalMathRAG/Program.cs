@@ -31,15 +31,17 @@ internal sealed class LauncherContext : ApplicationContext
     private const int LlamaPort = 8080;
     private const string ModelFileName = "Qwen3-8B-Q4_K_M.gguf";
     private const string ModelUrl = "https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf?download=true";
+    private const string LauncherSettingsFileName = "launcher.settings.json";
 
     private readonly NotifyIcon notifyIcon;
     private readonly ToolStripMenuItem startItem;
     private readonly ToolStripMenuItem stopItem;
     private readonly string rootDir;
-    private readonly string dataDir;
-    private readonly string modelsDir;
-    private readonly string runtimeDir;
-    private readonly string downloadsDir;
+    private readonly string settingsPath;
+    private string dataDir = "";
+    private string modelsDir = "";
+    private string runtimeDir = "";
+    private string downloadsDir = "";
     private Process? webProcess;
     private Process? llamaProcess;
     private bool servicesStarting;
@@ -47,15 +49,8 @@ internal sealed class LauncherContext : ApplicationContext
     public LauncherContext()
     {
         rootDir = ResolveRootDir();
-        dataDir = Path.Combine(rootDir, "data");
-        modelsDir = Path.Combine(dataDir, "models");
-        runtimeDir = Path.Combine(dataDir, "runtime");
-        downloadsDir = Path.Combine(runtimeDir, "downloads");
-
-        Directory.CreateDirectory(dataDir);
-        Directory.CreateDirectory(modelsDir);
-        Directory.CreateDirectory(runtimeDir);
-        Directory.CreateDirectory(downloadsDir);
+        settingsPath = Path.Combine(rootDir, LauncherSettingsFileName);
+        SetDataDirectory(ResolveInitialDataDirectory(), persist: false);
 
         startItem = new ToolStripMenuItem("Start services", null, async (_, _) => await StartServicesAsync(openBrowser: true));
         stopItem = new ToolStripMenuItem("Stop services", null, (_, _) => StopServices());
@@ -74,6 +69,7 @@ internal sealed class LauncherContext : ApplicationContext
         notifyIcon.ContextMenuStrip.Items.Add(new ToolStripSeparator());
         notifyIcon.ContextMenuStrip.Items.Add(new ToolStripMenuItem("View logs", null, (_, _) => OpenLogs()));
         notifyIcon.ContextMenuStrip.Items.Add(new ToolStripMenuItem("Open data directory", null, (_, _) => OpenPath(dataDir)));
+        notifyIcon.ContextMenuStrip.Items.Add(new ToolStripMenuItem("Choose data/download directory", null, (_, _) => ChooseDataDirectory()));
         notifyIcon.ContextMenuStrip.Items.Add(new ToolStripSeparator());
         notifyIcon.ContextMenuStrip.Items.Add(new ToolStripMenuItem("Exit", null, (_, _) => Exit()));
         notifyIcon.DoubleClick += (_, _) => OpenWebApp();
@@ -103,10 +99,10 @@ internal sealed class LauncherContext : ApplicationContext
         try
         {
             ShowStatus("Starting LocalMathRAG...");
-            var modelPath = Path.Combine(modelsDir, ModelFileName);
+            var modelPath = FindModelPath() ?? Path.Combine(modelsDir, ModelFileName);
             var llamaServer = await EnsureLlamaServerAsync();
             var activeLlamaServer = llamaServer;
-            await EnsureModelAsync(modelPath);
+            modelPath = await EnsureModelAsync(modelPath);
 
             if (!await IsHttpReadyAsync($"http://{Host}:{LlamaPort}/v1/models", TimeSpan.FromSeconds(2)))
             {
@@ -126,7 +122,7 @@ internal sealed class LauncherContext : ApplicationContext
             if (!await IsHttpReadyAsync($"http://{Host}:{LlamaPort}/v1/models", TimeSpan.FromMinutes(3)))
             {
                 ShowStatus("CUDA llama.cpp did not start; trying CPU runtime.");
-                llamaProcess?.Kill(entireProcessTree: true);
+                KillProcessTree(llamaProcess);
                 var cpuServer = await EnsureLlamaServerAsync("cpu", allowAnyExisting: false);
                 activeLlamaServer = cpuServer;
                 llamaProcess = StartHidden(
@@ -201,6 +197,22 @@ internal sealed class LauncherContext : ApplicationContext
         ShowStatus("LocalMathRAG services stopped.");
     }
 
+    private void ChooseDataDirectory()
+    {
+        using var dialog = new FolderBrowserDialog
+        {
+            Description = "Select the LocalMathRAG data directory. Models, llama.cpp runtime, downloads, logs, and knowledge bases will be stored here.",
+            UseDescriptionForTitle = true,
+            SelectedPath = dataDir,
+            ShowNewFolderButton = true,
+        };
+        if (dialog.ShowDialog() == DialogResult.OK && !string.IsNullOrWhiteSpace(dialog.SelectedPath))
+        {
+            SetDataDirectory(dialog.SelectedPath, persist: true);
+            ShowStatus("Data/download directory updated.");
+        }
+    }
+
     private void Exit()
     {
         StopServices();
@@ -220,11 +232,27 @@ internal sealed class LauncherContext : ApplicationContext
         {
             if (process is { HasExited: false })
             {
-                process.Kill(entireProcessTree: true);
+                KillProcessTree(process);
             }
         }
         catch
         {
+        }
+    }
+
+    private static void KillProcessTree(Process? process)
+    {
+        if (process is null || process.HasExited)
+        {
+            return;
+        }
+        try
+        {
+            process.Kill(entireProcessTree: true);
+        }
+        catch
+        {
+            process.Kill();
         }
     }
 
@@ -234,6 +262,13 @@ internal sealed class LauncherContext : ApplicationContext
         if (existing is not null)
         {
             return existing;
+        }
+
+        if (!ConfirmDownloadLocation(
+                $"llama.cpp {preferredFlavor} runtime is missing.",
+                "LocalMathRAG needs llama.cpp to run the local model service. Download now?"))
+        {
+            throw new InvalidOperationException("llama.cpp runtime is missing. Download was cancelled.");
         }
 
         try
@@ -248,17 +283,25 @@ internal sealed class LauncherContext : ApplicationContext
 
     private string? FindLlamaServer(string? flavor = null)
     {
-        var llamaRoot = Path.Combine(runtimeDir, "llama.cpp");
-        if (!Directory.Exists(llamaRoot))
+        foreach (var root in CandidateDataDirectories())
         {
-            return null;
-        }
+            var llamaRoot = Path.Combine(root, "runtime", "llama.cpp");
+            if (!Directory.Exists(llamaRoot))
+            {
+                continue;
+            }
 
-        var files = Directory.GetFiles(llamaRoot, "llama-server.exe", SearchOption.AllDirectories)
-            .Where(path => flavor is null || path.Contains(flavor, StringComparison.OrdinalIgnoreCase))
-            .OrderByDescending(File.GetLastWriteTimeUtc)
-            .ToArray();
-        return files.FirstOrDefault();
+            var files = Directory.GetFiles(llamaRoot, "llama-server.exe", SearchOption.AllDirectories)
+                .Where(path => flavor is null || path.Contains(flavor, StringComparison.OrdinalIgnoreCase))
+                .OrderByDescending(File.GetLastWriteTimeUtc)
+                .ToArray();
+            if (files.FirstOrDefault() is { } found)
+            {
+                SetDataDirectory(root, persist: true);
+                return found;
+            }
+        }
+        return null;
     }
 
     private async Task<string> InstallLlamaCppAsync(string flavor)
@@ -320,16 +363,25 @@ internal sealed class LauncherContext : ApplicationContext
         return null;
     }
 
-    private async Task EnsureModelAsync(string modelPath)
+    private async Task<string> EnsureModelAsync(string modelPath)
     {
         if (File.Exists(modelPath) && new FileInfo(modelPath).Length > 0)
         {
-            return;
+            return modelPath;
         }
 
+        if (!ConfirmDownloadLocation(
+                "Qwen3-8B GGUF model is missing.",
+                "LocalMathRAG can download the recommended Qwen3-8B-Q4_K_M model now. The model is large. Download now?"))
+        {
+            throw new InvalidOperationException("Model file is missing. Download was cancelled.");
+        }
+
+        modelPath = Path.Combine(modelsDir, ModelFileName);
         Directory.CreateDirectory(Path.GetDirectoryName(modelPath)!);
         using var client = CreateHttpClient();
         await DownloadFileAsync(client, ModelUrl, modelPath, "Downloading Qwen3-8B model");
+        return modelPath;
     }
 
     private async Task DownloadFileAsync(HttpClient client, string url, string target, string label)
@@ -390,6 +442,143 @@ internal sealed class LauncherContext : ApplicationContext
         var json = JsonSerializer.Serialize(payload);
         using var body = new StringContent(json, Encoding.UTF8, "application/json");
         await client.PatchAsync($"http://{Host}:{WebPort}/api/model/settings", body);
+    }
+
+    private string? FindModelPath()
+    {
+        foreach (var root in CandidateDataDirectories())
+        {
+            var modelPath = Path.Combine(root, "models", ModelFileName);
+            if (File.Exists(modelPath) && new FileInfo(modelPath).Length > 0)
+            {
+                SetDataDirectory(root, persist: true);
+                return modelPath;
+            }
+        }
+        return null;
+    }
+
+    private bool ConfirmDownloadLocation(string title, string message)
+    {
+        var detail = message + Environment.NewLine + Environment.NewLine +
+            $"Yes: download to the default/current data directory:{Environment.NewLine}{dataDir}{Environment.NewLine + Environment.NewLine}" +
+            "No: choose another data/download directory." + Environment.NewLine +
+            "Cancel: do not download.";
+        var choice = MessageBox.Show(detail, title, MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+        if (choice == DialogResult.Cancel)
+        {
+            return false;
+        }
+        if (choice == DialogResult.No)
+        {
+            using var dialog = new FolderBrowserDialog
+            {
+                Description = "Select the LocalMathRAG data/download directory. Models, runtime files, downloads, logs, and knowledge bases will be stored here.",
+                UseDescriptionForTitle = true,
+                SelectedPath = dataDir,
+                ShowNewFolderButton = true,
+            };
+            if (dialog.ShowDialog() != DialogResult.OK || string.IsNullOrWhiteSpace(dialog.SelectedPath))
+            {
+                return false;
+            }
+            SetDataDirectory(dialog.SelectedPath, persist: true);
+        }
+        else
+        {
+            SetDataDirectory(dataDir, persist: true);
+        }
+        return true;
+    }
+
+    private void SetDataDirectory(string path, bool persist)
+    {
+        dataDir = Path.GetFullPath(path);
+        modelsDir = Path.Combine(dataDir, "models");
+        runtimeDir = Path.Combine(dataDir, "runtime");
+        downloadsDir = Path.Combine(runtimeDir, "downloads");
+        Directory.CreateDirectory(dataDir);
+        Directory.CreateDirectory(modelsDir);
+        Directory.CreateDirectory(runtimeDir);
+        Directory.CreateDirectory(downloadsDir);
+        if (persist)
+        {
+            var json = JsonSerializer.Serialize(new LauncherSettings(dataDir), new JsonSerializerOptions { WriteIndented = true });
+            File.WriteAllText(settingsPath, json, Encoding.UTF8);
+        }
+    }
+
+    private string ResolveInitialDataDirectory()
+    {
+        var configured = Environment.GetEnvironmentVariable("LOCALMATHRAG_DATA_DIR");
+        if (!string.IsNullOrWhiteSpace(configured))
+        {
+            return Path.GetFullPath(configured);
+        }
+
+        if (File.Exists(settingsPath))
+        {
+            try
+            {
+                var settings = JsonSerializer.Deserialize<LauncherSettings>(File.ReadAllText(settingsPath, Encoding.UTF8));
+                if (!string.IsNullOrWhiteSpace(settings?.DataDirectory))
+                {
+                    return Path.GetFullPath(settings.DataDirectory);
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        foreach (var candidate in CandidateDataDirectories())
+        {
+            if (HasUsefulData(candidate))
+            {
+                return candidate;
+            }
+        }
+        return Path.Combine(rootDir, "data");
+    }
+
+    private IEnumerable<string> CandidateDataDirectories()
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var candidate in BuildCandidateDataDirectories())
+        {
+            var full = Path.GetFullPath(candidate);
+            if (seen.Add(full))
+            {
+                yield return full;
+            }
+        }
+    }
+
+    private IEnumerable<string> BuildCandidateDataDirectories()
+    {
+        if (!string.IsNullOrWhiteSpace(dataDir))
+        {
+            yield return dataDir;
+        }
+        yield return Path.Combine(rootDir, "data");
+
+        var current = new DirectoryInfo(rootDir);
+        for (var i = 0; i < 6 && current is not null; i++, current = current.Parent)
+        {
+            yield return Path.Combine(current.FullName, "data");
+            if (File.Exists(Path.Combine(current.FullName, "pyproject.toml")))
+            {
+                yield return Path.Combine(current.FullName, "data");
+            }
+        }
+    }
+
+    private static bool HasUsefulData(string candidate)
+    {
+        return File.Exists(Path.Combine(candidate, "models", ModelFileName)) ||
+            Directory.Exists(Path.Combine(candidate, "runtime", "llama.cpp")) ||
+            File.Exists(Path.Combine(candidate, "app.sqlite")) ||
+            Directory.Exists(Path.Combine(candidate, "kbs"));
     }
 
     private static HttpClient CreateHttpClient()
@@ -501,4 +690,6 @@ internal sealed class LauncherContext : ApplicationContext
         }
         return AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
     }
+
+    private sealed record LauncherSettings(string DataDirectory);
 }

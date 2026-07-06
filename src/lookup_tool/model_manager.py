@@ -16,8 +16,7 @@ DEFAULT_MODEL_URL = (
 
 
 def model_status(settings: dict[str, Any]) -> dict[str, Any]:
-    local_path_raw = str(settings.get("local_model_path") or "").strip()
-    local_path = Path(local_path_raw) if local_path_raw else None
+    local_path = find_installed_model(settings)
     base_url = str(settings.get("base_url") or "").rstrip("/")
     installed_llama = find_installed_llama_server(settings)
     return {
@@ -31,6 +30,25 @@ def model_status(settings: dict[str, Any]) -> dict[str, Any]:
         "endpoint_ok": endpoint_ok(base_url),
         "available_ollama_models": list_ollama_models() if shutil.which("ollama") else [],
     }
+
+
+def find_installed_model(settings: dict[str, Any]) -> Path | None:
+    configured_raw = str(settings.get("local_model_path") or "").strip()
+    if configured_raw:
+        configured = Path(configured_raw)
+        if configured.exists():
+            return configured
+    model_name = str(settings.get("recommended_file") or "Qwen3-8B-Q4_K_M.gguf")
+    search_roots: list[Path] = []
+    local_models_dir_raw = str(settings.get("local_models_dir") or "").strip()
+    if local_models_dir_raw:
+        search_roots.append(Path(local_models_dir_raw))
+    search_roots.extend(data_root / "models" for data_root in candidate_data_roots())
+    for root in search_roots:
+        candidate = root / model_name
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def endpoint_ok(base_url: str) -> bool:
@@ -58,7 +76,7 @@ def find_installed_llama_server(settings: dict[str, Any]) -> Path | None:
         search_roots.append(Path(local_models_dir_raw).parent / "runtime" / "llama.cpp")
     if local_model_path_raw:
         search_roots.append(Path(local_model_path_raw).parent.parent / "runtime" / "llama.cpp")
-    search_roots.append(Path.cwd() / "data" / "runtime" / "llama.cpp")
+    search_roots.extend(data_root / "runtime" / "llama.cpp" for data_root in candidate_data_roots())
     for root in search_roots:
         if not root.exists():
             continue
@@ -66,6 +84,21 @@ def find_installed_llama_server(settings: dict[str, Any]) -> Path | None:
         if found:
             return found[0]
     return None
+
+
+def candidate_data_roots() -> list[Path]:
+    roots: list[Path] = []
+    current = Path.cwd().resolve()
+    for item in [current, *current.parents]:
+        roots.append(item / "data")
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for root in roots:
+        key = str(root).lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(root)
+    return unique
 
 
 def list_ollama_models() -> list[str]:
