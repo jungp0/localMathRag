@@ -1,0 +1,26 @@
+[storage]
+db_path = "data/lookup.sqlite"
+artifact_dir = "data/artifacts"
+
+[parser]
+enable_formula_detection = true
+enable_ocr = false
+prefer_docling = true
+chunk_target_chars = 1200
+chunk_overlap_chars = 180
+
+[retrieval]
+top_k = 12
+formula_boost = 2.2
+context_window = 1
+
+[generation]
+enabled = false
+provider = "openai_compatible"
+base_url = "http://127.0.0.1:11434/v1"
+model = "qwen3-8b-q4"
+temperature = 0
+timeout_seconds = 60
+
+[output]
+mode = "agent_compact"

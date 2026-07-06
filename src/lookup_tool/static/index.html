@@ -1,0 +1,203 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Local Math RAG</title>
+    <link rel="stylesheet" href="/static/app.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">LMR</div>
+          <div>
+            <h1>Local Math RAG</h1>
+            <p id="server-status">连接中</p>
+          </div>
+        </div>
+
+        <section class="panel compact-panel">
+          <div class="panel-title">
+            <h2>知识库</h2>
+            <button id="refresh-kbs" class="icon-button" title="刷新知识库" aria-label="刷新知识库">↻</button>
+          </div>
+          <select id="kb-select" class="field"></select>
+          <div class="stack">
+            <input id="new-kb-name" class="field" placeholder="新知识库名称" />
+            <input id="new-kb-path" class="field" placeholder="data/kbs/project-a" />
+            <button id="create-kb" class="primary-button">新建知识库</button>
+          </div>
+          <div class="stack">
+            <input id="migrate-path" class="field" placeholder="迁移目标路径" />
+            <button id="migrate-kb" class="secondary-button">迁移当前库</button>
+          </div>
+        </section>
+
+        <section class="panel compact-panel grow">
+          <div class="panel-title">
+            <h2>项目</h2>
+            <button id="create-project" class="icon-button" title="新建项目" aria-label="新建项目">+</button>
+          </div>
+          <input id="project-name" class="field" placeholder="项目名称" />
+          <div id="project-list" class="list"></div>
+        </section>
+      </aside>
+
+      <main class="workspace">
+        <header class="workspace-header">
+          <div>
+            <h2>文档检索工作台</h2>
+            <p>面向外部 agent 的本地证据、公式、表格和图表抽取</p>
+          </div>
+          <div class="status-strip">
+            <span id="active-kb-chip" class="status-chip">知识库</span>
+            <span id="doc-count-chip" class="status-chip">文档 0</span>
+            <span id="model-chip" class="status-chip">模型未启用</span>
+          </div>
+        </header>
+        <nav class="tabs">
+          <button class="tab active" data-tab="ask">提问</button>
+          <button class="tab" data-tab="documents">文档</button>
+          <button class="tab" data-tab="history">历史</button>
+          <button class="tab" data-tab="settings">设置</button>
+        </nav>
+
+        <section id="tab-ask" class="tab-page active">
+          <div class="grid two-col">
+            <section class="panel">
+              <div class="panel-title">
+                <h2>提问</h2>
+                <span id="active-project-label" class="muted"></span>
+              </div>
+              <textarea id="query" class="query-box" placeholder="输入问题、公式、参数名或技术要求关键词"></textarea>
+              <div class="form-row">
+                <label>
+                  <span>任务</span>
+                  <select id="task" class="field">
+                    <option value="answer">证据检索</option>
+                    <option value="requirement_extract">技术要求</option>
+                    <option value="parameter_extract">参数</option>
+                    <option value="formula_extract">公式</option>
+                    <option value="visual_extract">图表</option>
+                    <option value="search">搜索</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Top K</span>
+                  <input id="top-k" class="field small-field" type="number" min="1" max="50" value="12" />
+                </label>
+                <button id="ask-button" class="primary-button">提交</button>
+              </div>
+            </section>
+
+            <section class="panel">
+              <div class="panel-title">
+                <h2>结果</h2>
+                <button id="copy-result" class="icon-button" title="复制 JSON" aria-label="复制 JSON">⧉</button>
+              </div>
+              <div id="result-summary" class="result-summary"></div>
+              <pre id="result-json" class="json-view">{}</pre>
+            </section>
+          </div>
+        </section>
+
+        <section id="tab-documents" class="tab-page">
+          <div class="grid two-col">
+            <section class="panel">
+              <div class="panel-title">
+                <h2>上传</h2>
+              </div>
+              <input id="file-upload" class="field" type="file" multiple />
+              <button id="upload-button" class="primary-button">上传并入库</button>
+              <div class="divider"></div>
+              <input id="ingest-path" class="field" placeholder="本地目录或文件路径" />
+              <button id="ingest-path-button" class="secondary-button">从路径入库</button>
+            </section>
+            <section class="panel">
+              <div class="panel-title">
+                <h2>文档</h2>
+                <button id="refresh-docs" class="icon-button" title="刷新文档" aria-label="刷新文档">↻</button>
+              </div>
+              <div id="document-list" class="table-list"></div>
+            </section>
+          </div>
+        </section>
+
+        <section id="tab-history" class="tab-page">
+          <div class="grid two-col history-layout">
+            <section class="panel">
+              <div class="panel-title">
+                <h2>历史</h2>
+                <button id="refresh-history" class="icon-button" title="刷新历史" aria-label="刷新历史">↻</button>
+              </div>
+              <div id="history-list" class="list"></div>
+            </section>
+            <section class="panel">
+              <div class="panel-title">
+                <h2>记录</h2>
+                <button id="delete-history" class="danger-button">删除</button>
+              </div>
+              <div id="history-detail" class="history-detail"></div>
+              <pre id="history-json" class="json-view">{}</pre>
+            </section>
+          </div>
+        </section>
+
+        <section id="tab-settings" class="tab-page">
+          <div class="grid two-col">
+            <section class="panel">
+              <div class="panel-title">
+                <h2>当前位置</h2>
+              </div>
+              <div id="kb-detail" class="kv-grid"></div>
+            </section>
+            <section class="panel">
+              <div class="panel-title">
+                <h2>模型</h2>
+                <button id="refresh-model" class="icon-button" title="刷新模型状态" aria-label="刷新模型状态">↻</button>
+              </div>
+              <label class="checkbox-row">
+                <input id="model-enabled" type="checkbox" />
+                <span>启用模型综合回答</span>
+              </label>
+              <div class="form-grid">
+                <label>
+                  <span>Provider</span>
+                  <select id="model-provider" class="field">
+                    <option value="openai_compatible">OpenAI-compatible</option>
+                    <option value="ollama">Ollama</option>
+                    <option value="llama_cpp">llama.cpp</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Base URL</span>
+                  <input id="model-base-url" class="field" />
+                </label>
+                <label>
+                  <span>Model</span>
+                  <input id="model-id" class="field" />
+                </label>
+                <label>
+                  <span>Temperature</span>
+                  <input id="model-temperature" class="field" type="number" min="0" max="2" step="0.1" />
+                </label>
+                <label class="wide">
+                  <span>Local GGUF</span>
+                  <input id="model-local-path" class="field" />
+                </label>
+              </div>
+              <div class="row-actions model-actions">
+                <button id="save-model" class="primary-button">保存模型设置</button>
+                <button id="download-model" class="secondary-button">下载推荐模型</button>
+              </div>
+              <div id="model-status" class="status-box"></div>
+            </section>
+          </div>
+        </section>
+      </main>
+    </div>
+    <div id="toast" class="toast"></div>
+    <script src="/static/app.js"></script>
+  </body>
+</html>
