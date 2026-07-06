@@ -17,6 +17,7 @@ from .llm import synthesize_answer
 from .model_manager import download_recommended_model, model_status, settings_from_request
 from .models import IngestReport
 from .parsers import DocumentParser
+from .ragflow import apply_ragflow_retrieval, ragflow_settings_from_request, ragflow_status, sync_paths_to_ragflow
 
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -155,6 +156,13 @@ def make_web_handler(app: WebApp):
             if parts == ["api", "model", "download"] and method == "POST":
                 settings = app.store.get_model_settings()
                 return {"item": download_recommended_model(settings)}, HTTPStatus.OK
+            if parts == ["api", "ragflow", "settings"] and method == "GET":
+                return {"item": app.store.get_ragflow_settings()}, HTTPStatus.OK
+            if parts == ["api", "ragflow", "settings"] and method == "PATCH":
+                body = self.read_json()
+                return {"item": app.store.update_ragflow_settings(ragflow_settings_from_request(body))}, HTTPStatus.OK
+            if parts == ["api", "ragflow", "status"] and method == "GET":
+                return {"item": ragflow_status(app.store.get_ragflow_settings())}, HTTPStatus.OK
 
             if len(parts) >= 3 and parts[0:2] == ["api", "kbs"]:
                 kb_id = parts[2]
@@ -199,6 +207,8 @@ def make_web_handler(app: WebApp):
                     return {"items": app.store.list_questions(kb_id, project_id=project_id)}, HTTPStatus.OK
                 if len(parts) == 4 and parts[3] == "ask" and method == "POST":
                     return self.handle_ask(kb_id)
+                if len(parts) == 5 and parts[3:5] == ["ragflow", "sync"] and method == "POST":
+                    return self.handle_ragflow_sync(kb_id)
                 if len(parts) == 5 and parts[3] == "questions" and method == "GET":
                     return {"item": app.store.get_question(parts[4])}, HTTPStatus.OK
                 if len(parts) == 5 and parts[3] == "questions" and method == "PATCH":
@@ -220,7 +230,9 @@ def make_web_handler(app: WebApp):
                 raise ValueError("paths must be a non-empty string or list")
             parser, index, _, _ = app.components(kb_id)
             report = ingest_paths(parser, index, [str(path) for path in paths], recursive=bool(body.get("recursive", True)))
-            return report.model_dump(mode="json", by_alias=True, exclude_none=True), HTTPStatus.OK
+            payload = report.model_dump(mode="json", by_alias=True, exclude_none=True)
+            self.maybe_sync_report_to_ragflow(payload)
+            return payload, HTTPStatus.OK
 
         def handle_upload(self, kb_id: str) -> tuple[dict[str, Any], HTTPStatus]:
             parser, index, _, kb = app.components(kb_id)
@@ -236,7 +248,9 @@ def make_web_handler(app: WebApp):
                 target.write_bytes(item["data"])
                 saved_paths.append(str(target))
             report = ingest_paths(parser, index, saved_paths, recursive=False)
-            return report.model_dump(mode="json", by_alias=True, exclude_none=True), HTTPStatus.OK
+            payload = report.model_dump(mode="json", by_alias=True, exclude_none=True)
+            self.maybe_sync_report_to_ragflow(payload)
+            return payload, HTTPStatus.OK
 
         def handle_ask(self, kb_id: str) -> tuple[dict[str, Any], HTTPStatus]:
             body = self.read_json()
@@ -247,8 +261,14 @@ def make_web_handler(app: WebApp):
             top_k = body.get("top_k")
             project_id = body.get("project_id")
             _, _, extractor, _ = app.components(kb_id)
-            result = extractor.extract(query, task=task, top_k=top_k)
-            payload = result.model_dump(mode="json", by_alias=True, exclude_none=True)
+            ragflow_settings = app.store.get_ragflow_settings()
+            mode = str(ragflow_settings.get("mode") or "local_only")
+            if ragflow_settings.get("enabled") and mode == "ragflow_only":
+                payload = {"schema": "lookup.result.v1", "task": task, "status": "not_found", "items": [], "evidence": {}, "warnings": []}
+            else:
+                result = extractor.extract(query, task=task, top_k=top_k)
+                payload = result.model_dump(mode="json", by_alias=True, exclude_none=True)
+            payload = apply_ragflow_retrieval(payload, settings=ragflow_settings, query=query, top_k=top_k)
             generated = synthesize_answer(app.store.get_model_settings(), query, payload)
             if generated:
                 payload.setdefault("items", []).insert(0, generated)
@@ -265,6 +285,28 @@ def make_web_handler(app: WebApp):
                 title=body.get("title"),
             )
             return {"record": record, "result": payload}, HTTPStatus.OK
+
+        def handle_ragflow_sync(self, kb_id: str) -> tuple[dict[str, Any], HTTPStatus]:
+            body = self.read_json()
+            paths = body.get("paths")
+            if isinstance(paths, str):
+                paths = [paths]
+            if not paths:
+                _, index, _, _ = app.components(kb_id)
+                paths = [item["path"] for item in index.list_documents()]
+            if not isinstance(paths, list):
+                raise ValueError("paths must be a string or list")
+            result = sync_paths_to_ragflow(app.store.get_ragflow_settings(), [str(path) for path in paths])
+            return {"item": result}, HTTPStatus.OK
+
+        def maybe_sync_report_to_ragflow(self, payload: dict[str, Any]) -> None:
+            settings = app.store.get_ragflow_settings()
+            if not settings.get("auto_sync_uploads"):
+                return
+            paths = [item["path"] for item in payload.get("documents", []) if item.get("path")]
+            if not paths:
+                return
+            payload["ragflow"] = sync_paths_to_ragflow(settings, paths)
 
         def read_json(self) -> dict[str, Any]:
             length = int(self.headers.get("Content-Length", "0") or "0")
@@ -368,4 +410,3 @@ def unique_path(path: Path) -> Path:
         if not candidate.exists():
             return candidate
     raise ValueError(f"Cannot allocate upload path for {path}")
-

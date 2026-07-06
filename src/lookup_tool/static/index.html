@@ -54,6 +54,7 @@
             <span id="active-kb-chip" class="status-chip">知识库</span>
             <span id="doc-count-chip" class="status-chip">文档 0</span>
             <span id="model-chip" class="status-chip">模型未启用</span>
+            <span id="ragflow-chip" class="status-chip">RAGFlow 关闭</span>
           </div>
         </header>
         <nav class="tabs">
@@ -192,6 +193,51 @@
                 <button id="download-model" class="secondary-button">下载推荐模型</button>
               </div>
               <div id="model-status" class="status-box"></div>
+            </section>
+            <section class="panel">
+              <div class="panel-title">
+                <h2>RAGFlow 离线后端</h2>
+                <button id="refresh-ragflow" class="icon-button" title="刷新 RAGFlow 状态" aria-label="刷新 RAGFlow 状态">↻</button>
+              </div>
+              <label class="checkbox-row">
+                <input id="ragflow-enabled" type="checkbox" />
+                <span>启用本机/内网 RAGFlow</span>
+              </label>
+              <div class="form-grid">
+                <label>
+                  <span>模式</span>
+                  <select id="ragflow-mode" class="field">
+                    <option value="local_only">仅本地</option>
+                    <option value="hybrid">本地 + RAGFlow</option>
+                    <option value="ragflow_only">仅 RAGFlow</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Base URL</span>
+                  <input id="ragflow-base-url" class="field" placeholder="http://127.0.0.1:9380" />
+                </label>
+                <label>
+                  <span>Dataset ID</span>
+                  <input id="ragflow-dataset-id" class="field" />
+                </label>
+                <label>
+                  <span>Top K</span>
+                  <input id="ragflow-top-k" class="field" type="number" min="1" max="50" value="8" />
+                </label>
+                <label class="wide">
+                  <span>API Key</span>
+                  <input id="ragflow-api-key" class="field" type="password" autocomplete="off" />
+                </label>
+              </div>
+              <label class="checkbox-row inline-check">
+                <input id="ragflow-auto-sync" type="checkbox" />
+                <span>上传/路径入库后自动同步到 RAGFlow</span>
+              </label>
+              <div class="row-actions model-actions">
+                <button id="save-ragflow" class="primary-button">保存 RAGFlow 设置</button>
+                <button id="sync-ragflow" class="secondary-button">同步当前文档</button>
+              </div>
+              <div id="ragflow-status" class="status-box"></div>
             </section>
           </div>
         </section>

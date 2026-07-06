@@ -101,10 +101,14 @@ class AppStore:
             needs_default = int(row["count"] if row else 0) == 0
             model_row = conn.execute("SELECT 1 FROM app_settings WHERE key = 'model'").fetchone()
             needs_model_default = model_row is None
+            ragflow_row = conn.execute("SELECT 1 FROM app_settings WHERE key = 'ragflow'").fetchone()
+            needs_ragflow_default = ragflow_row is None
         if needs_default:
             self.create_kb("Default", self.db_path.parent / "kbs" / "default")
         if needs_model_default:
             self.update_model_settings(default_model_settings(self.db_path.parent))
+        if needs_ragflow_default:
+            self.update_ragflow_settings(default_ragflow_settings())
 
     def create_kb(self, name: str, root_path: str | Path) -> dict[str, Any]:
         kb_id = new_id("kb")
@@ -343,22 +347,33 @@ class AppStore:
             conn.execute("UPDATE questions SET archived = 1, updated_at = ? WHERE id = ?", (now_ts(), question_id))
 
     def get_model_settings(self) -> dict[str, Any]:
+        return self.get_settings("model", default_model_settings(self.db_path.parent))
+
+    def update_model_settings(self, settings: dict[str, Any]) -> dict[str, Any]:
+        return self.update_settings("model", settings, default_model_settings(self.db_path.parent))
+
+    def get_ragflow_settings(self) -> dict[str, Any]:
+        return self.get_settings("ragflow", default_ragflow_settings())
+
+    def update_ragflow_settings(self, settings: dict[str, Any]) -> dict[str, Any]:
+        return self.update_settings("ragflow", settings, default_ragflow_settings())
+
+    def get_settings(self, key: str, defaults: dict[str, Any]) -> dict[str, Any]:
         with self.connect() as conn:
-            row = conn.execute("SELECT value_json FROM app_settings WHERE key = 'model'").fetchone()
+            row = conn.execute("SELECT value_json FROM app_settings WHERE key = ?", (key,)).fetchone()
         if row is None:
-            settings = default_model_settings(self.db_path.parent)
-            self.update_model_settings(settings)
-            return settings
+            self.update_settings(key, defaults, defaults)
+            return defaults
         try:
             stored = json.loads(row["value_json"])
         except json.JSONDecodeError:
             stored = {}
-        return {**default_model_settings(self.db_path.parent), **stored}
+        return {**defaults, **stored}
 
-    def update_model_settings(self, settings: dict[str, Any]) -> dict[str, Any]:
-        current = default_model_settings(self.db_path.parent)
+    def update_settings(self, key: str, settings: dict[str, Any], defaults: dict[str, Any]) -> dict[str, Any]:
+        current = dict(defaults)
         with self.connect() as conn:
-            row = conn.execute("SELECT value_json FROM app_settings WHERE key = 'model'").fetchone()
+            row = conn.execute("SELECT value_json FROM app_settings WHERE key = ?", (key,)).fetchone()
         if row is not None:
             try:
                 current.update(json.loads(row["value_json"]))
@@ -370,10 +385,10 @@ class AppStore:
             conn.execute(
                 """
                 INSERT INTO app_settings(key, value_json, updated_at)
-                VALUES ('model', ?, ?)
+                VALUES (?, ?, ?)
                 ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at
                 """,
-                (json.dumps(current, ensure_ascii=False), timestamp),
+                (key, json.dumps(current, ensure_ascii=False), timestamp),
             )
         return current
 
@@ -437,4 +452,21 @@ def default_model_settings(base_dir: Path) -> dict[str, Any]:
         "local_model_path": str(models_dir / "Qwen3-8B-Q4_K_M.gguf"),
         "recommended_repo": "Qwen/Qwen3-8B-GGUF",
         "recommended_file": "Qwen3-8B-Q4_K_M.gguf",
+    }
+
+
+def default_ragflow_settings() -> dict[str, Any]:
+    return {
+        "enabled": False,
+        "mode": "local_only",
+        "base_url": "http://127.0.0.1:9380",
+        "api_key": "",
+        "dataset_id": "",
+        "timeout_seconds": 20,
+        "top_k": 8,
+        "auto_sync_uploads": False,
+        "status_path": "/api/v1/datasets",
+        "retrieval_path": "/api/v1/retrieval",
+        "upload_path_template": "/api/v1/datasets/{dataset_id}/documents",
+        "upload_field": "file",
     }

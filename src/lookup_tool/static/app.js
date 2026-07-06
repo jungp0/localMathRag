@@ -9,6 +9,8 @@
   lastResult: null,
   modelSettings: null,
   modelStatus: null,
+  ragflowSettings: null,
+  ragflowStatus: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -68,6 +70,9 @@ function bindEvents() {
   $("refresh-model").addEventListener("click", () => withBusy("refresh-model", refreshModelStatus));
   $("save-model").addEventListener("click", () => withBusy("save-model", saveModelSettings));
   $("download-model").addEventListener("click", () => withBusy("download-model", downloadModel));
+  $("refresh-ragflow").addEventListener("click", () => withBusy("refresh-ragflow", refreshRagFlowStatus));
+  $("save-ragflow").addEventListener("click", () => withBusy("save-ragflow", saveRagFlowSettings));
+  $("sync-ragflow").addEventListener("click", () => withBusy("sync-ragflow", syncRagFlowDocuments));
 }
 
 async function withBusy(buttonId, fn) {
@@ -109,7 +114,7 @@ async function refreshKbs() {
   if (state.kbId) {
     await refreshWorkspace();
   }
-  await refreshModelSettings();
+  await Promise.all([refreshModelSettings(), refreshRagFlowSettings()]);
 }
 
 function renderKbs() {
@@ -279,7 +284,7 @@ async function uploadFiles() {
   const data = await api(`/api/kbs/${state.kbId}/upload`, { method: "POST", body: form });
   input.value = "";
   await refreshDocuments();
-  showToast(`入库 ${data.documents?.length || 0} 个文档`);
+  showToast(formatIngestToast(data));
 }
 
 async function ingestPath() {
@@ -295,7 +300,7 @@ async function ingestPath() {
   });
   $("ingest-path").value = "";
   await refreshDocuments();
-  showToast(`入库 ${data.documents?.length || 0} 个文档`);
+  showToast(formatIngestToast(data));
 }
 
 async function refreshDocuments() {
@@ -464,6 +469,79 @@ async function downloadModel() {
   showToast(`模型已下载: ${shortPath(data.item?.path || "")}`);
 }
 
+async function refreshRagFlowSettings() {
+  const data = await api("/api/ragflow/settings");
+  state.ragflowSettings = data.item || {};
+  renderRagFlowSettings();
+  await refreshRagFlowStatus();
+}
+
+function renderRagFlowSettings() {
+  const settings = state.ragflowSettings || {};
+  $("ragflow-enabled").checked = Boolean(settings.enabled);
+  $("ragflow-mode").value = settings.mode || "local_only";
+  $("ragflow-base-url").value = settings.base_url || "";
+  $("ragflow-dataset-id").value = settings.dataset_id || "";
+  $("ragflow-top-k").value = settings.top_k ?? 8;
+  $("ragflow-api-key").value = settings.api_key || "";
+  $("ragflow-auto-sync").checked = Boolean(settings.auto_sync_uploads);
+}
+
+async function saveRagFlowSettings() {
+  const payload = {
+    enabled: $("ragflow-enabled").checked,
+    mode: $("ragflow-mode").value,
+    base_url: $("ragflow-base-url").value.trim(),
+    dataset_id: $("ragflow-dataset-id").value.trim(),
+    top_k: Number($("ragflow-top-k").value || 8),
+    api_key: $("ragflow-api-key").value.trim(),
+    auto_sync_uploads: $("ragflow-auto-sync").checked,
+  };
+  const data = await api("/api/ragflow/settings", {
+    method: "PATCH",
+    body: JSON.stringify(payload),
+  });
+  state.ragflowSettings = data.item || {};
+  renderRagFlowSettings();
+  await refreshRagFlowStatus();
+  showToast("RAGFlow 设置已保存");
+}
+
+async function refreshRagFlowStatus() {
+  const data = await api("/api/ragflow/status");
+  state.ragflowStatus = data.item || {};
+  renderRagFlowStatus();
+}
+
+function renderRagFlowStatus() {
+  const item = state.ragflowStatus || {};
+  $("ragflow-status").innerHTML = [
+    ["启用", item.enabled ? "是" : "否"],
+    ["模式", item.mode || "local_only"],
+    ["Base URL", item.base_url || ""],
+    ["Dataset", item.dataset_id || ""],
+    ["离线地址校验", item.offline_allowed ? "通过" : "阻止"],
+    ["端点", item.endpoint_ok ? "在线" : item.reachable ? "可达但未通过" : "不可用"],
+    ["HTTP", item.http_status || ""],
+    ["错误", item.error || ""],
+  ]
+    .filter(([, value]) => value !== "")
+    .map(([key, value]) => `<div><strong>${escapeHtml(key)}:</strong> ${escapeHtml(value)}</div>`)
+    .join("");
+  renderWorkspaceStatus();
+}
+
+async function syncRagFlowDocuments() {
+  if (!state.kbId) return;
+  const data = await api(`/api/kbs/${state.kbId}/ragflow/sync`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+  await refreshRagFlowStatus();
+  const item = data.item || {};
+  showToast(`RAGFlow 同步 ${item.uploaded?.length || 0} 个文档`);
+}
+
 function shortPath(path) {
   const parts = String(path || "").split(/[\\/]/);
   return parts.slice(-2).join("/");
@@ -474,11 +552,19 @@ function formatTime(seconds) {
   return new Date(seconds * 1000).toLocaleString();
 }
 
+function formatIngestToast(data) {
+  const count = data.documents?.length || 0;
+  const ragflow = data.ragflow;
+  if (!ragflow) return `入库 ${count} 个文档`;
+  return `入库 ${count} 个文档，RAGFlow 同步 ${ragflow.uploaded?.length || 0} 个`;
+}
+
 function renderWorkspaceStatus() {
   const kb = activeKb();
   const kbChip = $("active-kb-chip");
   const docChip = $("doc-count-chip");
   const modelChip = $("model-chip");
+  const ragflowChip = $("ragflow-chip");
   if (kbChip) {
     kbChip.textContent = kb ? `知识库 ${kb.name}` : "未选择知识库";
     kbChip.className = `status-chip${kb ? " good" : " warn"}`;
@@ -504,6 +590,24 @@ function renderWorkspaceStatus() {
     } else {
       modelChip.textContent = "模型未下载";
       modelChip.className = "status-chip warn";
+    }
+  }
+  if (ragflowChip) {
+    const enabled = Boolean(state.ragflowSettings && state.ragflowSettings.enabled);
+    const mode = (state.ragflowSettings && state.ragflowSettings.mode) || "local_only";
+    const status = state.ragflowStatus || {};
+    if (!enabled || mode === "local_only") {
+      ragflowChip.textContent = "RAGFlow 关闭";
+      ragflowChip.className = "status-chip";
+    } else if (status.endpoint_ok) {
+      ragflowChip.textContent = `RAGFlow ${mode}`;
+      ragflowChip.className = "status-chip good";
+    } else if (status.offline_allowed === false) {
+      ragflowChip.textContent = "RAGFlow 地址阻止";
+      ragflowChip.className = "status-chip warn";
+    } else {
+      ragflowChip.textContent = "RAGFlow 未连接";
+      ragflowChip.className = "status-chip warn";
     }
   }
 }

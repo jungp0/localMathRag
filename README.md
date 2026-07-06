@@ -55,6 +55,7 @@ WebApp 支持：
 - 查看、切换、删除历史提问记录。
 - 查看 agent compact JSON 结果和 evidence。
 - 在设置页切换模型端点、模型 id、本地 GGUF 路径，并查看模型状态。
+- 可选连接本机/内网 RAGFlow，支持 `local_only`、`hybrid`、`ragflow_only`。
 
 WebApp 使用 `/api/...` 接口：
 
@@ -64,9 +65,13 @@ WebApp 使用 `/api/...` 接口：
 - `PATCH /api/model/settings`
 - `GET /api/model/status`
 - `POST /api/model/download`
+- `GET /api/ragflow/settings`
+- `PATCH /api/ragflow/settings`
+- `GET /api/ragflow/status`
 - `POST /api/kbs/{kb_id}/upload`
 - `POST /api/kbs/{kb_id}/ingest`
 - `POST /api/kbs/{kb_id}/ask`
+- `POST /api/kbs/{kb_id}/ragflow/sync`
 - `GET /api/kbs/{kb_id}/documents`
 - `GET /api/kbs/{kb_id}/projects`
 - `GET /api/kbs/{kb_id}/questions`
@@ -132,6 +137,45 @@ POST /api/kbs/{kb_id}/ask
 本项目会先返回可引用的检索/抽取 JSON。启用模型后，会把 evidence
 交给本地 OpenAI-compatible 运行器生成一个 `generated_answer` item。
 如果只需要给外部 agent 传结构化证据，可以保持模型关闭。
+
+## RAGFlow 离线整合
+
+RAGFlow 只作为可选的离线检索后端接入。本项目不会嵌入 RAGFlow 的联网能力，
+也不会调用公共网络、云搜索或在线模型。默认安全策略：
+
+- `enabled=false`，默认关闭。
+- `mode=local_only`，默认只使用本地 SQLite + math/table/visual 抽取。
+- `base_url=http://127.0.0.1:9380`。
+- 默认只允许 `localhost`、`127.0.0.1`、私有网段、`.local` 或单标签内网主机名。
+- 公网域名始终阻止。
+
+三种模式：
+
+- `local_only`: 完全使用当前工具的本地解析、索引和抽取。
+- `hybrid`: 当前工具先做公式、表格和图对象精准抽取，再追加 RAGFlow chunk evidence。
+- `ragflow_only`: 跳过本地召回，只把 RAGFlow 返回的 chunk 归一化成 `lookup.result.v1`。
+
+RAGFlow 版本间 HTTP API 可能有差异，因此设置页保留了可配置路径：
+
+- `status_path`: 默认 `/api/v1/datasets`。
+- `retrieval_path`: 默认 `/api/v1/retrieval`。
+- `upload_path_template`: 默认 `/api/v1/datasets/{dataset_id}/documents`。
+- `upload_field`: 默认 `file`。
+
+RAGFlow 返回内容会被归一化为：
+
+```json
+{
+  "id": "ragflow.chunk.001",
+  "type": "ragflow_chunk",
+  "text": "retrieved chunk text",
+  "score": 0.91,
+  "source": "spec.pdf",
+  "evidence": ["ev.ragflow.chunk-1"]
+}
+```
+
+这样外部 agent 仍然只需要读取统一的 `lookup.result.v1`。
 
 ## Formula-aware 设计
 
@@ -244,6 +288,7 @@ pip install -e ".[api,parsing,ocr,ml]"
 - PaddleOCR / PP-FormulaNet：扫描件公式 OCR。
 - Ollama 或 llama.cpp：结构化抽取、变量定义推断。
 - Qdrant：大规模向量和混合检索。
+- RAGFlow：本机/内网离线部署后，可作为可选混合检索后端。
 
 ## 测试
 
@@ -283,6 +328,7 @@ src/lookup_tool/
   models.py       # Pydantic contract
   ocr.py          # optional PaddleOCR hook for image-only tables
   parsers.py      # 文件解析
+  ragflow.py      # offline-only RAGFlow adapter
   webapp.py       # local WebApp server and API
   static/         # WebApp HTML/CSS/JS
   visual.py       # visual_object classification and caption linking
