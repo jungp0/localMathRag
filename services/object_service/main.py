@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import fnmatch
 import json
 import os
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -16,6 +18,18 @@ SCHEMA_DIR = Path(os.environ.get("LOCALMATHRAG_SCHEMA_DIR", "/schemas"))
 DATA_DIR = Path(os.environ.get("LOCALMATHRAG_DATA_DIR", "/data"))
 MODEL_DIR = Path(os.environ.get("LOCALMATHRAG_MODEL_DIR", DATA_DIR / "models"))
 MODEL_EXTENSIONS = {".gguf", ".safetensors", ".bin"}
+MODEL_METADATA_NAME = ".localmathrag-model.json"
+SNAPSHOT_FILE_EXTENSIONS = {
+    ".bin",
+    ".jinja",
+    ".json",
+    ".model",
+    ".py",
+    ".safetensors",
+    ".txt",
+    ".yaml",
+    ".yml",
+}
 LLAMA_BASE_URL = os.environ.get("LOCALMATHRAG_LLAMA_BASE_URL", "http://host.docker.internal:8080/v1").rstrip("/")
 EMBEDDING_BASE_URL = os.environ.get("LOCALMATHRAG_EMBEDDING_BASE_URL", "http://host.docker.internal:8081/v1").rstrip("/")
 RERANK_BASE_URL = os.environ.get("LOCALMATHRAG_RERANK_BASE_URL", "http://host.docker.internal:8082/v1").rstrip("/")
@@ -56,84 +70,96 @@ RECOMMENDED_MODELS = [
         "id": "qwen3-embedding-06b",
         "name": "Qwen3-Embedding-0.6B",
         "file_name": "Qwen3-Embedding-0.6B",
+        "runtime_model_name": "Qwen/Qwen3-Embedding-0.6B",
         "repo": "Qwen/Qwen3-Embedding-0.6B",
         "url": "https://huggingface.co/Qwen/Qwen3-Embedding-0.6B",
+        "download_kind": "snapshot",
         "model_type": ["embedding"],
         "max_tokens": 32768,
         "recommended_for": "Default local embedding model for multilingual technical retrieval",
         "provider": "OpenAI-API-Compatible",
         "base_url": EMBEDDING_BASE_URL,
-        "downloadable": False,
+        "downloadable": True,
         "group": "embedding",
     },
     {
         "id": "bge-m3",
         "name": "BAAI/bge-m3",
         "file_name": "bge-m3",
+        "runtime_model_name": "BAAI/bge-m3",
         "repo": "BAAI/bge-m3",
         "url": "https://huggingface.co/BAAI/bge-m3",
+        "download_kind": "snapshot",
         "model_type": ["embedding"],
         "max_tokens": 8192,
         "recommended_for": "Strong compact embedding fallback with broad RAG support",
         "provider": "OpenAI-API-Compatible",
         "base_url": EMBEDDING_BASE_URL,
-        "downloadable": False,
+        "downloadable": True,
         "group": "embedding",
     },
     {
         "id": "qwen3-reranker-06b",
         "name": "Qwen3-Reranker-0.6B",
         "file_name": "Qwen3-Reranker-0.6B",
+        "runtime_model_name": "Qwen/Qwen3-Reranker-0.6B",
         "repo": "Qwen/Qwen3-Reranker-0.6B",
         "url": "https://huggingface.co/Qwen/Qwen3-Reranker-0.6B",
+        "download_kind": "snapshot",
         "model_type": ["rerank"],
         "max_tokens": 32768,
         "recommended_for": "Default reranker for evidence ordering in technical documents",
         "provider": "OpenAI-API-Compatible",
         "base_url": RERANK_BASE_URL,
-        "downloadable": False,
+        "downloadable": True,
         "group": "rerank",
     },
     {
         "id": "bge-reranker-v2-m3",
         "name": "BAAI/bge-reranker-v2-m3",
         "file_name": "bge-reranker-v2-m3",
+        "runtime_model_name": "BAAI/bge-reranker-v2-m3",
         "repo": "BAAI/bge-reranker-v2-m3",
         "url": "https://huggingface.co/BAAI/bge-reranker-v2-m3",
+        "download_kind": "snapshot",
         "model_type": ["rerank"],
         "max_tokens": 8192,
         "recommended_for": "Compact rerank fallback",
         "provider": "OpenAI-API-Compatible",
         "base_url": RERANK_BASE_URL,
-        "downloadable": False,
+        "downloadable": True,
         "group": "rerank",
     },
     {
         "id": "qwen3-vl-8b-instruct",
         "name": "Qwen3-VL-8B-Instruct",
         "file_name": "Qwen3-VL-8B-Instruct",
+        "runtime_model_name": "Qwen/Qwen3-VL-8B-Instruct",
         "repo": "Qwen/Qwen3-VL-8B-Instruct",
         "url": "https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct",
+        "download_kind": "snapshot",
         "model_type": ["vision"],
         "max_tokens": 8192,
         "recommended_for": "Vision model for diagrams, figures, screenshots, and OCR-heavy pages",
         "provider": "OpenAI-API-Compatible",
         "base_url": VISION_BASE_URL,
-        "downloadable": False,
+        "downloadable": True,
         "group": "vision",
     },
     {
         "id": "qwen3-vl-4b-instruct",
         "name": "Qwen3-VL-4B-Instruct",
         "file_name": "Qwen3-VL-4B-Instruct",
+        "runtime_model_name": "Qwen/Qwen3-VL-4B-Instruct",
         "repo": "Qwen/Qwen3-VL-4B-Instruct",
         "url": "https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct",
+        "download_kind": "snapshot",
         "model_type": ["vision"],
         "max_tokens": 8192,
         "recommended_for": "Smaller vision fallback for 8 GB class GPUs",
         "provider": "OpenAI-API-Compatible",
         "base_url": VISION_BASE_URL,
-        "downloadable": False,
+        "downloadable": True,
         "group": "vision",
     },
 ]
@@ -216,6 +242,31 @@ def _model_files() -> list[Path]:
     )
 
 
+def _model_entries() -> list[Path]:
+    if not MODEL_DIR.exists():
+        return []
+    snapshot_dirs = [
+        path
+        for path in MODEL_DIR.iterdir()
+        if path.is_dir() and (path / MODEL_METADATA_NAME).exists()
+    ]
+    return sorted([*_model_files(), *snapshot_dirs])
+
+
+def _load_model_metadata(path: Path) -> dict[str, Any]:
+    metadata_path = path / MODEL_METADATA_NAME if path.is_dir() else None
+    if not metadata_path or not metadata_path.exists():
+        return {}
+    try:
+        return json.loads(metadata_path.read_text(encoding="utf-8-sig"))
+    except json.JSONDecodeError:
+        return {}
+
+
+def _directory_size(path: Path) -> int:
+    return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+
+
 def _infer_model_type(path: Path) -> list[str]:
     name = path.name.lower()
     if "embedding" in name or "embed" in name or "bge-m3" in name:
@@ -261,25 +312,114 @@ def _llama_endpoint_status(timeout: float = 1.5) -> dict[str, Any]:
 
 
 def _model_payload(path: Path) -> dict[str, Any]:
-    stat = path.stat()
-    model_type = _infer_model_type(path)
-    runtime_model_name = path.stem
-    if path.suffix.lower() == ".gguf" and model_type[0] == "chat":
+    metadata = _load_model_metadata(path)
+    model_type = metadata.get("model_type") or _infer_model_type(path)
+    runtime_model_name = metadata.get("runtime_model_name") or path.stem
+    if path.is_file() and path.suffix.lower() == ".gguf" and model_type[0] == "chat":
         runtime_model_name = f"/models/{path.name}"
+    size_bytes = _directory_size(path) if path.is_dir() else path.stat().st_size
     return {
-        "name": path.stem,
+        "name": metadata.get("name") or path.stem,
         "runtime_model_name": runtime_model_name,
-        "file_name": path.name,
+        "file_name": metadata.get("file_name") or path.name,
         "path": str(path),
         "relative_path": str(path.relative_to(MODEL_DIR)),
-        "size_bytes": stat.st_size,
-        "size_gb": round(stat.st_size / 1024 / 1024 / 1024, 2),
-        "extension": path.suffix.lower(),
-        "provider": "OpenAI-API-Compatible",
-        "base_url": _base_url_for_model_type(model_type),
+        "size_bytes": size_bytes,
+        "size_gb": round(size_bytes / 1024 / 1024 / 1024, 2),
+        "extension": "snapshot" if path.is_dir() else path.suffix.lower(),
+        "provider": metadata.get("provider") or "OpenAI-API-Compatible",
+        "base_url": metadata.get("base_url") or _base_url_for_model_type(model_type),
         "model_type": model_type,
-        "max_tokens": 8192,
+        "max_tokens": metadata.get("max_tokens") or 8192,
     }
+
+
+def _snapshot_metadata(model: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": model.get("id"),
+        "name": model.get("name"),
+        "file_name": model.get("file_name"),
+        "runtime_model_name": model.get("runtime_model_name") or model.get("repo") or model.get("name"),
+        "repo": model.get("repo"),
+        "provider": model.get("provider") or "OpenAI-API-Compatible",
+        "base_url": model.get("base_url"),
+        "model_type": model.get("model_type") or ["chat"],
+        "max_tokens": model.get("max_tokens") or 8192,
+        "download_kind": "snapshot",
+    }
+
+
+def _hf_repo_tree(repo: str, revision: str = "main") -> list[dict[str, Any]]:
+    repo_path = urllib.parse.quote(repo, safe="/")
+    url = f"https://huggingface.co/api/models/{repo_path}/tree/{revision}?recursive=1"
+    with urllib.request.urlopen(url, timeout=30) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    if not isinstance(data, list):
+        raise HTTPException(status_code=502, detail="Hugging Face repository tree response is invalid")
+    return [item for item in data if isinstance(item, dict)]
+
+
+def _allowed_snapshot_file(path: str, allow_patterns: list[str] | None = None) -> bool:
+    normalized = path.replace("\\", "/")
+    if allow_patterns:
+        return any(fnmatch.fnmatch(normalized, pattern) for pattern in allow_patterns)
+    suffix = Path(normalized).suffix.lower()
+    if suffix not in SNAPSHOT_FILE_EXTENSIONS:
+        return False
+    lower = normalized.lower()
+    if lower.startswith((".git", "onnx/", "openvino/", "examples/")):
+        return False
+    if lower.endswith((".md", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".pdf")):
+        return False
+    return True
+
+
+def _download_hf_file(repo: str, path: str, target: Path, revision: str = "main") -> None:
+    repo_path = urllib.parse.quote(repo, safe="/")
+    file_path = urllib.parse.quote(path, safe="/")
+    url = f"https://huggingface.co/{repo_path}/resolve/{revision}/{file_path}"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    partial = target.with_suffix(target.suffix + ".partial")
+    urllib.request.urlretrieve(url, partial)
+    partial.replace(target)
+
+
+def _download_snapshot(model: dict[str, Any]) -> dict[str, Any]:
+    repo = model.get("repo")
+    file_name = model.get("file_name")
+    if not repo or not file_name:
+        raise HTTPException(status_code=400, detail="Snapshot model requires repo and file_name")
+    target_dir = MODEL_DIR / Path(file_name).name
+    metadata_path = target_dir / MODEL_METADATA_NAME
+    if metadata_path.exists():
+        return {"status": "exists", "model": _model_payload(target_dir)}
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    allow_patterns = model.get("allow_patterns")
+    tree = _hf_repo_tree(repo)
+    files = [
+        item["path"]
+        for item in tree
+        if item.get("type") == "file"
+        and isinstance(item.get("path"), str)
+        and _allowed_snapshot_file(item["path"], allow_patterns)
+    ]
+    if not files:
+        raise HTTPException(status_code=502, detail="No downloadable model files were found in the repository")
+
+    try:
+        for file_path in files:
+            _download_hf_file(repo, file_path, target_dir / file_path)
+        metadata_path.write_text(
+            json.dumps(_snapshot_metadata(model), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        for partial in target_dir.rglob("*.partial"):
+            partial.unlink(missing_ok=True)
+        raise HTTPException(status_code=502, detail=f"Snapshot download failed: {exc}") from exc
+
+    return {"status": "downloaded", "model": _model_payload(target_dir)}
 
 
 @app.get("/health")
@@ -289,7 +429,7 @@ def health() -> dict[str, Any]:
         "schema_dir": str(SCHEMA_DIR),
         "schema_count": len(_schema_files()),
         "model_dir": str(MODEL_DIR),
-        "model_count": len(_model_files()),
+        "model_count": len(_model_entries()),
     }
 
 
@@ -300,13 +440,13 @@ def list_local_models() -> dict[str, Any]:
     return {
         "model_dir": str(MODEL_DIR),
         "endpoint_status": endpoint_status,
-        "models": [_model_payload(path) for path in _model_files()],
+        "models": [_model_payload(path) for path in _model_entries()],
     }
 
 
 @app.get("/v1/models/recommended")
 def list_recommended_models() -> dict[str, Any]:
-    local_names = {path.name for path in _model_files()}
+    local_names = {path.name for path in _model_entries()}
     endpoint_status = _llama_endpoint_status()
     models = []
     for model in RECOMMENDED_MODELS:
@@ -323,7 +463,7 @@ def list_recommended_models() -> dict[str, Any]:
 def model_status() -> dict[str, Any]:
     return {
         "model_dir": str(MODEL_DIR),
-        "model_count": len(_model_files()),
+        "model_count": len(_model_entries()),
         "endpoint_status": _llama_endpoint_status(timeout=3),
     }
 
@@ -334,6 +474,12 @@ def download_model(request: DownloadModelRequest) -> dict[str, Any]:
         (model for model in RECOMMENDED_MODELS if model["id"] == request.id),
         None,
     )
+    if selected and selected.get("download_kind") == "snapshot":
+        if not selected.get("downloadable", False):
+            raise HTTPException(status_code=400, detail="This model cannot be downloaded automatically")
+        MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        return _download_snapshot(selected)
+
     url = request.url or (selected or {}).get("url")
     file_name = request.file_name or (selected or {}).get("file_name")
     if not url or not file_name:

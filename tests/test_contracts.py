@@ -69,6 +69,10 @@ def test_object_service_imports() -> None:
     assert "qwen3-vl-8b-instruct" in text
     assert "runtime_model_name" in text
     assert '"/models/Qwen3-8B-Q4_K_M.gguf"' in text
+    assert "download_kind" in text
+    assert "_download_snapshot" in text
+    assert "Qwen/Qwen3-Embedding-0.6B" in text
+    assert "Qwen/Qwen3-Reranker-0.6B" in text
 
 
 def test_windows_launcher_exists() -> None:
@@ -134,6 +138,8 @@ def test_ragflow_patch_workflow_exists() -> None:
     assert "/v1/models/local" in patch_text
     assert "OpenAiAPICompatible" in patch_text
     assert "_check_local_chat_completion" in patch_text
+    assert "Download and configure" in patch_text
+    assert "嵌入模型" in patch_text
 
 
 def test_docker_compose_mounts_ragflow_backend_overrides() -> None:

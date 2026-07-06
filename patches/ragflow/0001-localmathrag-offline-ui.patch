@@ -584,7 +584,7 @@ index 2d0d06b..f58171b 100644
      <>
        <Spotlight opcity={0.4} coverage={60} color={'rgb(128, 255, 248)'} />
 diff --git a/web/src/pages/user-setting/setting-model/components/un-add-model.tsx b/web/src/pages/user-setting/setting-model/components/un-add-model.tsx
-index 1039c7c..5a7641e 100644
+index 1039c7c..222d249 100644
 --- a/web/src/pages/user-setting/setting-model/components/un-add-model.tsx
 +++ b/web/src/pages/user-setting/setting-model/components/un-add-model.tsx
 @@ -1,12 +1,17 @@
@@ -611,7 +611,7 @@ index 1039c7c..5a7641e 100644
  
  export const mapModelKey = {
    image2text: 'VLM',
-@@ -20,83 +25,245 @@ export const mapModelKey = {
+@@ -20,83 +25,250 @@ export const mapModelKey = {
    ocr: 'OCR',
  };
  
@@ -678,6 +678,7 @@ index 1039c7c..5a7641e 100644
 +  base_url: string;
 +  downloaded: boolean;
 +  downloadable?: boolean;
++  download_kind?: 'file' | 'snapshot';
 +  target_path: string;
 +  group?: ModelGroup;
 +  endpoint_status?: EndpointStatus;
@@ -722,7 +723,7 @@ index 1039c7c..5a7641e 100644
 +const typeLabel = (type: ModelGroup, isZh: boolean) => {
 +  const labels = {
 +    chat: isZh ? '对话模型' : 'Chat',
-+    embedding: isZh ? '向量模型' : 'Embedding',
++    embedding: isZh ? '嵌入模型' : 'Embedding',
 +    rerank: isZh ? '重排模型' : 'Rerank',
 +    vision: isZh ? '视觉/OCR' : 'Vision/OCR',
 +  };
@@ -788,12 +789,12 @@ index 1039c7c..5a7641e 100644
 +      configure: isZh ? '配置' : 'Configure',
 +      recommended: isZh ? '推荐模型' : 'Recommended models',
 +      downloaded: isZh ? '已下载' : 'Downloaded',
-+      download: isZh ? '下载' : 'Download',
++      download: isZh ? '下载并配置' : 'Download and configure',
 +      open: isZh ? '打开链接' : 'Open link',
 +      linkOnly: isZh ? '仓库链接' : 'Repo link',
 +      offline: isZh
-+        ? 'Chat 的 GGUF 可直接下载；Embedding、Rerank、Vision 需要后续接入对应本地服务。'
-+        : 'Chat GGUF can be downloaded directly. Embedding, rerank, and vision need a matching local service.',
++        ? '推荐模型可直接下载。Chat 使用 llama.cpp；嵌入、重排和视觉模型下载后会填入对应本地服务端点。'
++        : 'Recommended models can be downloaded directly. Chat uses llama.cpp; embedding, rerank, and vision models are configured with their matching local endpoints.',
 +      error: isZh ? '本地模型服务不可用' : 'Local model service is unavailable',
 +      endpoint: isZh ? '端点' : 'Endpoint',
 +    }),
@@ -914,7 +915,11 @@ index 1039c7c..5a7641e 100644
 +        const data = await response.json().catch(() => ({}));
 +        throw new Error(data.detail ?? 'download failed');
 +      }
++      const data = await response.json();
 +      await loadModels();
++      if (data?.model) {
++        configureModel(data.model);
++      }
 +    } catch (err) {
 +      setError(err instanceof Error ? err.message : copy.error);
 +    } finally {
@@ -923,7 +928,7 @@ index 1039c7c..5a7641e 100644
    };
  
    return (
-@@ -104,112 +271,193 @@ export const AvailableModels: FC<{
+@@ -104,112 +276,193 @@ export const AvailableModels: FC<{
        className="text-text-primary h-full flex flex-col"
        data-testid="available-models-section"
      >
