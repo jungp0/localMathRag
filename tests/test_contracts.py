@@ -61,6 +61,12 @@ def test_object_service_imports() -> None:
     assert "/v1/models/download" in text
     assert "/v1/models/status" in text
     assert "LLAMA_BASE_URL" in text
+    assert "EMBEDDING_BASE_URL" in text
+    assert "RERANK_BASE_URL" in text
+    assert "VISION_BASE_URL" in text
+    assert "qwen3-embedding-06b" in text
+    assert "qwen3-reranker-06b" in text
+    assert "qwen3-vl-8b-instruct" in text
 
 
 def test_windows_launcher_exists() -> None:
@@ -83,6 +89,9 @@ def test_windows_launcher_exists() -> None:
     assert "MenuGlyph" in program_text
     assert "ContextMenuStrip = menu" in program_text
     assert "menuHost" in program_text
+    assert "OpenFromTrayAsync" in program_text
+    assert "TRAY menu opening" in program_text
+    assert "TRAY mouse click" in program_text
     assert "ShowTrayMenu" in program_text
     assert "OpenOrFocusAppWindow" in program_text
     assert "SetForegroundWindow" in program_text

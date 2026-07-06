@@ -427,7 +427,7 @@ index 2d0d06b..f58171b 100644
      <>
        <Spotlight opcity={0.4} coverage={60} color={'rgb(128, 255, 248)'} />
 diff --git a/web/src/pages/user-setting/setting-model/components/un-add-model.tsx b/web/src/pages/user-setting/setting-model/components/un-add-model.tsx
-index 1039c7c..1fe725a 100644
+index 1039c7c..e27dee8 100644
 --- a/web/src/pages/user-setting/setting-model/components/un-add-model.tsx
 +++ b/web/src/pages/user-setting/setting-model/components/un-add-model.tsx
 @@ -1,12 +1,17 @@
@@ -454,7 +454,7 @@ index 1039c7c..1fe725a 100644
  
  export const mapModelKey = {
    image2text: 'VLM',
-@@ -20,83 +25,162 @@ export const mapModelKey = {
+@@ -20,83 +25,243 @@ export const mapModelKey = {
    ocr: 'OCR',
  };
  
@@ -468,18 +468,12 @@ index 1039c7c..1fe725a 100644
 -  image2text: 6,
 -  vision: 6,
 -  ocr: 7,
-+type LocalModel = {
-+  name: string;
-+  file_name: string;
-+  path: string;
-+  relative_path: string;
-+  size_bytes: number;
-+  size_gb: number;
-+  extension: string;
-+  provider: string;
++type ModelGroup = 'chat' | 'embedding' | 'rerank' | 'vision';
++
++type EndpointStatus = {
 +  base_url: string;
-+  model_type: string[];
-+  max_tokens: number;
++  endpoint_ok: boolean;
++  error?: string;
  };
  
 -type ModelType =
@@ -498,6 +492,20 @@ index 1039c7c..1fe725a 100644
 -    (a, b) =>
 -      (orderMap[a as ModelType] || 999) - (orderMap[b as ModelType] || 999),
 -  );
++type LocalModel = {
++  name: string;
++  file_name: string;
++  path: string;
++  relative_path: string;
++  size_bytes: number;
++  size_gb: number;
++  extension: string;
++  provider: string;
++  base_url: string;
++  model_type: string[];
++  max_tokens: number;
++};
++
 +type RecommendedModel = {
 +  id: string;
 +  name: string;
@@ -510,28 +518,76 @@ index 1039c7c..1fe725a 100644
 +  provider: string;
 +  base_url: string;
 +  downloaded: boolean;
++  downloadable?: boolean;
 +  target_path: string;
- };
- 
++  group?: ModelGroup;
++  endpoint_status?: EndpointStatus;
++};
++
 +const OBJECT_SERVICE_URL = 'http://127.0.0.1:8088';
++
++const MODEL_GROUPS: ModelGroup[] = ['chat', 'embedding', 'rerank', 'vision'];
++
++const getPrimaryType = (model: Pick<LocalModel | RecommendedModel, 'model_type'>) => {
++  const type = model.model_type?.[0] ?? 'chat';
++  return type === 'ocr' ? 'vision' : (type as ModelGroup);
++};
++
++const instanceNameByType: Record<ModelGroup, string> = {
++  chat: 'local-llama-cpp',
++  embedding: 'local-embedding',
++  rerank: 'local-rerank',
++  vision: 'local-vision',
++};
 +
 +const makeDefaults = (
 +  model: Pick<
 +    LocalModel | RecommendedModel,
 +    'name' | 'base_url' | 'model_type' | 'max_tokens'
 +  >,
-+): LocalModelDefaults => ({
-+  instance_name: 'local-llama-cpp',
-+  model_name: model.name,
-+  model_type: model.model_type,
-+  base_url: model.base_url,
-+  api_key: 'local',
-+  max_tokens: model.max_tokens,
-+});
++): LocalModelDefaults => {
++  const primaryType = getPrimaryType(model);
++  return {
++    instance_name: instanceNameByType[primaryType],
++    model_name: model.name,
++    model_type: model.model_type,
++    base_url: model.base_url,
++    api_key: 'local',
++    max_tokens: model.max_tokens,
++  };
++};
 +
 +const formatSize = (sizeGb: number) =>
 +  sizeGb > 0 ? `${sizeGb.toFixed(2)} GB` : '< 0.01 GB';
 +
++const typeLabel = (type: ModelGroup, isZh: boolean) => {
++  const labels = {
++    chat: isZh ? '对话模型' : 'Chat',
++    embedding: isZh ? '向量模型' : 'Embedding',
++    rerank: isZh ? '重排模型' : 'Rerank',
++    vision: isZh ? '视觉/OCR' : 'Vision/OCR',
++  };
++  return labels[type];
++};
++
++const typeDescription = (type: ModelGroup, isZh: boolean) => {
++  const descriptions = {
++    chat: isZh
++      ? '用于问答、总结、结构化抽取。'
++      : 'Answers, summaries, and structured extraction.',
++    embedding: isZh
++      ? '用于文档入库和语义检索，离线 RAG 必需。'
++      : 'Required for indexing and semantic retrieval.',
++    rerank: isZh
++      ? '用于证据重排，提升技术要求和参数检索质量。'
++      : 'Reorders evidence for better technical retrieval.',
++    vision: isZh
++      ? '用于图表、流程图、截图表格、图片说明和 OCR 增强。'
++      : 'Figures, diagrams, screenshot tables, captions, and OCR enhancement.',
++  };
++  return descriptions[type];
+ };
+ 
  export const AvailableModels: FC<{
 -  handleAddModel: (factory: string) => void;
 +  handleAddModel: (factory: string, defaults?: LocalModelDefaults) => void;
@@ -550,6 +606,7 @@ index 1039c7c..1fe725a 100644
 -  const [selectedTag, setSelectedTag] = useState<string | null>(null);
 +  const [loading, setLoading] = useState(false);
 +  const [downloadingId, setDownloadingId] = useState<string | null>(null);
++  const [activeGroup, setActiveGroup] = useState<ModelGroup>('chat');
 +  const [error, setError] = useState('');
  
 -  const searchedModels = useMemo(() => {
@@ -561,23 +618,25 @@ index 1039c7c..1fe725a 100644
 +    () => ({
 +      title: isZh ? '本地模型' : 'Local models',
 +      subtitle: isZh
-+        ? '自动扫描本机 data/models。推荐模型只在点击下载后联网。'
-+        : 'Scans local data/models first. Recommended models only connect when you click download.',
++        ? '按类型配置本地模型。日常使用保持离线，只有点击下载或打开链接时才联网。'
++        : 'Configure local models by type. Daily use stays offline; network is used only when you download or open a link.',
 +      search: isZh ? '搜索本地模型或推荐模型' : 'Search local or recommended models',
 +      refresh: isZh ? '重新扫描' : 'Rescan',
 +      found: isZh ? '已发现' : 'Discovered',
 +      empty: isZh
-+        ? '未发现本地模型。可将 GGUF 放入目录，或从右侧推荐列表下载。'
-+        : 'No local models found. Put GGUF files into the directory or download a recommended model.',
++        ? '未发现该类型的本地模型。可以把模型放入 data/models，或从推荐链接安装对应本地运行服务。'
++        : 'No local model of this type was found. Put model files into data/models, or install a matching local runtime from a recommendation.',
 +      configure: isZh ? '配置' : 'Configure',
-+      recommended: isZh ? '推荐下载' : 'Recommended downloads',
++      recommended: isZh ? '推荐模型' : 'Recommended models',
 +      downloaded: isZh ? '已下载' : 'Downloaded',
 +      download: isZh ? '下载' : 'Download',
-+      open: isZh ? '打开 Hugging Face' : 'Open Hugging Face',
++      open: isZh ? '打开链接' : 'Open link',
++      linkOnly: isZh ? '仓库链接' : 'Repo link',
 +      offline: isZh
-+        ? '日常使用保持本地离线；下载需要你主动确认并联网。'
-+        : 'Daily use stays local and offline. Downloads require an explicit online action.',
++        ? 'Chat 的 GGUF 可直接下载；Embedding、Rerank、Vision 需要后续接入对应本地服务。'
++        : 'Chat GGUF can be downloaded directly. Embedding, rerank, and vision need a matching local service.',
 +      error: isZh ? '本地模型服务不可用' : 'Local model service is unavailable',
++      endpoint: isZh ? '端点' : 'Endpoint',
 +    }),
 +    [isZh],
 +  );
@@ -608,19 +667,7 @@ index 1039c7c..1fe725a 100644
      }
 -    return searchedModels.filter((model) =>
 -      model.model_types.some((type) => type === selectedTag),
-+  }, [copy.error]);
-+
-+  useEffect(() => {
-+    loadModels();
-+  }, [loadModels]);
-+
-+  const filteredLocalModels = useMemo(() => {
-+    const needle = searchTerm.toLowerCase();
-+    return localModels.filter(
-+      (model) =>
-+        model.name.toLowerCase().includes(needle) ||
-+        model.file_name.toLowerCase().includes(needle),
-     );
+-    );
 -  }, [searchedModels, selectedTag]);
 -
 -  // Number of providers matching each tag, respecting the current search term so
@@ -630,16 +677,51 @@ index 1039c7c..1fe725a 100644
 -      // Count each provider once per model type, even if listed more than once.
 -      new Set(model.model_types).forEach((type) => {
 -        acc[type] = (acc[type] || 0) + 1;
-+  }, [localModels, searchTerm]);
++  }, [copy.error]);
 +
-+  const filteredRecommendedModels = useMemo(() => {
-+    const needle = searchTerm.toLowerCase();
-+    return recommendedModels.filter(
-+      (model) =>
-+        model.name.toLowerCase().includes(needle) ||
-+        model.repo.toLowerCase().includes(needle),
-+    );
-+  }, [recommendedModels, searchTerm]);
++  useEffect(() => {
++    loadModels();
++  }, [loadModels]);
++
++  const needle = searchTerm.toLowerCase();
++
++  const filteredLocalModels = useMemo(
++    () =>
++      localModels.filter((model) => {
++        const matchesGroup = getPrimaryType(model) === activeGroup;
++        const matchesSearch =
++          model.name.toLowerCase().includes(needle) ||
++          model.file_name.toLowerCase().includes(needle);
++        return matchesGroup && matchesSearch;
++      }),
++    [activeGroup, localModels, needle],
++  );
++
++  const filteredRecommendedModels = useMemo(
++    () =>
++      recommendedModels.filter((model) => {
++        const matchesGroup = (model.group ?? getPrimaryType(model)) === activeGroup;
++        const matchesSearch =
++          model.name.toLowerCase().includes(needle) ||
++          model.repo.toLowerCase().includes(needle) ||
++          model.recommended_for.toLowerCase().includes(needle);
++        return matchesGroup && matchesSearch;
++      }),
++    [activeGroup, needle, recommendedModels],
++  );
++
++  const groupCounts = useMemo(
++    () =>
++      MODEL_GROUPS.reduce(
++        (acc, group) => ({
++          ...acc,
++          [group]: localModels.filter((model) => getPrimaryType(model) === group)
++            .length,
++        }),
++        {} as Record<ModelGroup, number>,
++      ),
++    [localModels],
++  );
 +
 +  const configureModel = (model: LocalModel | RecommendedModel) => {
 +    handleAddModel(LLMFactory.OpenAiAPICompatible, makeDefaults(model));
@@ -682,7 +764,7 @@ index 1039c7c..1fe725a 100644
    };
  
    return (
-@@ -104,112 +188,164 @@ export const AvailableModels: FC<{
+@@ -104,112 +269,193 @@ export const AvailableModels: FC<{
        className="text-text-primary h-full flex flex-col"
        data-testid="available-models-section"
      >
@@ -713,6 +795,19 @@ index 1039c7c..1fe725a 100644
 -
 -        {/* Tags Filter */}
 -        <div className="flex flex-wrap gap-2">
+-          <Button
+-            variant={selectedTag === null ? 'default' : 'secondary'}
+-            size="auto"
+-            className="leading-none px-1 py-0.5 rounded-sm text-xs"
+-            onClick={() => setSelectedTag(null)}
+-          >
+-            All
+-            <span className="ml-1 tabular-nums opacity-60">
+-              {searchedModels.length}
+-            </span>
+-          </Button>
+-
+-          {allTags.map((tag) => (
 +        <SearchInput
 +          data-testid="model-providers-search"
 +          type="text"
@@ -721,6 +816,30 @@ index 1039c7c..1fe725a 100644
 +          onChange={(e) => setSearchTerm(e.target.value)}
 +          className="w-full px-4 py-2 pl-10 bg-bg-input border border-border-default rounded-lg focus:outline-none focus:ring-1 focus:ring-border-button transition-colors"
 +        />
++        <div className="grid grid-cols-2 gap-2">
++          {MODEL_GROUPS.map((group) => (
+             <Button
+-              variant={selectedTag === tag ? 'default' : 'secondary'}
+-              size="auto"
+-              className="leading-none px-1 py-0.5 rounded-sm text-xs"
+-              key={tag}
+-              onClick={() => handleTagClick(tag)}
++              key={group}
++              variant={activeGroup === group ? 'default' : 'outline'}
++              size="sm"
++              onClick={() => setActiveGroup(group)}
++              className="justify-between"
+             >
+-              {mapModelKey[tag.trim() as keyof typeof mapModelKey] ||
+-                tag.trim()}
+-              <span className="ml-1 tabular-nums opacity-60">
+-                {tagCounts[tag] ?? 0}
+-              </span>
++              <span>{typeLabel(group, isZh)}</span>
++              <span className="text-xs opacity-70">{groupCounts[group] ?? 0}</span>
+             </Button>
+           ))}
+         </div>
 +        <div className="flex items-center justify-between gap-3">
 +          <div className="min-w-0 text-xs text-text-secondary">
 +            <div className="flex items-center gap-1.5">
@@ -728,90 +847,22 @@ index 1039c7c..1fe725a 100644
 +              <span className="truncate">{modelDir || 'data/models'}</span>
 +            </div>
 +          </div>
-           <Button
--            variant={selectedTag === null ? 'default' : 'secondary'}
--            size="auto"
--            className="leading-none px-1 py-0.5 rounded-sm text-xs"
--            onClick={() => setSelectedTag(null)}
++          <Button
 +            variant="outline"
 +            size="sm"
 +            onClick={loadModels}
 +            disabled={loading}
-           >
--            All
--            <span className="ml-1 tabular-nums opacity-60">
--              {searchedModels.length}
--            </span>
++          >
 +            <RefreshCw size={14} className={loading ? 'animate-spin' : ''} />
 +            {copy.refresh}
-           </Button>
++          </Button>
 +        </div>
 +        {error && (
 +          <div className="rounded-md border border-state-error/30 bg-state-error-5 px-3 py-2 text-xs text-state-error">
 +            {copy.error}: {error}
 +          </div>
 +        )}
-+      </header>
-+
-+      <div className="p-4 flex flex-col gap-5 overflow-auto h-full scrollbar-auto">
-+        <section className="space-y-3">
-+          <div className="flex items-center justify-between">
-+            <h4 className="text-sm font-medium text-text-primary">
-+              {copy.found}
-+            </h4>
-+            <span className="rounded-sm bg-bg-card px-2 py-0.5 text-xs text-text-secondary">
-+              {filteredLocalModels.length}
-+            </span>
-+          </div>
-+
-+          {filteredLocalModels.length === 0 && (
-+            <div className="rounded-lg border border-dashed border-border-button p-3 text-xs leading-5 text-text-secondary">
-+              {copy.empty}
-+            </div>
-+          )}
- 
--          {allTags.map((tag) => (
--            <Button
--              variant={selectedTag === tag ? 'default' : 'secondary'}
--              size="auto"
--              className="leading-none px-1 py-0.5 rounded-sm text-xs"
--              key={tag}
--              onClick={() => handleTagClick(tag)}
-+          {filteredLocalModels.map((model) => (
-+            <div
-+              key={model.path}
-+              className="rounded-lg border border-border-button p-3 transition-colors hover:bg-bg-input"
-+              data-testid="local-model-card"
-             >
--              {mapModelKey[tag.trim() as keyof typeof mapModelKey] ||
--                tag.trim()}
--              <span className="ml-1 tabular-nums opacity-60">
--                {tagCounts[tag] ?? 0}
--              </span>
--            </Button>
-+              <div className="flex items-start justify-between gap-3">
-+                <div className="min-w-0">
-+                  <div className="truncate text-sm font-medium">
-+                    {model.name}
-+                  </div>
-+                  <div className="mt-1 truncate text-xs text-text-secondary">
-+                    {model.relative_path} · {formatSize(model.size_gb)}
-+                  </div>
-+                </div>
-+                <Button
-+                  size="sm"
-+                  variant="outline"
-+                  onClick={() => configureModel(model)}
-+                >
-+                  <Settings size={14} />
-+                  {copy.configure}
-+                </Button>
-+              </div>
-+            </div>
-           ))}
--        </div>
--      </header>
-+        </section>
+       </header>
  
 -      {/* Models List */}
 -      <div className="p-4 pt-0 flex flex-col gap-4 overflow-auto h-full scrollbar-auto">
@@ -828,10 +879,64 @@ index 1039c7c..1fe725a 100644
 -              <div className="flex flex-1 gap-1.5 items-center">
 -                <div className="font-normal text-base truncate">
 -                  {model.name}
++      <div className="p-4 flex flex-col gap-5 overflow-auto h-full scrollbar-auto">
++        <section className="space-y-3">
++          <div className="space-y-1">
++            <div className="flex items-center justify-between">
++              <h4 className="text-sm font-medium text-text-primary">
++                {copy.found} · {typeLabel(activeGroup, isZh)}
++              </h4>
++              <span className="rounded-sm bg-bg-card px-2 py-0.5 text-xs text-text-secondary">
++                {filteredLocalModels.length}
++              </span>
++            </div>
++            <p className="text-xs leading-5 text-text-secondary">
++              {typeDescription(activeGroup, isZh)}
++            </p>
++          </div>
++
++          {filteredLocalModels.length === 0 && (
++            <div className="rounded-lg border border-dashed border-border-button p-3 text-xs leading-5 text-text-secondary">
++              {copy.empty}
++            </div>
++          )}
++
++          {filteredLocalModels.map((model) => (
++            <div
++              key={model.path}
++              className="rounded-lg border border-border-button p-3 transition-colors hover:bg-bg-input"
++              data-testid="local-model-card"
++            >
++              <div className="flex items-start justify-between gap-3">
++                <div className="min-w-0">
++                  <div className="truncate text-sm font-medium">
++                    {model.name}
++                  </div>
++                  <div className="mt-1 truncate text-xs text-text-secondary">
++                    {model.relative_path} · {formatSize(model.size_gb)}
++                  </div>
++                  <div className="mt-1 truncate text-xs text-text-secondary">
++                    {copy.endpoint}: {model.base_url}
++                  </div>
+                 </div>
+-                {!!APIMapUrl[model.name as keyof typeof APIMapUrl] && (
++                <Button
++                  size="sm"
++                  variant="outline"
++                  onClick={() => configureModel(model)}
++                >
++                  <Settings size={14} />
++                  {copy.configure}
++                </Button>
++              </div>
++            </div>
++          ))}
++        </section>
++
 +        <section className="space-y-3">
 +          <div className="space-y-1">
 +            <h4 className="text-sm font-medium text-text-primary">
-+              {copy.recommended}
++              {copy.recommended} · {typeLabel(activeGroup, isZh)}
 +            </h4>
 +            <p className="text-xs leading-5 text-text-secondary">
 +              {copy.offline}
@@ -860,11 +965,13 @@ index 1039c7c..1fe725a 100644
 +                  <div className="mt-1 truncate text-xs text-text-secondary">
 +                    {model.repo}
 +                  </div>
-+                  <div className="mt-1 text-xs text-text-secondary">
++                  <div className="mt-1 text-xs leading-5 text-text-secondary">
 +                    {model.recommended_for}
 +                  </div>
-                 </div>
--                {!!APIMapUrl[model.name as keyof typeof APIMapUrl] && (
++                  <div className="mt-1 truncate text-xs text-text-secondary">
++                    {copy.endpoint}: {model.base_url}
++                  </div>
++                </div>
 +              </div>
 +              <div className="mt-3 flex flex-wrap gap-2">
 +                {model.downloaded ? (
@@ -876,7 +983,7 @@ index 1039c7c..1fe725a 100644
 +                    <Settings size={14} />
 +                    {copy.configure}
 +                  </Button>
-+                ) : (
++                ) : model.downloadable !== false ? (
                    <Button
 -                    asLink
 -                    variant="ghost"
@@ -898,6 +1005,10 @@ index 1039c7c..1fe725a 100644
 +                      ? `${copy.download}...`
 +                      : copy.download}
                    </Button>
++                ) : (
++                  <span className="inline-flex h-8 items-center rounded-md border border-border-button px-3 text-xs text-text-secondary">
++                    {copy.linkOnly}
++                  </span>
                  )}
 -              </div>
 -
@@ -919,7 +1030,7 @@ index 1039c7c..1fe725a 100644
 +                  asLink
 +                  variant="ghost"
 +                  size="sm"
-+                  to={`https://huggingface.co/${model.repo}`}
++                  to={model.url || `https://huggingface.co/${model.repo}`}
 +                  target="_blank"
 +                  rel="noreferrer noopener"
                  >

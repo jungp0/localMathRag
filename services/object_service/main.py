@@ -17,6 +17,9 @@ DATA_DIR = Path(os.environ.get("LOCALMATHRAG_DATA_DIR", "/data"))
 MODEL_DIR = Path(os.environ.get("LOCALMATHRAG_MODEL_DIR", DATA_DIR / "models"))
 MODEL_EXTENSIONS = {".gguf", ".safetensors", ".bin"}
 LLAMA_BASE_URL = os.environ.get("LOCALMATHRAG_LLAMA_BASE_URL", "http://host.docker.internal:8080/v1").rstrip("/")
+EMBEDDING_BASE_URL = os.environ.get("LOCALMATHRAG_EMBEDDING_BASE_URL", "http://host.docker.internal:8081/v1").rstrip("/")
+RERANK_BASE_URL = os.environ.get("LOCALMATHRAG_RERANK_BASE_URL", "http://host.docker.internal:8082/v1").rstrip("/")
+VISION_BASE_URL = os.environ.get("LOCALMATHRAG_VISION_BASE_URL", "http://host.docker.internal:8083/v1").rstrip("/")
 
 RECOMMENDED_MODELS = [
     {
@@ -30,6 +33,8 @@ RECOMMENDED_MODELS = [
         "recommended_for": "Intel Ultra 9 + RTX 4060 + 32GB RAM",
         "provider": "OpenAI-API-Compatible",
         "base_url": LLAMA_BASE_URL,
+        "downloadable": True,
+        "group": "chat",
     },
     {
         "id": "qwen3-4b-q4-k-m",
@@ -42,6 +47,92 @@ RECOMMENDED_MODELS = [
         "recommended_for": "Lower memory fallback",
         "provider": "OpenAI-API-Compatible",
         "base_url": LLAMA_BASE_URL,
+        "downloadable": True,
+        "group": "chat",
+    },
+    {
+        "id": "qwen3-embedding-06b",
+        "name": "Qwen3-Embedding-0.6B",
+        "file_name": "Qwen3-Embedding-0.6B",
+        "repo": "Qwen/Qwen3-Embedding-0.6B",
+        "url": "https://huggingface.co/Qwen/Qwen3-Embedding-0.6B",
+        "model_type": ["embedding"],
+        "max_tokens": 32768,
+        "recommended_for": "Default local embedding model for multilingual technical retrieval",
+        "provider": "OpenAI-API-Compatible",
+        "base_url": EMBEDDING_BASE_URL,
+        "downloadable": False,
+        "group": "embedding",
+    },
+    {
+        "id": "bge-m3",
+        "name": "BAAI/bge-m3",
+        "file_name": "bge-m3",
+        "repo": "BAAI/bge-m3",
+        "url": "https://huggingface.co/BAAI/bge-m3",
+        "model_type": ["embedding"],
+        "max_tokens": 8192,
+        "recommended_for": "Strong compact embedding fallback with broad RAG support",
+        "provider": "OpenAI-API-Compatible",
+        "base_url": EMBEDDING_BASE_URL,
+        "downloadable": False,
+        "group": "embedding",
+    },
+    {
+        "id": "qwen3-reranker-06b",
+        "name": "Qwen3-Reranker-0.6B",
+        "file_name": "Qwen3-Reranker-0.6B",
+        "repo": "Qwen/Qwen3-Reranker-0.6B",
+        "url": "https://huggingface.co/Qwen/Qwen3-Reranker-0.6B",
+        "model_type": ["rerank"],
+        "max_tokens": 32768,
+        "recommended_for": "Default reranker for evidence ordering in technical documents",
+        "provider": "OpenAI-API-Compatible",
+        "base_url": RERANK_BASE_URL,
+        "downloadable": False,
+        "group": "rerank",
+    },
+    {
+        "id": "bge-reranker-v2-m3",
+        "name": "BAAI/bge-reranker-v2-m3",
+        "file_name": "bge-reranker-v2-m3",
+        "repo": "BAAI/bge-reranker-v2-m3",
+        "url": "https://huggingface.co/BAAI/bge-reranker-v2-m3",
+        "model_type": ["rerank"],
+        "max_tokens": 8192,
+        "recommended_for": "Compact rerank fallback",
+        "provider": "OpenAI-API-Compatible",
+        "base_url": RERANK_BASE_URL,
+        "downloadable": False,
+        "group": "rerank",
+    },
+    {
+        "id": "qwen3-vl-8b-instruct",
+        "name": "Qwen3-VL-8B-Instruct",
+        "file_name": "Qwen3-VL-8B-Instruct",
+        "repo": "Qwen/Qwen3-VL-8B-Instruct",
+        "url": "https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct",
+        "model_type": ["vision"],
+        "max_tokens": 8192,
+        "recommended_for": "Vision model for diagrams, figures, screenshots, and OCR-heavy pages",
+        "provider": "OpenAI-API-Compatible",
+        "base_url": VISION_BASE_URL,
+        "downloadable": False,
+        "group": "vision",
+    },
+    {
+        "id": "qwen3-vl-4b-instruct",
+        "name": "Qwen3-VL-4B-Instruct",
+        "file_name": "Qwen3-VL-4B-Instruct",
+        "repo": "Qwen/Qwen3-VL-4B-Instruct",
+        "url": "https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct",
+        "model_type": ["vision"],
+        "max_tokens": 8192,
+        "recommended_for": "Smaller vision fallback for 8 GB class GPUs",
+        "provider": "OpenAI-API-Compatible",
+        "base_url": VISION_BASE_URL,
+        "downloadable": False,
+        "group": "vision",
     },
 ]
 
@@ -123,6 +214,30 @@ def _model_files() -> list[Path]:
     )
 
 
+def _infer_model_type(path: Path) -> list[str]:
+    name = path.name.lower()
+    if "embedding" in name or "embed" in name or "bge-m3" in name:
+        return ["embedding"]
+    if "rerank" in name or "reranker" in name:
+        return ["rerank"]
+    if "vl" in name or "vision" in name or "omni" in name:
+        return ["vision"]
+    if "ocr" in name:
+        return ["ocr"]
+    return ["chat"]
+
+
+def _base_url_for_model_type(model_type: list[str]) -> str:
+    first_type = model_type[0] if model_type else "chat"
+    if first_type == "embedding":
+        return EMBEDDING_BASE_URL
+    if first_type == "rerank":
+        return RERANK_BASE_URL
+    if first_type in {"vision", "ocr"}:
+        return VISION_BASE_URL
+    return LLAMA_BASE_URL
+
+
 def _llama_endpoint_status(timeout: float = 1.5) -> dict[str, Any]:
     url = f"{LLAMA_BASE_URL}/models"
     try:
@@ -145,6 +260,7 @@ def _llama_endpoint_status(timeout: float = 1.5) -> dict[str, Any]:
 
 def _model_payload(path: Path) -> dict[str, Any]:
     stat = path.stat()
+    model_type = _infer_model_type(path)
     return {
         "name": path.stem,
         "file_name": path.name,
@@ -154,8 +270,8 @@ def _model_payload(path: Path) -> dict[str, Any]:
         "size_gb": round(stat.st_size / 1024 / 1024 / 1024, 2),
         "extension": path.suffix.lower(),
         "provider": "OpenAI-API-Compatible",
-        "base_url": LLAMA_BASE_URL,
-        "model_type": ["chat"],
+        "base_url": _base_url_for_model_type(model_type),
+        "model_type": model_type,
         "max_tokens": 8192,
     }
 
@@ -192,6 +308,7 @@ def list_recommended_models() -> dict[str, Any]:
         item["downloaded"] = item["file_name"] in local_names
         item["target_path"] = str(MODEL_DIR / item["file_name"])
         item["endpoint_status"] = endpoint_status
+        item.setdefault("downloadable", False)
         models.append(item)
     return {"models": models}
 
@@ -215,6 +332,8 @@ def download_model(request: DownloadModelRequest) -> dict[str, Any]:
     file_name = request.file_name or (selected or {}).get("file_name")
     if not url or not file_name:
         raise HTTPException(status_code=400, detail="Model url and file_name are required")
+    if selected and not selected.get("downloadable", False):
+        raise HTTPException(status_code=400, detail="This model is a repository recommendation. Open the model link and install it with the matching local runtime.")
     if not url.startswith("https://huggingface.co/"):
         raise HTTPException(status_code=400, detail="Only Hugging Face model downloads are supported")
 

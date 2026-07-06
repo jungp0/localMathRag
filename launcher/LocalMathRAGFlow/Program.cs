@@ -35,6 +35,7 @@ internal sealed partial class TrayContext : ApplicationContext
     private readonly Icon appIcon;
     private Process? browserProcess;
     private string lastStatus = "";
+    private DateTimeOffset lastTrayOpenAt = DateTimeOffset.MinValue;
     private CancellationTokenSource? currentRun;
 
     public TrayContext()
@@ -57,28 +58,6 @@ internal sealed partial class TrayContext : ApplicationContext
         restartItem = MenuItem("Restart services", async () => await RestartServicesAsync(), MenuGlyph.Restart());
         menuHost = CreateMenuHost();
         menu = CreateMenu();
-
-        tray = new NotifyIcon
-        {
-            Icon = appIcon,
-            Text = "LocalMathRAGFlow",
-            ContextMenuStrip = menu,
-            Visible = true
-        };
-        tray.MouseClick += (_, e) =>
-        {
-            if (e.Button == MouseButtons.Right)
-            {
-                ShowTrayMenu();
-            }
-        };
-        tray.MouseUp += (_, e) =>
-        {
-            if (e.Button == MouseButtons.Right)
-            {
-                ShowTrayMenu();
-            }
-        };
         menu.Items.Add(statusItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(MenuItem("Open RAGFlow", async () => await OpenRagflowAsync(CancellationToken.None), MenuGlyph.Open()));
@@ -92,11 +71,30 @@ internal sealed partial class TrayContext : ApplicationContext
         menu.Items.Add(MenuItem("View compose log", () => OpenPath(ComposeLogFile), MenuGlyph.Log()));
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(MenuItem("Exit", async () => await ExitAsync(), MenuGlyph.Exit()));
+
+        menu.Opening += (_, _) => Log("TRAY menu opening");
+        menu.Opened += (_, _) => Log("TRAY menu opened");
+        tray = new NotifyIcon
+        {
+            Icon = appIcon,
+            Text = "LocalMathRAGFlow",
+            ContextMenuStrip = menu,
+            Visible = true
+        };
+        tray.DoubleClick += async (_, _) => await OpenFromTrayAsync("double click");
         tray.MouseDoubleClick += async (_, e) =>
         {
             if (e.Button == MouseButtons.Left)
             {
-                await OpenRagflowAsync(CancellationToken.None);
+                await OpenFromTrayAsync("left mouse double click");
+            }
+        };
+        tray.MouseClick += async (_, e) =>
+        {
+            Log($"TRAY mouse click: {e.Button}, clicks={e.Clicks}");
+            if (e.Button == MouseButtons.Left && e.Clicks >= 2)
+            {
+                await OpenFromTrayAsync("left mouse click fallback");
             }
         };
 
@@ -290,6 +288,18 @@ internal sealed partial class TrayContext : ApplicationContext
     {
         var loginUrl = await TryBuildAutoLoginUrlAsync(token);
         OpenOrFocusAppWindow(loginUrl ?? WebUrl);
+    }
+
+    private async Task OpenFromTrayAsync(string reason)
+    {
+        var now = DateTimeOffset.UtcNow;
+        if (now - lastTrayOpenAt < TimeSpan.FromMilliseconds(750))
+        {
+            return;
+        }
+        lastTrayOpenAt = now;
+        Log("TRAY open requested: " + reason);
+        await OpenRagflowAsync(CancellationToken.None);
     }
 
     private void ShowTrayMenu()
