@@ -57,7 +57,11 @@ def test_windows_launcher_exists() -> None:
     assert program.exists()
     assert build_script.exists()
     assert "UseWindowsForms" in read_text(project)
-    assert "StartDockerDesktop" in read_text(program)
+    program_text = read_text(program)
+    assert "StartDockerDesktop" in program_text
+    assert "installedRoot" in program_text
+    assert "third_party" in program_text
+    assert "ragflow" in program_text
 
 
 def main() -> None:

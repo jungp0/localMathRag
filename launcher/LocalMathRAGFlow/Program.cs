@@ -398,15 +398,24 @@ internal sealed class TrayContext : ApplicationContext
     private static string FindRoot()
     {
         var current = AppContext.BaseDirectory;
+        var candidates = new List<string>();
         for (var dir = new DirectoryInfo(current); dir is not null; dir = dir.Parent)
         {
             if (File.Exists(Path.Combine(dir.FullName, "docker", "docker-compose.localmathrag.yml")) &&
                 Directory.Exists(Path.Combine(dir.FullName, "scripts")))
             {
-                return dir.FullName;
+                candidates.Add(dir.FullName);
             }
         }
-        return Directory.GetCurrentDirectory();
+
+        var installedRoot = candidates.FirstOrDefault(candidate =>
+            File.Exists(Path.Combine(candidate, "third_party", "ragflow", "docker", "docker-compose.yml")));
+        if (installedRoot is not null)
+        {
+            return installedRoot;
+        }
+
+        return candidates.FirstOrDefault() ?? Directory.GetCurrentDirectory();
     }
 
     private static void OpenUrl(string url) => Process.Start(new ProcessStartInfo { FileName = url, UseShellExecute = true });
