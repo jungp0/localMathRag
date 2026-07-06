@@ -14,6 +14,8 @@ LocalMathRAGFlow 是基于 RAGFlow 的工程文档问答二开工作区。当前
 ## 仓库结构
 
 ```text
+launcher/
+  LocalMathRAGFlow/                # Windows 托盘 EXE 启动器
 docker/
   docker-compose.localmathrag.yml   # RAGFlow Docker 覆盖文件
 docs/
@@ -36,6 +38,43 @@ tests/
 ```
 
 `data/` 被保留并继续被 git 忽略。已下载的 `data/models/Qwen3-8B-Q4_K_M.gguf` 不会被删除，Docker 覆盖文件会把 `data/models` 挂载给可选的 llama.cpp 服务。
+
+## 一键启动
+
+本地桌面主入口是 `LocalMathRAGFlow.exe`：
+
+1. 双击 `LocalMathRAGFlow.exe`。
+2. 如果 Docker daemon 未运行，启动器会自动打开 Docker Desktop 并等待 Docker ready。
+3. 如果 `third_party/ragflow` 不存在，启动器会弹窗确认是否从 GitHub 下载 RAGFlow 源码。
+4. 启动器执行 Docker Compose，启动 RAGFlow、MySQL、Redis、MinIO、Elasticsearch 和 LocalMathRAGFlow object sidecar。
+5. 启动完成后自动打开 RAGFlow Web。
+
+托盘菜单支持：
+
+- 打开 RAGFlow。
+- 打开 object service。
+- 启动、停止、重启服务。
+- 打开数据目录。
+- 查看 launcher/compose 日志。
+- 退出时选择是否停止 Docker 服务。
+
+构建 EXE：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-launcher.ps1
+```
+
+输出目录：
+
+```text
+dist\LocalMathRAGFlow-win-x64
+```
+
+Release zip：
+
+```text
+dist\LocalMathRAGFlow-win-x64.zip
+```
 
 ## 开发启动
 

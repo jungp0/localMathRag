@@ -18,6 +18,8 @@ __pycache__/
 *.sqlite-wal
 
 node_modules/
+bin/
+obj/
 build/
 coverage/
 tmp/

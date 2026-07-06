@@ -49,11 +49,23 @@ def test_object_service_imports() -> None:
     assert "/v1/objects/normalize" in text
 
 
+def test_windows_launcher_exists() -> None:
+    project = ROOT / "launcher" / "LocalMathRAGFlow" / "LocalMathRAGFlow.csproj"
+    program = ROOT / "launcher" / "LocalMathRAGFlow" / "Program.cs"
+    build_script = ROOT / "scripts" / "build-launcher.ps1"
+    assert project.exists()
+    assert program.exists()
+    assert build_script.exists()
+    assert "UseWindowsForms" in read_text(project)
+    assert "StartDockerDesktop" in read_text(program)
+
+
 def main() -> None:
     test_json_schemas_are_valid()
     test_openapi_and_pipeline_exist()
     test_chinese_text_files_use_utf8_bom()
     test_object_service_imports()
+    test_windows_launcher_exists()
     print("contract checks passed")
 
 
