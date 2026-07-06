@@ -1,8 +1,8 @@
 diff --git a/api/apps/llm_app.py b/api/apps/llm_app.py
-index 690d54b..4c387aa 100644
+index 690d54b..c59550f 100644
 --- a/api/apps/llm_app.py
 +++ b/api/apps/llm_app.py
-@@ -44,6 +44,34 @@ def _resolve_my_llm_is_tools(o_dict: dict) -> bool:
+@@ -44,6 +44,43 @@ def _resolve_my_llm_is_tools(o_dict: dict) -> bool:
          return False
  
  
@@ -34,10 +34,19 @@ index 690d54b..4c387aa 100644
 +    return bool(getattr(response, "choices", None))
 +
 +
++def _defer_local_non_chat_check(factory: str, base_url: str | None, model_type: str | None) -> bool:
++    return _is_local_openai_compatible(factory, base_url) and model_type in {
++        LLMType.EMBEDDING.value,
++        LLMType.RERANK.value,
++        LLMType.IMAGE2TEXT.value,
++        LLMType.OCR.value,
++    }
++
++
  @manager.route("/factories", methods=["GET"])  # noqa: F821
  @login_required
  def factories():
-@@ -111,6 +139,18 @@ async def set_api_key():
+@@ -111,6 +148,18 @@ async def set_api_key():
              assert factory in ChatModel, f"Chat model from {factory} is not supported yet."
              mdl = ChatModel[factory](req["api_key"], llm.llm_name, base_url=base_url, **extra)
              try:
@@ -56,7 +65,37 @@ index 690d54b..4c387aa 100644
                  async def check_streamly():
                      async for chunk in mdl.async_chat_streamly(
                          None,
-@@ -335,19 +375,28 @@ async def add_llm():
+@@ -316,16 +365,19 @@ async def add_llm():
+     match model_type:
+         case LLMType.EMBEDDING.value:
+             assert factory in EmbeddingModel, f"Embedding model from {factory} is not supported yet."
+-            mdl = EmbeddingModel[factory](key=model_api_key, model_name=mdl_nm, base_url=model_base_url)
+-            try:
+-                arr, tc = await asyncio.wait_for(
+-                    asyncio.to_thread(mdl.encode, ["Test if the api key is available"]),
+-                    timeout=timeout_seconds,
+-                )
+-                if len(arr[0]) == 0:
+-                    raise Exception("Fail")
+-            except Exception as e:
+-                msg += f"\nFail to access embedding model({mdl_nm})." + str(e)
++            if _defer_local_non_chat_check(factory, model_base_url, model_type):
++                logging.info("add_llm: deferred local embedding runtime check for %s", mdl_nm)
++            else:
++                mdl = EmbeddingModel[factory](key=model_api_key, model_name=mdl_nm, base_url=model_base_url)
++                try:
++                    arr, tc = await asyncio.wait_for(
++                        asyncio.to_thread(mdl.encode, ["Test if the api key is available"]),
++                        timeout=timeout_seconds,
++                    )
++                    if len(arr[0]) == 0:
++                        raise Exception("Fail")
++                except Exception as e:
++                    msg += f"\nFail to access embedding model({mdl_nm})." + str(e)
+         case LLMType.CHAT.value:
+             assert factory in ChatModel, f"Chat model from {factory} is not supported yet."
+             mdl = ChatModel[factory](
+@@ -335,25 +387,36 @@ async def add_llm():
                  **extra,
              )
              try:
@@ -98,11 +137,90 @@ index 690d54b..4c387aa 100644
              except Exception as e:
                  msg += f"\nFail to access model({factory}/{mdl_nm})." + str(e)
  
+         case LLMType.RERANK.value:
+             if factory not in RerankModel:
+                 msg += f"\nRerank model from {factory} is not supported yet."
++            elif _defer_local_non_chat_check(factory, model_base_url, model_type):
++                logging.info("add_llm: deferred local rerank runtime check for %s", mdl_nm)
+             else:
+                 try:
+                     mdl = RerankModel[factory](key=model_api_key, model_name=mdl_nm, base_url=model_base_url)
+@@ -372,17 +435,20 @@ async def add_llm():
+             from rag.utils.base64_image import test_image
+ 
+             assert factory in CvModel, f"Image to text model from {factory} is not supported yet."
+-            mdl = CvModel[factory](key=model_api_key, model_name=mdl_nm, base_url=model_base_url)
+-            try:
+-                image_data = test_image
+-                m, tc = await asyncio.wait_for(
+-                    asyncio.to_thread(mdl.describe, image_data),
+-                    timeout=timeout_seconds,
+-                )
+-                if not tc and m.find("**ERROR**:") >= 0:
+-                    raise Exception(m)
+-            except Exception as e:
+-                msg += f"\nFail to access model({factory}/{mdl_nm})." + str(e)
++            if _defer_local_non_chat_check(factory, model_base_url, model_type):
++                logging.info("add_llm: deferred local image2text runtime check for %s", mdl_nm)
++            else:
++                mdl = CvModel[factory](key=model_api_key, model_name=mdl_nm, base_url=model_base_url)
++                try:
++                    image_data = test_image
++                    m, tc = await asyncio.wait_for(
++                        asyncio.to_thread(mdl.describe, image_data),
++                        timeout=timeout_seconds,
++                    )
++                    if not tc and m.find("**ERROR**:") >= 0:
++                        raise Exception(m)
++                except Exception as e:
++                    msg += f"\nFail to access model({factory}/{mdl_nm})." + str(e)
+         case LLMType.TTS.value:
+             assert factory in TTSModel, f"TTS model from {factory} is not supported yet."
+             mdl = TTSModel[factory](key=model_api_key, model_name=mdl_nm, base_url=model_base_url)
+@@ -399,16 +465,19 @@ async def add_llm():
+                 msg += f"\nFail to access model({factory}/{mdl_nm})." + str(e)
+         case LLMType.OCR.value:
+             assert factory in OcrModel, f"OCR model from {factory} is not supported yet."
+-            try:
+-                mdl = OcrModel[factory](key=model_api_key, model_name=mdl_nm, base_url=model_base_url)
+-                ok, reason = await asyncio.wait_for(
+-                    asyncio.to_thread(mdl.check_available),
+-                    timeout=timeout_seconds,
+-                )
+-                if not ok:
+-                    raise RuntimeError(reason or "Model not available")
+-            except Exception as e:
+-                msg += f"\nFail to access model({factory}/{mdl_nm})." + str(e)
++            if _defer_local_non_chat_check(factory, model_base_url, model_type):
++                logging.info("add_llm: deferred local OCR runtime check for %s", mdl_nm)
++            else:
++                try:
++                    mdl = OcrModel[factory](key=model_api_key, model_name=mdl_nm, base_url=model_base_url)
++                    ok, reason = await asyncio.wait_for(
++                        asyncio.to_thread(mdl.check_available),
++                        timeout=timeout_seconds,
++                    )
++                    if not ok:
++                        raise RuntimeError(reason or "Model not available")
++                except Exception as e:
++                    msg += f"\nFail to access model({factory}/{mdl_nm})." + str(e)
+         case LLMType.SPEECH2TEXT.value:
+             assert factory in Seq2txtModel, f"Speech model from {factory} is not supported yet."
+             try:
 diff --git a/api/apps/services/provider_api_service.py b/api/apps/services/provider_api_service.py
-index 795885d..20f2179 100644
+index 795885d..57ce2b0 100644
 --- a/api/apps/services/provider_api_service.py
 +++ b/api/apps/services/provider_api_service.py
-@@ -42,6 +42,34 @@ def _factory_model_types(llm: dict) -> list[str]:
+@@ -25,7 +25,7 @@ from api.db.joint_services.tenant_model_service import get_model_config_from_pro
+ from api.db.services.tenant_model_provider_service import TenantModelProviderService
+ from api.db.services.tenant_model_instance_service import TenantModelInstanceService
+ from api.db.services.tenant_model_service import TenantModelService
+-from rag.llm import ChatModel, EmbeddingModel, ModelMeta, OcrModel, RerankModel, TTSModel
++from rag.llm import ChatModel, CvModel, EmbeddingModel, ModelMeta, OcrModel, RerankModel, TTSModel
+ 
+ 
+ def _to_int(v, default=500):
+@@ -42,6 +42,46 @@ def _factory_model_types(llm: dict) -> list[str]:
      return [model_type] if model_type else []
  
  
@@ -134,10 +252,77 @@ index 795885d..20f2179 100644
 +    return bool(getattr(response, "choices", None))
 +
 +
++def _defer_local_non_chat_check(provider_name: str, base_url: str | None, model_types: list[str]) -> bool:
++    return _is_local_openai_compatible(provider_name, base_url) and any(
++        model_type in {
++            LLMType.EMBEDDING.value,
++            LLMType.RERANK.value,
++            LLMType.IMAGE2TEXT.value,
++            LLMType.OCR.value,
++        }
++        for model_type in model_types
++    )
++
++
  def _normalize_provider_base_url(provider_name: str, base_url: str | None):
      if provider_name != "VLLM" or not base_url:
          return base_url
-@@ -459,6 +487,17 @@ async def verify_api_key(provider_id_or_name: str, api_key: str | dict, base_url
+@@ -305,18 +345,14 @@ async def create_provider_instance(tenant_id: str, provider_id_or_name: str, ins
+     if api_key:
+         api_key_str = api_key if isinstance(api_key, str) else json.dumps(api_key)
+ 
++    factory_entry = next((f for f in FACTORY_LLM_INFOS if f["name"] == provider_name), None)
+     # Only verify when there are models to probe. Generic providers such as
+     # "OpenAI-API-Compatible" may start empty and receive custom models later.
+-    factory_entry = next((f for f in FACTORY_LLM_INFOS if f["name"] == provider_name), None)
+     if (factory_entry and factory_entry.get("llm")) or model_info:
+         success, msg = await verify_api_key(provider_name, api_key, base_url, region, model_info)
+         if not success:
+             return False, msg
+ 
+-    success, msg = await verify_api_key(provider_name, api_key, base_url, region, model_info)
+-    if not success:
+-        return False, msg
+-
+     extra_fields = {}
+     if base_url:
+         extra_fields["base_url"] = base_url
+@@ -408,9 +444,7 @@ async def verify_api_key(provider_id_or_name: str, api_key: str | dict, base_url
+         return False, f"Provider '{provider_id_or_name}' not found"
+ 
+     factory_llms = factory_info[0]["llm"]
+-    if not factory_llms:
+-        if not model_info:
+-            return False, f"No models found for provider '{provider_id_or_name}'"
++    if model_info:
+         factory_llms = [
+             {
+                 "model_type": _type,
+@@ -422,9 +456,11 @@ async def verify_api_key(provider_id_or_name: str, api_key: str | dict, base_url
+         ]
+         if not factory_llms:
+             return False, f"No valid models found for provider '{provider_id_or_name}'"
++    elif not factory_llms:
++        return False, f"No models found for provider '{provider_id_or_name}'"
+ 
+     # test if api key works
+-    chat_passed, embd_passed, rerank_passed, ocr_passed, tts_passed = False, False, False, False, False
++    chat_passed, embd_passed, rerank_passed, vision_passed, ocr_passed, tts_passed = False, False, False, False, False, False
+     timeout_seconds = int(os.environ.get("LLM_TIMEOUT_SECONDS", 10))
+     extra = {"provider": provider_name}
+     msg = ""
+@@ -439,6 +475,10 @@ async def verify_api_key(provider_id_or_name: str, api_key: str | dict, base_url
+         model_types = _factory_model_types(llm)
+         if not embd_passed and LLMType.EMBEDDING.value in model_types:
+             assert provider_name in EmbeddingModel, f"Embedding model from {provider_name} is not supported yet."
++            if _defer_local_non_chat_check(provider_name, base_url, model_types):
++                logging.info("verify_api_key: deferred local embedding runtime check for %s", llm["llm_name"])
++                embd_passed = True
++                continue
+             mdl = EmbeddingModel[provider_name](api_key_str, llm["llm_name"], base_url=base_url)
+             try:
+                 arr, tc = await asyncio.wait_for(
+@@ -459,6 +499,17 @@ async def verify_api_key(provider_id_or_name: str, api_key: str | dict, base_url
              assert provider_name in ChatModel, f"Chat model from {provider_name} is not supported yet."
              mdl = ChatModel[provider_name](api_key_str, llm["llm_name"], base_url=base_url, **extra)
              try:
@@ -155,6 +340,68 @@ index 795885d..20f2179 100644
  
                  async def check_streamly():
                      async for chunk in mdl.async_chat_streamly(
+@@ -488,6 +539,10 @@ async def verify_api_key(provider_id_or_name: str, api_key: str | dict, base_url
+                 logging.warning(unsupported_msg)
+                 msg += f"\n{unsupported_msg}"
+                 continue
++            if _defer_local_non_chat_check(provider_name, base_url, model_types):
++                logging.info("verify_api_key: deferred local rerank runtime check for %s", llm["llm_name"])
++                rerank_passed = True
++                continue
+             mdl = RerankModel[provider_name](api_key_str, llm["llm_name"], base_url=base_url)
+             try:
+                 arr, tc = await asyncio.wait_for(
+@@ -505,8 +560,36 @@ async def verify_api_key(provider_id_or_name: str, api_key: str | dict, base_url
+                     llm["llm_name"],
+                 )
+                 msg += f"\nFail to access model({provider_name}/{llm['llm_name']}) using this api key." + str(e)
++        elif not vision_passed and LLMType.IMAGE2TEXT.value in model_types:
++            assert provider_name in CvModel, f"Image to text model from {provider_name} is not supported yet."
++            if _defer_local_non_chat_check(provider_name, base_url, model_types):
++                logging.info("verify_api_key: deferred local image2text runtime check for %s", llm["llm_name"])
++                vision_passed = True
++                continue
++            from rag.utils.base64_image import test_image
++
++            mdl = CvModel[provider_name](key=api_key_str, model_name=llm["llm_name"], base_url=base_url)
++            try:
++                m, tc = await asyncio.wait_for(
++                    asyncio.to_thread(mdl.describe, test_image),
++                    timeout=timeout_seconds,
++                )
++                if not tc and m.find("**ERROR**:") >= 0:
++                    raise Exception(m)
++                vision_passed = True
++            except Exception as e:
++                logging.exception(
++                    "Fail to access image2text model for provider=%s model=%s",
++                    provider_name,
++                    llm["llm_name"],
++                )
++                msg += f"\nFail to access model({provider_name}/{llm['llm_name']})." + str(e)
+         elif not ocr_passed and LLMType.OCR.value in model_types:
+             assert provider_name in OcrModel, f"OCR model from {provider_name} is not supported yet."
++            if _defer_local_non_chat_check(provider_name, base_url, model_types):
++                logging.info("verify_api_key: deferred local OCR runtime check for %s", llm["llm_name"])
++                ocr_passed = True
++                continue
+             mdl = OcrModel[provider_name](key=api_key_str, model_name=llm["llm_name"], base_url=base_url)
+             try:
+                 ok, reason = await asyncio.wait_for(
+@@ -544,11 +627,11 @@ async def verify_api_key(provider_id_or_name: str, api_key: str | dict, base_url
+                     llm["llm_name"],
+                 )
+                 msg += f"\nFail to access model({provider_name}/{llm['llm_name']})." + str(e)
+-        if any([embd_passed, chat_passed, rerank_passed, ocr_passed, tts_passed]):
++        if any([embd_passed, chat_passed, rerank_passed, vision_passed, ocr_passed, tts_passed]):
+             msg = ""
+             break
+ 
+-    success = any([embd_passed, chat_passed, rerank_passed, ocr_passed, tts_passed])
++    success = any([embd_passed, chat_passed, rerank_passed, vision_passed, ocr_passed, tts_passed])
+     return success, "success" if success else msg
+ 
+ 
 diff --git a/web/package.json b/web/package.json
 index 8a74385..f9a1e52 100644
 --- a/web/package.json
@@ -584,18 +831,20 @@ index 2d0d06b..f58171b 100644
      <>
        <Spotlight opcity={0.4} coverage={60} color={'rgb(128, 255, 248)'} />
 diff --git a/web/src/pages/user-setting/setting-model/components/un-add-model.tsx b/web/src/pages/user-setting/setting-model/components/un-add-model.tsx
-index 1039c7c..222d249 100644
+index 1039c7c..ebc55cf 100644
 --- a/web/src/pages/user-setting/setting-model/components/un-add-model.tsx
 +++ b/web/src/pages/user-setting/setting-model/components/un-add-model.tsx
-@@ -1,12 +1,17 @@
+@@ -1,12 +1,18 @@
 -// src/components/AvailableModels.tsx
 -import { LlmIcon } from '@/components/svg-icon';
- import { Button } from '@/components/ui/button';
+-import { Button } from '@/components/ui/button';
++﻿import { Button } from '@/components/ui/button';
  import { SearchInput } from '@/components/ui/input';
 -import { APIMapUrl } from '@/constants/llm';
 -import { useFetchAvailableProviders } from '@/hooks/use-llm-request';
 -import { ArrowUpRight, Plus } from 'lucide-react';
 -import { FC, useMemo, useState } from 'react';
++import { Progress } from '@/components/ui/progress';
 +import { LLMFactory } from '@/constants/llm';
 +import {
 +  CheckCircle2,
@@ -611,7 +860,7 @@ index 1039c7c..222d249 100644
  
  export const mapModelKey = {
    image2text: 'VLM',
-@@ -20,83 +25,250 @@ export const mapModelKey = {
+@@ -20,83 +26,286 @@ export const mapModelKey = {
    ocr: 'OCR',
  };
  
@@ -688,16 +937,30 @@ index 1039c7c..222d249 100644
 +
 +const MODEL_GROUPS: ModelGroup[] = ['chat', 'embedding', 'rerank', 'vision'];
 +
-+const getPrimaryType = (model: Pick<LocalModel | RecommendedModel, 'model_type'>) => {
-+  const type = model.model_type?.[0] ?? 'chat';
-+  return type === 'ocr' ? 'vision' : (type as ModelGroup);
++const normalizeModelType = (type?: string): ModelGroup => {
++  if (type === 'ocr' || type === 'image2text') return 'vision';
++  if (type === 'embedding' || type === 'rerank' || type === 'vision') {
++    return type;
++  }
++  return 'chat';
 +};
++
++const getPrimaryType = (
++  model: Pick<LocalModel | RecommendedModel, 'model_type'>,
++): ModelGroup => normalizeModelType(model.model_type?.[0]);
 +
 +const instanceNameByType: Record<ModelGroup, string> = {
 +  chat: 'local-llama-cpp',
 +  embedding: 'local-embedding',
 +  rerank: 'local-rerank',
 +  vision: 'local-vision',
++};
++
++const ragflowTypeByGroup: Record<ModelGroup, string[]> = {
++  chat: ['chat'],
++  embedding: ['embedding'],
++  rerank: ['rerank'],
++  vision: ['image2text'],
 +};
 +
 +const makeDefaults = (
@@ -710,7 +973,7 @@ index 1039c7c..222d249 100644
 +  return {
 +    instance_name: instanceNameByType[primaryType],
 +    model_name: model.runtime_model_name || model.name,
-+    model_type: model.model_type,
++    model_type: ragflowTypeByGroup[primaryType],
 +    base_url: model.base_url,
 +    api_key: 'local',
 +    max_tokens: model.max_tokens,
@@ -722,7 +985,7 @@ index 1039c7c..222d249 100644
 +
 +const typeLabel = (type: ModelGroup, isZh: boolean) => {
 +  const labels = {
-+    chat: isZh ? '对话模型' : 'Chat',
++    chat: isZh ? '语言模型' : 'Chat',
 +    embedding: isZh ? '嵌入模型' : 'Embedding',
 +    rerank: isZh ? '重排模型' : 'Rerank',
 +    vision: isZh ? '视觉/OCR' : 'Vision/OCR',
@@ -733,10 +996,10 @@ index 1039c7c..222d249 100644
 +const typeDescription = (type: ModelGroup, isZh: boolean) => {
 +  const descriptions = {
 +    chat: isZh
-+      ? '用于问答、总结、结构化抽取。'
++      ? '用于问答、总结和结构化提取。'
 +      : 'Answers, summaries, and structured extraction.',
 +    embedding: isZh
-+      ? '用于文档入库和语义检索，离线 RAG 必需。'
++      ? '用于文档入库和语义检索，是离线 RAG 的基础模型。'
 +      : 'Required for indexing and semantic retrieval.',
 +    rerank: isZh
 +      ? '用于证据重排，提升技术要求和参数检索质量。'
@@ -766,6 +1029,7 @@ index 1039c7c..222d249 100644
 -  const [selectedTag, setSelectedTag] = useState<string | null>(null);
 +  const [loading, setLoading] = useState(false);
 +  const [downloadingId, setDownloadingId] = useState<string | null>(null);
++  const [downloadProgress, setDownloadProgress] = useState(0);
 +  const [activeGroup, setActiveGroup] = useState<ModelGroup>('chat');
 +  const [error, setError] = useState('');
  
@@ -780,26 +1044,44 @@ index 1039c7c..222d249 100644
 +      subtitle: isZh
 +        ? '按类型配置本地模型。日常使用保持离线，只有点击下载或打开链接时才联网。'
 +        : 'Configure local models by type. Daily use stays offline; network is used only when you download or open a link.',
-+      search: isZh ? '搜索本地模型或推荐模型' : 'Search local or recommended models',
++      search: isZh
++        ? '搜索本地模型或推荐模型'
++        : 'Search local or recommended models',
 +      refresh: isZh ? '重新扫描' : 'Rescan',
 +      found: isZh ? '已发现' : 'Discovered',
 +      empty: isZh
-+        ? '未发现该类型的本地模型。可以把模型放入 data/models，或从推荐链接安装对应本地运行服务。'
-+        : 'No local model of this type was found. Put model files into data/models, or install a matching local runtime from a recommendation.',
++        ? '未发现该类型的本地模型。可以把模型放入 data/models，或从推荐模型下载。'
++        : 'No local model of this type was found. Put model files into data/models, or download a recommendation.',
 +      configure: isZh ? '配置' : 'Configure',
 +      recommended: isZh ? '推荐模型' : 'Recommended models',
 +      downloaded: isZh ? '已下载' : 'Downloaded',
-+      download: isZh ? '下载并配置' : 'Download and configure',
++      download: isZh ? '下载' : 'Download',
++      downloading: isZh ? '下载中' : 'Downloading',
 +      open: isZh ? '打开链接' : 'Open link',
 +      linkOnly: isZh ? '仓库链接' : 'Repo link',
++      downloadComplete: isZh
++        ? '下载完成。模型已进入对应类型列表，可继续点击配置。'
++        : 'Downloaded. The model is now listed under its own type and can be configured next.',
++      runtimeHint: isZh
++        ? '下载只保存模型文件；配置和使用前需要对应的本地运行服务可用。'
++        : 'Download stores model files only. The matching local runtime must be available before use.',
 +      offline: isZh
-+        ? '推荐模型可直接下载。Chat 使用 llama.cpp；嵌入、重排和视觉模型下载后会填入对应本地服务端点。'
-+        : 'Recommended models can be downloaded directly. Chat uses llama.cpp; embedding, rerank, and vision models are configured with their matching local endpoints.',
++        ? '推荐模型可直接下载。下载后会显示在对应类型标签下；需要使用时再点击配置。'
++        : 'Recommended models can be downloaded directly. After download they appear under their own type; configure them when needed.',
 +      error: isZh ? '本地模型服务不可用' : 'Local model service is unavailable',
 +      endpoint: isZh ? '端点' : 'Endpoint',
 +    }),
 +    [isZh],
 +  );
++
++  useEffect(() => {
++    if (!downloadingId) return;
++    setDownloadProgress(8);
++    const timer = window.setInterval(() => {
++      setDownloadProgress((value) => Math.min(value + 4, 92));
++    }, 900);
++    return () => window.clearInterval(timer);
++  }, [downloadingId]);
  
 -  const filteredModels = useMemo(() => {
 -    if (selectedTag === null) {
@@ -860,7 +1142,9 @@ index 1039c7c..222d249 100644
 +  const filteredRecommendedModels = useMemo(
 +    () =>
 +      recommendedModels.filter((model) => {
-+        const matchesGroup = (model.group ?? getPrimaryType(model)) === activeGroup;
++        const matchesGroup =
++          normalizeModelType(model.group) === activeGroup ||
++          getPrimaryType(model) === activeGroup;
 +        const matchesSearch =
 +          model.name.toLowerCase().includes(needle) ||
 +          model.repo.toLowerCase().includes(needle) ||
@@ -915,20 +1199,21 @@ index 1039c7c..222d249 100644
 +        const data = await response.json().catch(() => ({}));
 +        throw new Error(data.detail ?? 'download failed');
 +      }
-+      const data = await response.json();
++      setDownloadProgress(100);
++      await response.json().catch(() => ({}));
 +      await loadModels();
-+      if (data?.model) {
-+        configureModel(data.model);
-+      }
 +    } catch (err) {
 +      setError(err instanceof Error ? err.message : copy.error);
 +    } finally {
-+      setDownloadingId(null);
++      window.setTimeout(() => {
++        setDownloadingId(null);
++        setDownloadProgress(0);
++      }, 500);
 +    }
    };
  
    return (
-@@ -104,112 +276,193 @@ export const AvailableModels: FC<{
+@@ -104,112 +313,213 @@ export const AvailableModels: FC<{
        className="text-text-primary h-full flex flex-col"
        data-testid="available-models-section"
      >
@@ -1107,74 +1392,102 @@ index 1039c7c..222d249 100644
 +            </p>
 +          </div>
 +
-+          {filteredRecommendedModels.map((model) => (
-+            <div
-+              key={model.id}
-+              className="rounded-lg border border-border-button p-3 transition-colors hover:bg-bg-input"
-+              data-testid="recommended-model-card"
-+            >
-+              <div className="flex items-start justify-between gap-3">
-+                <div className="min-w-0">
-+                  <div className="flex items-center gap-2">
-+                    <div className="truncate text-sm font-medium">
-+                      {model.name}
++          {filteredRecommendedModels.map((model) => {
++            const isDownloading = downloadingId === model.id;
++            return (
++              <div
++                key={model.id}
++                className="rounded-lg border border-border-button p-3 transition-colors hover:bg-bg-input"
++                data-testid="recommended-model-card"
++              >
++                <div className="flex items-start justify-between gap-3">
++                  <div className="min-w-0">
++                    <div className="flex items-center gap-2">
++                      <div className="truncate text-sm font-medium">
++                        {model.name}
++                      </div>
++                      {model.downloaded && (
++                        <CheckCircle2
++                          size={14}
++                          className="shrink-0 text-state-success"
++                        />
++                      )}
++                    </div>
++                    <div className="mt-1 truncate text-xs text-text-secondary">
++                      {model.repo}
++                    </div>
++                    <div className="mt-1 text-xs leading-5 text-text-secondary">
++                      {model.recommended_for}
++                    </div>
++                    <div className="mt-1 truncate text-xs text-text-secondary">
++                      {copy.endpoint}: {model.base_url}
 +                    </div>
 +                    {model.downloaded && (
-+                      <CheckCircle2
-+                        size={14}
-+                        className="shrink-0 text-state-success"
-+                      />
++                      <div className="mt-2 text-xs text-state-success">
++                        {copy.downloadComplete}
++                      </div>
++                    )}
++                    {isDownloading && (
++                      <div className="mt-3 space-y-1.5">
++                        <div className="flex items-center justify-between text-xs text-text-secondary">
++                          <span>{copy.downloading}</span>
++                          <span>{downloadProgress}%</span>
++                        </div>
++                        <Progress value={downloadProgress} />
++                      </div>
 +                    )}
 +                  </div>
-+                  <div className="mt-1 truncate text-xs text-text-secondary">
-+                    {model.repo}
-+                  </div>
-+                  <div className="mt-1 text-xs leading-5 text-text-secondary">
-+                    {model.recommended_for}
-+                  </div>
-+                  <div className="mt-1 truncate text-xs text-text-secondary">
-+                    {copy.endpoint}: {model.base_url}
-+                  </div>
 +                </div>
-+              </div>
-+              <div className="mt-3 flex flex-wrap gap-2">
-+                {model.downloaded ? (
-+                  <Button
-+                    size="sm"
-+                    variant="outline"
-+                    onClick={() => configureModel(model)}
-+                  >
-+                    <Settings size={14} />
-+                    {copy.configure}
-+                  </Button>
-+                ) : model.downloadable !== false ? (
++                <div className="mt-3 flex flex-wrap gap-2">
++                  {model.downloaded ? (
++                    <Button
++                      size="sm"
++                      variant="outline"
++                      onClick={() => configureModel(model)}
++                    >
++                      <Settings size={14} />
++                      {copy.configure}
++                    </Button>
++                  ) : model.downloadable !== false ? (
++                    <Button
++                      size="sm"
++                      onClick={() => downloadModel(model)}
++                      disabled={Boolean(downloadingId)}
++                    >
++                      <Download size={14} />
++                      {isDownloading ? copy.downloading : copy.download}
++                    </Button>
++                  ) : (
++                    <span className="inline-flex h-8 items-center rounded-md border border-border-button px-3 text-xs text-text-secondary">
++                      {copy.linkOnly}
++                    </span>
++                  )}
                    <Button
--                    asLink
--                    variant="ghost"
+                     asLink
+                     variant="ghost"
 -                    size="icon-xs"
 -                    className="size-4"
 -                    to={APIMapUrl[model.name as keyof typeof APIMapUrl]}
--                    target="_blank"
++                    size="sm"
++                    to={model.url || `https://huggingface.co/${model.repo}`}
+                     target="_blank"
 -                    rel="noopener noreferrer"
 -                    onClick={(e: React.MouseEvent<HTMLButtonElement>) =>
 -                      e.stopPropagation()
 -                    }
-+                    size="sm"
-+                    onClick={() => downloadModel(model)}
-+                    disabled={downloadingId === model.id}
++                    rel="noreferrer noopener"
                    >
 -                    <ArrowUpRight size={16} />
-+                    <Download size={14} />
-+                    {downloadingId === model.id
-+                      ? `${copy.download}...`
-+                      : copy.download}
++                    <ExternalLink size={14} />
++                    {copy.open}
                    </Button>
-+                ) : (
-+                  <span className="inline-flex h-8 items-center rounded-md border border-border-button px-3 text-xs text-text-secondary">
-+                    {copy.linkOnly}
-+                  </span>
++                </div>
++                {!model.downloaded && (
++                  <div className="mt-2 text-xs leading-5 text-text-secondary">
++                    {copy.runtimeHint}
++                  </div>
                  )}
--              </div>
+               </div>
 -
 -              <Button
 -                size="xs"
@@ -1190,25 +1503,15 @@ index 1039c7c..222d249 100644
 -                <span
 -                  key={index}
 -                  className="px-1 flex items-center h-5 text-xs bg-bg-card text-text-secondary rounded-md"
-+                <Button
-+                  asLink
-+                  variant="ghost"
-+                  size="sm"
-+                  to={model.url || `https://huggingface.co/${model.repo}`}
-+                  target="_blank"
-+                  rel="noreferrer noopener"
-                 >
+-                >
 -                  {mapModelKey[type as keyof typeof mapModelKey] || type}
 -                </span>
 -              ))}
-+                  <ExternalLink size={14} />
-+                  {copy.open}
-+                </Button>
-+              </div>
-             </div>
+-            </div>
 -          </div>
 -        ))}
-+          ))}
++            );
++          })}
 +        </section>
        </div>
      </aside>

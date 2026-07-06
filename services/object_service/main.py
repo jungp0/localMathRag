@@ -232,25 +232,37 @@ def _stable_id(object_type: str, payload: dict[str, Any], source: Source) -> str
     return f"{object_type}_{digest[:12]}"
 
 
-def _model_files() -> list[Path]:
+def _snapshot_model_dirs() -> list[Path]:
     if not MODEL_DIR.exists():
         return []
     return sorted(
         path
+        for path in MODEL_DIR.iterdir()
+        if path.is_dir() and (path / MODEL_METADATA_NAME).exists()
+    )
+
+
+def _is_inside_snapshot(path: Path, snapshot_dirs: list[Path]) -> bool:
+    return any(snapshot_dir in path.parents for snapshot_dir in snapshot_dirs)
+
+
+def _model_files(snapshot_dirs: list[Path] | None = None) -> list[Path]:
+    if not MODEL_DIR.exists():
+        return []
+    snapshot_dirs = snapshot_dirs or _snapshot_model_dirs()
+    return sorted(
+        path
         for path in MODEL_DIR.rglob("*")
         if path.is_file() and path.suffix.lower() in MODEL_EXTENSIONS
+        and not _is_inside_snapshot(path, snapshot_dirs)
     )
 
 
 def _model_entries() -> list[Path]:
     if not MODEL_DIR.exists():
         return []
-    snapshot_dirs = [
-        path
-        for path in MODEL_DIR.iterdir()
-        if path.is_dir() and (path / MODEL_METADATA_NAME).exists()
-    ]
-    return sorted([*_model_files(), *snapshot_dirs])
+    snapshot_dirs = _snapshot_model_dirs()
+    return sorted([*_model_files(snapshot_dirs), *snapshot_dirs])
 
 
 def _load_model_metadata(path: Path) -> dict[str, Any]:
