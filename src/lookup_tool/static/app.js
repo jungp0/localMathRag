@@ -418,6 +418,7 @@ function renderModelSettings() {
   $("model-id").value = settings.model || "";
   $("model-temperature").value = settings.temperature ?? 0;
   $("model-local-path").value = settings.local_model_path || "";
+  $("model-llama-path").value = settings.llama_server_path || "";
 }
 
 async function saveModelSettings() {
@@ -428,6 +429,7 @@ async function saveModelSettings() {
     model: $("model-id").value.trim(),
     temperature: Number($("model-temperature").value || 0),
     local_model_path: $("model-local-path").value.trim(),
+    llama_server_path: $("model-llama-path").value.trim(),
   };
   const data = await api("/api/model/settings", {
     method: "PATCH",
@@ -454,6 +456,7 @@ function renderModelStatus() {
     ["文件大小", localSize],
     ["Ollama", item.ollama_available ? "可用" : "未安装或不在 PATH"],
     ["llama.cpp", item.llama_available ? "可用" : "未安装或不在 PATH"],
+    ["llama-server", item.llama_server_path || ""],
     ["端点", item.endpoint_ok ? "在线" : "不可用"],
     ["Ollama 模型", (item.available_ollama_models || []).join(", ") || "无"],
   ]

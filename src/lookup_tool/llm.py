@@ -35,7 +35,7 @@ class OpenAICompatibleClient:
                 raw = json.loads(response.read().decode("utf-8"))
         except (OSError, URLError, TimeoutError, json.JSONDecodeError):
             return None
-        content = raw.get("choices", [{}])[0].get("message", {}).get("content")
+        content = extract_choice_text(raw)
         if not content:
             return None
         try:
@@ -64,8 +64,44 @@ class OpenAICompatibleClient:
                 raw = json.loads(response.read().decode("utf-8"))
         except (OSError, URLError, TimeoutError, json.JSONDecodeError):
             return None
-        content = raw.get("choices", [{}])[0].get("message", {}).get("content")
+        content = extract_choice_text(raw)
         return str(content).strip() if content else None
+
+
+def extract_choice_text(raw: dict[str, Any]) -> str | None:
+    choices = raw.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None
+    choice = choices[0] if isinstance(choices[0], dict) else {}
+    message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+    candidates = [
+        message.get("content"),
+        message.get("reasoning_content"),
+        message.get("reasoning"),
+        choice.get("text"),
+    ]
+    for candidate in candidates:
+        text = normalize_text_content(candidate)
+        if text:
+            return text
+    return None
+
+
+def normalize_text_content(value: Any) -> str | None:
+    if isinstance(value, str):
+        return value.strip() or None
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text") or item.get("content")
+                if isinstance(text, str):
+                    parts.append(text)
+        joined = "\n".join(part.strip() for part in parts if part.strip())
+        return joined or None
+    return None
 
 
 def generation_config_from_settings(settings: dict[str, Any]) -> GenerationConfig:

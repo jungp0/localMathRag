@@ -14,6 +14,45 @@
 
 ## 快速开始
 
+Windows 本机一键启动：
+
+```powershell
+# 首次或更新 llama.cpp 运行器时执行一次，会访问 GitHub release 下载二进制包
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\Install-LlamaCpp.ps1 -Flavor cuda-12.4
+
+# 之后直接双击或命令行运行
+.\scripts\Start-LocalMathRAG.cmd
+```
+
+启动脚本会：
+
+- 查找 `data\runtime\llama.cpp\...\llama-server.exe`。
+- 用 `data\models\Qwen3-8B-Q4_K_M.gguf` 启动 `http://127.0.0.1:8080/v1`。
+- 加入 `--reasoning off`，让 Qwen3 直接返回 `message.content`。
+- 启动 WebApp `http://127.0.0.1:8765`。
+- 自动保存 WebApp 模型设置。
+
+停止：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\Stop-LocalMathRAG.ps1
+```
+
+Docker 可选启动：
+
+```powershell
+# 仅启动 WebApp
+docker compose -f docker-compose.local.yml up --build webapp
+
+# WebApp + llama.cpp CPU
+docker compose -f docker-compose.local.yml --profile llama-cpu up --build
+
+# WebApp + llama.cpp CUDA，需要 Docker GPU runtime / NVIDIA Container Toolkit
+docker compose -f docker-compose.local.yml --profile llama-cuda up --build
+```
+
+本机 Windows + 4060 推荐优先使用 `Start-LocalMathRAG.cmd`，因为已经验证可直接调用 Windows CUDA 版 llama.cpp。Docker 更适合未来迁移到 Linux 工作站或服务器。
+
 ```powershell
 # 使用当前 Codex bundled Python 示例
 $env:PYTHONPATH="D:\LookupTool\src"
@@ -133,10 +172,16 @@ POST /api/kbs/{kb_id}/ask
 - `base_url`: 例如 `http://127.0.0.1:8080/v1`。
 - `model`: 运行器暴露的模型 id。
 - `local_model_path`: 本地 GGUF 文件位置。
+- `llama_server_path`: 本地 `llama-server.exe` 位置，便于迁移设备后重新指向运行器。
 
 本项目会先返回可引用的检索/抽取 JSON。启用模型后，会把 evidence
 交给本地 OpenAI-compatible 运行器生成一个 `generated_answer` item。
 如果只需要给外部 agent 传结构化证据，可以保持模型关闭。
+
+如果模型端点在线但仍出现空答案，优先确认 `llama-server` 是否使用
+`--reasoning off` 启动。后端也会兼容读取部分模型返回的
+`reasoning_content`，但面向外部 agent 的常规答案应尽量放在
+`message.content`。
 
 ## RAGFlow 离线整合
 

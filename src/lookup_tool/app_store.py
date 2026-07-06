@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from pathlib import Path
 import json
+import os
 import shutil
 import sqlite3
 import time
@@ -441,18 +442,27 @@ def question_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
 
 def default_model_settings(base_dir: Path) -> dict[str, Any]:
     models_dir = base_dir / "models"
+    default_model = str(models_dir / "Qwen3-8B-Q4_K_M.gguf")
     return {
-        "enabled": False,
-        "provider": "openai_compatible",
-        "base_url": "http://127.0.0.1:8080/v1",
-        "model": "Qwen/Qwen3-8B-GGUF:Q4_K_M",
-        "temperature": 0,
-        "timeout_seconds": 60,
-        "local_models_dir": str(models_dir),
-        "local_model_path": str(models_dir / "Qwen3-8B-Q4_K_M.gguf"),
+        "enabled": env_bool("LOOKUP_TOOL_MODEL_ENABLED", False),
+        "provider": os.environ.get("LOOKUP_TOOL_MODEL_PROVIDER", "openai_compatible"),
+        "base_url": os.environ.get("LOOKUP_TOOL_MODEL_BASE_URL", "http://127.0.0.1:8080/v1"),
+        "model": os.environ.get("LOOKUP_TOOL_MODEL_ID", default_model),
+        "temperature": float(os.environ.get("LOOKUP_TOOL_MODEL_TEMPERATURE", "0")),
+        "timeout_seconds": int(os.environ.get("LOOKUP_TOOL_MODEL_TIMEOUT_SECONDS", "60")),
+        "local_models_dir": os.environ.get("LOOKUP_TOOL_LOCAL_MODELS_DIR", str(models_dir)),
+        "local_model_path": os.environ.get("LOOKUP_TOOL_LOCAL_MODEL_PATH", default_model),
+        "llama_server_path": os.environ.get("LOOKUP_TOOL_LLAMA_SERVER_PATH", ""),
         "recommended_repo": "Qwen/Qwen3-8B-GGUF",
         "recommended_file": "Qwen3-8B-Q4_K_M.gguf",
     }
+
+
+def env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def default_ragflow_settings() -> dict[str, Any]:
