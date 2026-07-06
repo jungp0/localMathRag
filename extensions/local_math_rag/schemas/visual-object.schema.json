@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://localmathragflow.local/schemas/visual-object.schema.json",
+  "title": "Visual Object",
+  "type": "object",
+  "required": ["id", "type", "visual_type", "source"],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "type": {
+      "const": "visual_object"
+    },
+    "visual_type": {
+      "type": "string",
+      "enum": [
+        "flow_diagram",
+        "block_diagram",
+        "chart",
+        "plot",
+        "screenshot",
+        "icon",
+        "mechanical_drawing",
+        "electrical_schematic",
+        "photo",
+        "generic_figure"
+      ]
+    },
+    "title": {
+      "type": "string"
+    },
+    "caption": {
+      "type": "string"
+    },
+    "ocr_text": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "summary": {
+      "type": "string"
+    },
+    "nearby_text_before": {
+      "type": "string"
+    },
+    "nearby_text_after": {
+      "type": "string"
+    },
+    "image_path": {
+      "type": "string"
+    },
+    "related_symbols": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "related_formulas": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "source": {
+      "$ref": "document-object.schema.json#/$defs/source"
+    }
+  },
+  "additionalProperties": true
+}

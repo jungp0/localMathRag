@@ -1,0 +1,86 @@
+services:
+  ragflow-cpu:
+    volumes:
+      - ${LOCALMATHRAG_ROOT}/extensions/local_math_rag:/localmathrag/extensions/local_math_rag:ro
+      - ${LOCALMATHRAG_ROOT}/data/models:/localmathrag/models:ro
+    environment:
+      LOCALMATHRAG_OBJECT_SERVICE_URL: http://localmathrag-object-service:8088
+      LOCALMATHRAG_EXTENSION_DIR: /localmathrag/extensions/local_math_rag
+      LOCALMATHRAG_MODEL_DIR: /localmathrag/models
+
+  ragflow-gpu:
+    volumes:
+      - ${LOCALMATHRAG_ROOT}/extensions/local_math_rag:/localmathrag/extensions/local_math_rag:ro
+      - ${LOCALMATHRAG_ROOT}/data/models:/localmathrag/models:ro
+    environment:
+      LOCALMATHRAG_OBJECT_SERVICE_URL: http://localmathrag-object-service:8088
+      LOCALMATHRAG_EXTENSION_DIR: /localmathrag/extensions/local_math_rag
+      LOCALMATHRAG_MODEL_DIR: /localmathrag/models
+
+  localmathrag-object-service:
+    build:
+      context: ${LOCALMATHRAG_ROOT}
+      dockerfile: services/object_service/Dockerfile
+    image: localmathrag/object-service:dev
+    ports:
+      - ${LOCALMATHRAG_OBJECT_PORT:-8088}:8088
+    volumes:
+      - ${LOCALMATHRAG_ROOT}/extensions/local_math_rag/schemas:/schemas:ro
+      - ${LOCALMATHRAG_ROOT}/data:/data
+    environment:
+      LOCALMATHRAG_SCHEMA_DIR: /schemas
+      LOCALMATHRAG_DATA_DIR: /data
+    networks:
+      - ragflow
+    restart: unless-stopped
+
+  localmathrag-llama-cpp:
+    profiles:
+      - llama-cpp-cpu
+    image: ghcr.io/ggml-org/llama.cpp:server
+    ports:
+      - ${LOCALMATHRAG_LLAMA_PORT:-8080}:8080
+    volumes:
+      - ${LOCALMATHRAG_ROOT}/data/models:/models:ro
+    command:
+      - -m
+      - /models/${LOCALMATHRAG_GGUF_MODEL:-Qwen3-8B-Q4_K_M.gguf}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - -c
+      - "${LOCALMATHRAG_CTX_SIZE:-8192}"
+    networks:
+      - ragflow
+    restart: unless-stopped
+
+  localmathrag-llama-cpp-cuda:
+    profiles:
+      - llama-cpp-cuda
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    ports:
+      - ${LOCALMATHRAG_LLAMA_PORT:-8080}:8080
+    volumes:
+      - ${LOCALMATHRAG_ROOT}/data/models:/models:ro
+    command:
+      - -m
+      - /models/${LOCALMATHRAG_GGUF_MODEL:-Qwen3-8B-Q4_K_M.gguf}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - -c
+      - "${LOCALMATHRAG_CTX_SIZE:-8192}"
+      - --n-gpu-layers
+      - "${LOCALMATHRAG_N_GPU_LAYERS:-999}"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks:
+      - ragflow
+    restart: unless-stopped

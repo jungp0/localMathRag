@@ -1,0 +1,60 @@
+version: 1
+name: localmathrag_engineering_document_pipeline
+chat_first: true
+structured_objects_default_visibility: collapsed
+object_service_url_env: LOCALMATHRAG_OBJECT_SERVICE_URL
+
+inputs:
+  supported_documents:
+    - pdf
+    - docx
+    - xlsx
+    - pptx
+    - csv
+    - txt
+    - md
+    - image
+
+object_types:
+  - technical_parameter
+  - requirement_table_row
+  - formula
+  - table_object
+  - visual_object
+  - flow_diagram
+
+ragflow_reuse:
+  keep_chat_ui: true
+  keep_dataset_management: true
+  keep_chunk_visualization: true
+  keep_citations: true
+  keep_document_preview: true
+
+extraction_policy:
+  answer_text_primary: true
+  emit_structured_objects: metadata_only
+  require_source_for_objects: true
+  include_page: true
+  include_bbox_when_available: true
+  include_nearby_text: true
+
+table_policy:
+  preserve_cells: true
+  preserve_merged_cells: true
+  infer_header_hierarchy: true
+  split_long_cells: true
+  keep_cell_source: true
+
+formula_policy:
+  preserve_original_crop: true
+  extract_latex: true
+  extract_symbols: true
+  bind_nearby_text: true
+  enable_symbol_search: true
+
+visual_policy:
+  create_visual_object_for_each_image: true
+  classify_visual_type: true
+  extract_ocr_text: true
+  bind_caption_and_nearby_text: true
+  flow_diagram_extract_nodes_edges: true

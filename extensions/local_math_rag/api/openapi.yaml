@@ -1,0 +1,62 @@
+openapi: 3.1.0
+info:
+  title: LocalMathRAGFlow Object Service
+  version: 0.1.0
+  description: Auxiliary structured evidence API for a RAGFlow-based engineering document assistant.
+servers:
+  - url: http://127.0.0.1:8088
+paths:
+  /health:
+    get:
+      operationId: health
+      responses:
+        "200":
+          description: Service status.
+  /v1/schemas:
+    get:
+      operationId: listSchemas
+      responses:
+        "200":
+          description: Available object schemas.
+  /v1/schemas/{name}:
+    get:
+      operationId: getSchema
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: JSON schema content.
+        "404":
+          description: Schema not found.
+  /v1/objects/normalize:
+    post:
+      operationId: normalizeObject
+      description: Normalize one structured evidence object and attach stable source metadata.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Normalized object.
+  /v1/search/objects:
+    post:
+      operationId: searchObjects
+      description: Reserved endpoint for searching structured objects by type, symbol, parameter, or source.
+      responses:
+        "501":
+          description: Not implemented in phase 1.
+  /v1/export/objects:
+    post:
+      operationId: exportObjects
+      description: Reserved endpoint for exporting structured objects for external agents.
+      responses:
+        "501":
+          description: Not implemented in phase 1.

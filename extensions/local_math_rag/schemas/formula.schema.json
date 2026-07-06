@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://localmathragflow.local/schemas/formula.schema.json",
+  "title": "Formula Object",
+  "type": "object",
+  "required": ["id", "type", "expression", "source"],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "type": {
+      "const": "formula"
+    },
+    "expression": {
+      "type": "string"
+    },
+    "latex": {
+      "type": "string"
+    },
+    "mathml": {
+      "type": "string"
+    },
+    "plain_text": {
+      "type": "string"
+    },
+    "symbols": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "nearby_text_before": {
+      "type": "string"
+    },
+    "nearby_text_after": {
+      "type": "string"
+    },
+    "image_path": {
+      "type": "string"
+    },
+    "source": {
+      "$ref": "document-object.schema.json#/$defs/source"
+    }
+  },
+  "additionalProperties": true
+}

@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://localmathragflow.local/schemas/flow-diagram.schema.json",
+  "title": "Flow Diagram Object",
+  "type": "object",
+  "required": ["id", "type", "nodes", "edges", "summary", "source"],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "type": {
+      "const": "flow_diagram"
+    },
+    "title": {
+      "type": "string"
+    },
+    "caption": {
+      "type": "string"
+    },
+    "nodes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "edges": {
+      "type": "array",
+      "items": {
+        "type": "array",
+        "minItems": 2,
+        "maxItems": 3,
+        "items": {
+          "type": "string"
+        }
+      }
+    },
+    "summary": {
+      "type": "string"
+    },
+    "ocr_text": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "related_symbols": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "related_formulas": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "source": {
+      "$ref": "document-object.schema.json#/$defs/source"
+    }
+  },
+  "additionalProperties": true
+}

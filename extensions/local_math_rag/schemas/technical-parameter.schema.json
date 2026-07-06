@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://localmathragflow.local/schemas/technical-parameter.schema.json",
+  "title": "Technical Parameter Object",
+  "type": "object",
+  "required": ["id", "type", "parameter", "source"],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "type": {
+      "const": "technical_parameter"
+    },
+    "product": {
+      "type": "string"
+    },
+    "module": {
+      "type": "string"
+    },
+    "parameter": {
+      "type": "string"
+    },
+    "min": {
+      "type": "string"
+    },
+    "typical": {
+      "type": "string"
+    },
+    "max": {
+      "type": "string"
+    },
+    "unit": {
+      "type": "string"
+    },
+    "condition": {
+      "type": "string"
+    },
+    "source": {
+      "$ref": "document-object.schema.json#/$defs/source"
+    }
+  },
+  "additionalProperties": true
+}

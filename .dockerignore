@@ -1,7 +1,9 @@
 .git
-.agents
-.codex
+.github
+data
+dist
+third_party
+*.log
+*.sqlite
 __pycache__
-*.pyc
 .pytest_cache
-data/

@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://localmathragflow.local/schemas/requirement-table-row.schema.json",
+  "title": "Requirement Table Row Object",
+  "type": "object",
+  "required": ["id", "type", "name", "source"],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "type": {
+      "const": "requirement_table_row"
+    },
+    "requirement_id": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    },
+    "sil_level": {
+      "type": "string"
+    },
+    "confirmation_method": {
+      "type": "string"
+    },
+    "applicable_mode": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "input": {
+      "type": "string"
+    },
+    "description": {
+      "type": "string"
+    },
+    "exception_handling": {
+      "type": "string"
+    },
+    "output": {
+      "type": "string"
+    },
+    "notes": {
+      "type": "string"
+    },
+    "source": {
+      "$ref": "document-object.schema.json#/$defs/source"
+    }
+  },
+  "additionalProperties": true
+}
