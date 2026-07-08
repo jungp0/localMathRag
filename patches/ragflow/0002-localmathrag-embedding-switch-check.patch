@@ -1,0 +1,33 @@
+diff --git a/api/apps/services/dataset_api_service.py b/api/apps/services/dataset_api_service.py
+--- a/api/apps/services/dataset_api_service.py
++++ b/api/apps/services/dataset_api_service.py
+@@ -322,0 +323,6 @@ async def update_dataset(tenant_id: str, dataset_id: str, req: dict):
++        if req["embd_id"] != kb.embd_id and kb.chunk_num > 0:
++            embedding_ok, embedding_result = check_embedding(dataset_id, tenant_id, {"embd_id": req["embd_id"]})
++            if embedding_ok is not True:
++                if isinstance(embedding_result, dict):
++                    return False, embedding_result.get("message") or "Embedding model switch failed."
++                return False, embedding_result
+@@ -1285 +1285,5 @@ def check_embedding(dataset_id: str, tenant_id: str, req: dict):
+-    return "not_effective", {"code": RetCode.NOT_EFFECTIVE, "message": "Embedding model switch failed: the average similarity between old and new vectors is below 0.9, indicating incompatible vector spaces.", "data": data}
++    return "not_effective", {
++        "code": RetCode.NOT_EFFECTIVE,
++        "message": "Embedding model switch failed: the average similarity between old and new vectors is below 0.9, indicating incompatible vector spaces. Please delete or reparse existing chunks to rebuild the dataset vectors with the new embedding model, then try again.",
++        "data": data,
++    }
+diff --git a/internal/service/dataset.go b/internal/service/dataset.go
+--- a/internal/service/dataset.go
++++ b/internal/service/dataset.go
+@@ -949 +949 @@ func (s *DatasetService) CheckEmbedding(userID, datasetID string, req *CheckEmbe
+-	return response, common.CodeNotEffective, errors.New("Embedding model switch failed: the average similarity between old and new vectors is below 0.9, indicating incompatible vector spaces.")
++	return response, common.CodeNotEffective, errors.New("Embedding model switch failed: the average similarity between old and new vectors is below 0.9, indicating incompatible vector spaces. Please delete or reparse existing chunks to rebuild the dataset vectors with the new embedding model, then try again.")
+@@ -2771,0 +2772,9 @@ func (s *DatasetService) UpdateDataset(datasetID, tenantID string, req UpdateDatasetRequest) (map[string]interface{}, common.ErrorCode, error) {
++		if embdID != kb.EmbdID && kb.ChunkNum > 0 {
++			_, code, err := s.CheckEmbedding(tenantID, datasetID, &CheckEmbeddingRequest{EmbeddingID: embdID})
++			if code != common.CodeSuccess {
++				if err != nil {
++					return nil, code, err
++				}
++				return nil, code, errors.New("Embedding model switch failed.")
++			}
++		}

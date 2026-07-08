@@ -44,13 +44,21 @@ Windows 启动器必须按以下逻辑选择 root：
 ## Local Model Runtime Rules
 
 - `data/models/*.gguf` 是本地模型的唯一默认发现入口，launcher 和 `scripts/dev-up.ps1` 必须优先扫描这里。
-- 如果发现本地 GGUF，默认启动 `llama-cpp-cpu` compose profile，并设置 `LOCALMATHRAG_GGUF_MODEL=<文件名>`。
+- 如果发现本地 GGUF，默认启动 `llama-cpp-cuda` compose profile，并设置 `LOCALMATHRAG_GGUF_MODEL=<文件名>`。
 - 如果本地 GGUF 已存在但 llama.cpp Docker image 尚未安装，launcher 必须弹窗确认后才允许拉取镜像；用户拒绝时只启动 RAGFlow，不启本地模型 endpoint。
-- 如需 GPU，使用 `LOCALMATHRAG_LLAMA_PROFILE=cuda` 切换到 `llama-cpp-cuda`；如需禁用本地模型服务，使用 `LOCALMATHRAG_LLAMA_PROFILE=none`。
+- 如需 CPU 回退，使用 `LOCALMATHRAG_LLAMA_PROFILE=cpu` 切换到 `llama-cpp-cpu`；如需禁用本地模型服务，使用 `LOCALMATHRAG_LLAMA_PROFILE=none`。
 - 如果没有本地 GGUF，不允许自动下载模型，也不允许强行启动 llama.cpp 容器。
-- RAGFlow 模型提供商仍使用 OpenAI-compatible 形式，但 `base_url` 必须指向本地 `http://host.docker.internal:8080/v1` 或等价的本机离线端点。
-- `services/object_service` 必须暴露 `/v1/models/status`，用于确认模型文件数量和本地 llama endpoint 状态。
-- 当 RAGFlow 报 `No valid response received` 或 `Fail to access model` 时，优先检查 llama.cpp 容器是否已启动、8080 端口是否可访问、`LOCALMATHRAG_GGUF_MODEL` 是否与 `data/models` 文件名一致。
+- 默认嵌入 endpoint 由 `localmathrag-object-service` 提供 OpenAI-compatible fallback `/v1/embeddings`，base URL 为 `http://localmathrag-object-service:8088/v1`。
+- `data/models/bge-m3` 是当前默认真实嵌入模型目录；发现后默认使用 `embedding-cuda` profile，端口为 `8081`，默认 pooling 为 `cls`。如需禁用真实嵌入服务，使用 `LOCALMATHRAG_EMBEDDING_PROFILE=none`；如需 CPU 回退，使用 `LOCALMATHRAG_EMBEDDING_PROFILE=cpu`。
+- `data/models/Qwen3-Embedding-0.6B` 可以作为后续候选嵌入模型保留，但当前 TEI 路径对它不稳定；除非指定兼容运行时，否则不能作为默认解析 embedding。
+- `data/models/Qwen3-Reranker-0.6B` 是默认重排模型目录；发现后必须设置 `LOCALMATHRAG_RERANK_MODEL=<目录名>`，默认启动 `rerank-cuda` profile，默认端口为 `8082`。如需禁用重排服务，使用 `LOCALMATHRAG_RERANK_PROFILE=none`；如需 CPU 回退，使用 `LOCALMATHRAG_RERANK_PROFILE=cpu`。
+- 如果 embedding/rerank profile 被启用但 `${LOCALMATHRAG_TEI_IMAGE:-${LOCALMATHRAG_TEI_CUDA_IMAGE:-infiniflow/text-embeddings-inference:1.8}}` 尚未安装，launcher 必须弹窗确认后才允许拉取镜像；用户拒绝时只启动 RAGFlow，不启对应 TEI endpoint。CPU 回退镜像使用 `${LOCALMATHRAG_TEI_CPU_IMAGE:-infiniflow/text-embeddings-inference:cpu-1.8}`。
+- VLM/ASR/TTS 需要预留本地模型支持。目录发现后必须设置 `LOCALMATHRAG_VLM_MODEL`、`LOCALMATHRAG_ASR_MODEL`、`LOCALMATHRAG_TTS_MODEL`；默认 profile 名称必须是 CUDA 优先：`vlm-cuda`、`asr-cuda`、`tts-cuda`。如需禁用，使用对应 `LOCALMATHRAG_*_PROFILE=none`；如需 CPU/非 CUDA 回退，使用 `cpu` 或 `local`。
+- VLM 默认端口为 `8083`；ASR 默认端口为 `8084`；TTS 默认端口为 `8085`。
+- 如果 VLM/ASR/TTS profile 被显式启用但对应 Docker image 尚未安装，launcher 必须弹窗确认后才允许拉取镜像；用户拒绝时只启动 RAGFlow，不启对应 endpoint。
+- RAGFlow 模型提供商仍使用 OpenAI-compatible 形式；容器内默认 `base_url` 必须优先指向 Docker 内网离线端点。LLM 可使用 `http://host.docker.internal:8080/v1`，embedding/rerank 默认必须使用 `http://localmathrag-object-service:8088/v1` 兜底，VLM/ASR/TTS 使用 `http://localmathrag-vlm:8000/v1`、`http://localmathrag-asr:8080/v1`、`http://localmathrag-tts:8080/v1` 或等价 Docker 内网端点。
+- `services/object_service` 必须暴露 `/v1/models/status`、`/v1/embeddings`、`/v1/rerank`，用于确认模型文件数量并给 embedding/rerank 提供离线兜底。
+- 当 RAGFlow 报 `No valid response received`、`Fail to access model`、`Fail to bind embedding model` 或 `host.docker.internal:8082 /v1/rerank` 连接失败时，优先检查 RAGFlow 数据库中已保存模型配置是否仍指向旧地址，然后检查对应模型容器是否已启动、8080/8081/8082/8083/8084/8085 端口是否可访问、`LOCALMATHRAG_*_MODEL` 是否与 `data/models` 文件名或目录名一致。
 
 ## Tray Launcher Rules
 
@@ -70,7 +78,9 @@ Windows 启动器必须按以下逻辑选择 root：
 - 所有 RAGFlow 二开改动必须同步生成到 `patches/ragflow/*.patch`。
 - `scripts/apply-ragflow-patches.ps1` 必须能够在干净 RAGFlow checkout 上应用补丁，也必须能在补丁已应用时安全跳过。
 - `scripts/build-ragflow-web.ps1` 是前端二开构建入口，负责先应用补丁，再安装依赖并生成 `third_party/ragflow/web/dist`。
-- 如果 `third_party/ragflow/web/dist` 存在，launcher 和 `scripts/dev-up.ps1` 必须挂载 `docker/docker-compose.webdist.yml`，让容器使用本地构建后的前端。
+- 默认运行路径必须构建并使用 `localmathrag/ragflow:dev` 二开镜像，Dockerfile 为 `docker/Dockerfile.ragflow-local`。
+- `third_party/ragflow/web/dist`、已修改的 RAGFlow 后端源码和本地化配置必须打入二开镜像；launcher 不能再自动挂载 `docker/docker-compose.webdist.yml` 覆盖镜像内容。
+- `docker/docker-compose.webdist.yml` 只允许作为临时前端调试入口保留，不能出现在默认 launcher compose 链路中。
 
 ## Encoding Rule
 

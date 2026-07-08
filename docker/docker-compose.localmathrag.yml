@@ -1,25 +1,47 @@
 services:
   ragflow-cpu:
-    volumes:
+    build:
+      context: ${LOCALMATHRAG_ROOT}
+      dockerfile: docker/Dockerfile.ragflow-local
+      args:
+        RAGFLOW_BASE_IMAGE: ${RAGFLOW_IMAGE:-infiniflow/ragflow:v0.26.3}
+    image: localmathrag/ragflow:dev
+    volumes: !override
+      - ${LOCALMATHRAG_ROOT}/third_party/ragflow/docker/ragflow-logs:/ragflow/logs
       - ${LOCALMATHRAG_ROOT}/extensions/local_math_rag:/localmathrag/extensions/local_math_rag:ro
       - ${LOCALMATHRAG_ROOT}/data/models:/localmathrag/models:ro
-      - ${LOCALMATHRAG_ROOT}/third_party/ragflow/api/apps/services/provider_api_service.py:/ragflow/api/apps/services/provider_api_service.py:ro
-      - ${LOCALMATHRAG_ROOT}/third_party/ragflow/api/apps/llm_app.py:/ragflow/api/apps/llm_app.py:ro
+      - ${LOCALMATHRAG_ROOT}/data/dataset:/localmathrag/dataset:ro
+      - ${LOCALMATHRAG_ROOT}/data/cache:/localmathrag/cache
     environment:
       LOCALMATHRAG_OBJECT_SERVICE_URL: http://localmathrag-object-service:8088
       LOCALMATHRAG_EXTENSION_DIR: /localmathrag/extensions/local_math_rag
       LOCALMATHRAG_MODEL_DIR: /localmathrag/models
+      LOCALMATHRAG_DATASET_DIR: /localmathrag/dataset
+      LOCALMATHRAG_DATASET_STATE_FILE: /localmathrag/cache/dataset-state.json
+      LOCALMATHRAG_LOCAL_ONLY: "1"
+      LOCALMATHRAG_DISABLE_LOGIN: "1"
 
   ragflow-gpu:
-    volumes:
+    build:
+      context: ${LOCALMATHRAG_ROOT}
+      dockerfile: docker/Dockerfile.ragflow-local
+      args:
+        RAGFLOW_BASE_IMAGE: ${RAGFLOW_IMAGE:-infiniflow/ragflow:v0.26.3}
+    image: localmathrag/ragflow:dev
+    volumes: !override
+      - ${LOCALMATHRAG_ROOT}/third_party/ragflow/docker/ragflow-logs:/ragflow/logs
       - ${LOCALMATHRAG_ROOT}/extensions/local_math_rag:/localmathrag/extensions/local_math_rag:ro
       - ${LOCALMATHRAG_ROOT}/data/models:/localmathrag/models:ro
-      - ${LOCALMATHRAG_ROOT}/third_party/ragflow/api/apps/services/provider_api_service.py:/ragflow/api/apps/services/provider_api_service.py:ro
-      - ${LOCALMATHRAG_ROOT}/third_party/ragflow/api/apps/llm_app.py:/ragflow/api/apps/llm_app.py:ro
+      - ${LOCALMATHRAG_ROOT}/data/dataset:/localmathrag/dataset:ro
+      - ${LOCALMATHRAG_ROOT}/data/cache:/localmathrag/cache
     environment:
       LOCALMATHRAG_OBJECT_SERVICE_URL: http://localmathrag-object-service:8088
       LOCALMATHRAG_EXTENSION_DIR: /localmathrag/extensions/local_math_rag
       LOCALMATHRAG_MODEL_DIR: /localmathrag/models
+      LOCALMATHRAG_DATASET_DIR: /localmathrag/dataset
+      LOCALMATHRAG_DATASET_STATE_FILE: /localmathrag/cache/dataset-state.json
+      LOCALMATHRAG_LOCAL_ONLY: "1"
+      LOCALMATHRAG_DISABLE_LOGIN: "1"
 
   localmathrag-object-service:
     build:
@@ -31,10 +53,32 @@ services:
     volumes:
       - ${LOCALMATHRAG_ROOT}/extensions/local_math_rag/schemas:/schemas:ro
       - ${LOCALMATHRAG_ROOT}/data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
     environment:
       LOCALMATHRAG_SCHEMA_DIR: /schemas
       LOCALMATHRAG_DATA_DIR: /data
       LOCALMATHRAG_MODEL_DIR: /data/models
+      LOCALMATHRAG_DATASET_DIR: /data/dataset
+      LOCALMATHRAG_EMBEDDING_BASE_URL: http://localmathrag-object-service:8088/v1
+      LOCALMATHRAG_RERANK_BASE_URL: http://localmathrag-object-service:8088/v1
+      LOCALMATHRAG_EMBEDDING_RUNTIME_BASE_URL: http://localmathrag-embedding:8080/v1
+      LOCALMATHRAG_RERANK_RUNTIME_BASE_URL: http://localmathrag-rerank:8080/v1
+      LOCALMATHRAG_VISION_BASE_URL: http://localmathrag-vlm:8000/v1
+      LOCALMATHRAG_ASR_BASE_URL: http://localmathrag-asr:8080/v1
+      LOCALMATHRAG_TTS_BASE_URL: http://localmathrag-tts:8080/v1
+      LOCALMATHRAG_HF_ENDPOINT: ${LOCALMATHRAG_HF_ENDPOINT:-https://huggingface.co}
+      LOCALMATHRAG_RUNTIME_LAZY: ${LOCALMATHRAG_RUNTIME_LAZY:-1}
+      LOCALMATHRAG_OPTIONAL_RUNTIME_MAX_ACTIVE: ${LOCALMATHRAG_OPTIONAL_RUNTIME_MAX_ACTIVE:-1}
+      LOCALMATHRAG_RUNTIME_READY_TIMEOUT_SECONDS: ${LOCALMATHRAG_RUNTIME_READY_TIMEOUT_SECONDS:-240}
+      LOCALMATHRAG_RUNTIME_STARTUP_STALL_TIMEOUT_SECONDS: ${LOCALMATHRAG_RUNTIME_STARTUP_STALL_TIMEOUT_SECONDS:-120}
+      LOCALMATHRAG_RUNTIME_MIN_FREE_DISK_GB: ${LOCALMATHRAG_RUNTIME_MIN_FREE_DISK_GB:-20}
+      LOCALMATHRAG_VISION_MIN_AVAILABLE_MEMORY_GB: ${LOCALMATHRAG_VISION_MIN_AVAILABLE_MEMORY_GB:-10}
+      LOCALMATHRAG_DOCKER_SOCKET: /var/run/docker.sock
+      LOCALMATHRAG_EMBEDDING_CONTAINER: ${LOCALMATHRAG_EMBEDDING_CONTAINER:-docker-localmathrag-embedding-1}
+      LOCALMATHRAG_RERANK_CONTAINER: ${LOCALMATHRAG_RERANK_CONTAINER:-docker-localmathrag-rerank-1}
+      LOCALMATHRAG_VISION_CONTAINER: ${LOCALMATHRAG_VISION_CONTAINER:-docker-localmathrag-vlm-1}
+      LOCALMATHRAG_ASR_CONTAINER: ${LOCALMATHRAG_ASR_CONTAINER:-docker-localmathrag-asr-1}
+      LOCALMATHRAG_TTS_CONTAINER: ${LOCALMATHRAG_TTS_CONTAINER:-docker-localmathrag-tts-1}
     networks:
       - ragflow
     restart: unless-stopped
@@ -56,9 +100,11 @@ services:
       - "8080"
       - -c
       - "${LOCALMATHRAG_CTX_SIZE:-8192}"
+      - --parallel
+      - "${LOCALMATHRAG_LLAMA_PARALLEL:-1}"
     networks:
       - ragflow
-    restart: unless-stopped
+    restart: "no"
 
   localmathrag-llama-cpp-cuda:
     profiles:
@@ -77,6 +123,8 @@ services:
       - "8080"
       - -c
       - "${LOCALMATHRAG_CTX_SIZE:-8192}"
+      - --parallel
+      - "${LOCALMATHRAG_LLAMA_PARALLEL:-1}"
       - --n-gpu-layers
       - "${LOCALMATHRAG_N_GPU_LAYERS:-999}"
     deploy:
@@ -89,3 +137,202 @@ services:
     networks:
       - ragflow
     restart: unless-stopped
+
+  localmathrag-embedding:
+    profiles:
+      - embedding-cuda
+    image: ${LOCALMATHRAG_TEI_CUDA_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cuda-latest}
+    entrypoint:
+      - /bin/bash
+      - -lc
+      - |
+        set -e
+        export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64
+        compute_cap=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | sed -n '1p' | sed 's/\.//g' | tr -d '[:space:]')
+        exec "text-embeddings-router-$${compute_cap}" "$@"
+      - tei
+    environment:
+      LD_LIBRARY_PATH: /usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64
+    ports:
+      - ${LOCALMATHRAG_EMBEDDING_PORT:-8081}:8080
+    volumes:
+      - ${LOCALMATHRAG_ROOT}/data/models:/models:ro
+    command:
+      - --model-id
+      - /models/${LOCALMATHRAG_EMBEDDING_MODEL:-bge-m3}
+      - --hostname
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --tokenization-workers
+      - ${LOCALMATHRAG_TEI_TOKENIZATION_WORKERS:-2}
+      - --max-concurrent-requests
+      - ${LOCALMATHRAG_TEI_MAX_CONCURRENT_REQUESTS:-64}
+      - --max-client-batch-size
+      - ${LOCALMATHRAG_TEI_MAX_CLIENT_BATCH_SIZE:-8}
+      - --pooling
+      - ${LOCALMATHRAG_EMBEDDING_POOLING:-cls}
+      - --auto-truncate
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks:
+      - ragflow
+    restart: "no"
+
+  localmathrag-embedding-cpu:
+    profiles:
+      - embedding-cpu
+    image: ${LOCALMATHRAG_TEI_CPU_IMAGE:-infiniflow/text-embeddings-inference:cpu-1.8}
+    ports:
+      - ${LOCALMATHRAG_EMBEDDING_PORT:-8081}:8080
+    volumes:
+      - ${LOCALMATHRAG_ROOT}/data/models:/models:ro
+    command:
+      - --model-id
+      - /models/${LOCALMATHRAG_EMBEDDING_MODEL:-bge-m3}
+      - --hostname
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --pooling
+      - ${LOCALMATHRAG_EMBEDDING_POOLING:-cls}
+      - --auto-truncate
+    networks:
+      ragflow:
+        aliases:
+          - localmathrag-embedding
+    restart: "no"
+
+  localmathrag-rerank:
+    profiles:
+      - rerank-cuda
+    image: ${LOCALMATHRAG_TEI_CUDA_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cuda-latest}
+    entrypoint:
+      - /bin/bash
+      - -lc
+      - |
+        set -e
+        export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64
+        compute_cap=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | sed -n '1p' | sed 's/\.//g' | tr -d '[:space:]')
+        exec "text-embeddings-router-$${compute_cap}" "$@"
+      - tei
+    environment:
+      LD_LIBRARY_PATH: /usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64
+    ports:
+      - ${LOCALMATHRAG_RERANK_PORT:-8082}:8080
+    volumes:
+      - ${LOCALMATHRAG_ROOT}/data/models:/models:ro
+    command:
+      - --model-id
+      - /models/${LOCALMATHRAG_RERANK_MODEL:-bge-reranker-v2-m3}
+      - --hostname
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --tokenization-workers
+      - ${LOCALMATHRAG_TEI_TOKENIZATION_WORKERS:-2}
+      - --max-concurrent-requests
+      - ${LOCALMATHRAG_TEI_MAX_CONCURRENT_REQUESTS:-64}
+      - --max-client-batch-size
+      - ${LOCALMATHRAG_TEI_MAX_CLIENT_BATCH_SIZE:-8}
+      - --pooling
+      - cls
+      - --max-batch-tokens
+      - ${LOCALMATHRAG_RERANK_MAX_BATCH_TOKENS:-16384}
+      - --auto-truncate
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks:
+      - ragflow
+    restart: "no"
+
+  localmathrag-rerank-cpu:
+    profiles:
+      - rerank-cpu
+    image: ${LOCALMATHRAG_TEI_CPU_IMAGE:-infiniflow/text-embeddings-inference:cpu-1.8}
+    ports:
+      - ${LOCALMATHRAG_RERANK_PORT:-8082}:8080
+    volumes:
+      - ${LOCALMATHRAG_ROOT}/data/models:/models:ro
+    command:
+      - --model-id
+      - /models/${LOCALMATHRAG_RERANK_MODEL:-bge-reranker-v2-m3}
+      - --hostname
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --pooling
+      - cls
+      - --auto-truncate
+    networks:
+      ragflow:
+        aliases:
+          - localmathrag-rerank
+    restart: "no"
+
+  localmathrag-vlm:
+    profiles:
+      - vlm-cuda
+      - vlm-local
+    image: ${LOCALMATHRAG_VLM_IMAGE:-vllm/vllm-openai:latest}
+    ports:
+      - ${LOCALMATHRAG_VISION_PORT:-8083}:8000
+    volumes:
+      - ${LOCALMATHRAG_ROOT}/data/models:/models:ro
+    command:
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --model
+      - /models/${LOCALMATHRAG_VLM_MODEL:-Qwen3-VL-4B-Instruct}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks:
+      - ragflow
+    restart: "no"
+
+  localmathrag-asr:
+    profiles:
+      - asr-cuda
+      - asr-local
+    image: ${LOCALMATHRAG_ASR_IMAGE:-localmathrag/asr-openai:placeholder}
+    ports:
+      - ${LOCALMATHRAG_ASR_PORT:-8084}:8080
+    volumes:
+      - ${LOCALMATHRAG_ROOT}/data/models:/models:ro
+    environment:
+      LOCALMATHRAG_ASR_MODEL: ${LOCALMATHRAG_ASR_MODEL:-whisper-large-v3-turbo}
+    networks:
+      - ragflow
+    restart: "no"
+
+  localmathrag-tts:
+    profiles:
+      - tts-cuda
+      - tts-local
+    image: ${LOCALMATHRAG_TTS_IMAGE:-localmathrag/tts-openai:placeholder}
+    ports:
+      - ${LOCALMATHRAG_TTS_PORT:-8085}:8080
+    volumes:
+      - ${LOCALMATHRAG_ROOT}/data/models:/models:ro
+    environment:
+      LOCALMATHRAG_TTS_MODEL: ${LOCALMATHRAG_TTS_MODEL:-CosyVoice2-0.5B}
+    networks:
+      - ragflow
+    restart: "no"

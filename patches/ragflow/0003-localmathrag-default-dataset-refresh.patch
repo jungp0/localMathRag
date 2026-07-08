@@ -1,0 +1,477 @@
+diff --git a/api/apps/restful_apis/dataset_api.py b/api/apps/restful_apis/dataset_api.py
+--- a/api/apps/restful_apis/dataset_api.py
++++ b/api/apps/restful_apis/dataset_api.py
+@@ -80,0 +81,14 @@ def get_flattened_metadata(tenant_id):
++@manager.route("/datasets/<dataset_id>/local-refresh", methods=["POST"])  # noqa: F821
++@login_required
++@add_tenant_id_to_kwargs
++def refresh_local_dataset(dataset_id: str, tenant_id: str = None):
++    try:
++        success, result = dataset_api_service.refresh_default_local_dataset(dataset_id, tenant_id)
++        if success:
++            return get_result(data=result)
++        return get_error_data_result(message=result)
++    except Exception as e:
++        logging.exception(e)
++        return get_error_data_result(message="Internal server error")
++
++
+diff --git a/api/apps/services/dataset_api_service.py b/api/apps/services/dataset_api_service.py
+--- a/api/apps/services/dataset_api_service.py
++++ b/api/apps/services/dataset_api_service.py
+@@ -33,0 +34 @@ from api.utils.api_utils import deep_merge, get_parser_config, remap_dictionary_keys, verify_embedding_availability
++from api.apps.services.local_dataset_service import refresh_local_dataset
+@@ -240,0 +241,4 @@ def get_ingestion_summary(dataset_id: str, tenant_id: str):
++def refresh_default_local_dataset(dataset_id: str, tenant_id: str):
++    return refresh_local_dataset(tenant_id, dataset_id)
++
++
+diff --git a/api/apps/services/local_dataset_service.py b/api/apps/services/local_dataset_service.py
+new file mode 100644
+--- /dev/null
++++ b/api/apps/services/local_dataset_service.py
+@@ -0,0 +1,344 @@
++#
++#  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
++#
++#  Licensed under the Apache License, Version 2.0 (the "License");
++#  you may not use this file except in compliance with the License.
++#  You may obtain a copy of the License at
++#
++#      http://www.apache.org/licenses/LICENSE-2.0
++#
++#  Unless required by applicable law or agreed to in writing, software
++#  distributed under the License is distributed on an "AS IS" BASIS,
++#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++#  See the License for the specific language governing permissions and
++#  limitations under the License.
++#
++import hashlib
++import json
++import logging
++import os
++import threading
++import time
++from pathlib import Path
++from typing import Any
++
++from api.db.db_models import DB
++from api.db.services.document_service import DocumentService
++from api.db.services.file_service import FileService
++from api.db.services.knowledgebase_service import KnowledgebaseService
++from api.db.services.user_service import TenantService, UserService
++from api.utils.file_utils import filename_type
++from common.constants import ParserType, StatusEnum, TaskStatus
++
++
++DEFAULT_DATASET_NAME = os.environ.get("LOCALMATHRAG_DEFAULT_DATASET_NAME", "Default")
++DEFAULT_USER_EMAIL = os.environ.get("LOCALMATHRAG_DEFAULT_USER_EMAIL", "admin@ragflow.io")
++DATASET_DIR = Path(os.environ.get("LOCALMATHRAG_DATASET_DIR", "/localmathrag/dataset"))
++DATASET_STATE_FILE = Path(os.environ.get("LOCALMATHRAG_DATASET_STATE_FILE", "/localmathrag/cache/dataset-state.json"))
++REFRESH_LOCK = threading.Lock()
++
++
++class LocalDatasetFile:
++    def __init__(self, path: Path, rel_path: str, doc_id: str, fingerprint: str):
++        self.path = path
++        self.filename = rel_path
++        self.id = doc_id
++        self.fingerprint = fingerprint
++
++    def read(self) -> bytes:
++        return self.path.read_bytes()
++
++
++def _now() -> float:
++    return time.time()
++
++
++def _doc_id(rel_path: str) -> str:
++    return hashlib.sha1(f"localmathrag:default:{rel_path}".encode("utf-8")).hexdigest()[:32]
++
++
++def _signature(path: Path) -> dict[str, int]:
++    stat = path.stat()
++    data = {
++        "mtime_ns": int(stat.st_mtime_ns),
++        "ctime_ns": int(stat.st_ctime_ns),
++    }
++    if path.is_file():
++        data["size"] = int(stat.st_size)
++    return data
++
++
++def _fingerprint(rel_path: str, signature: dict[str, int]) -> str:
++    seed = {"path": rel_path, "signature": signature}
++    return hashlib.sha1(json.dumps(seed, sort_keys=True).encode("utf-8")).hexdigest()[:32]
++
++
++def _relative_path(path: Path) -> str:
++    rel = path.relative_to(DATASET_DIR).as_posix()
++    return "" if rel == "." else rel
++
++
++def _parent_path(path: str) -> str:
++    if not path or "/" not in path:
++        return ""
++    return path.rsplit("/", 1)[0]
++
++
++def _load_state() -> dict[str, Any]:
++    if not DATASET_STATE_FILE.exists():
++        return {}
++    try:
++        state = json.loads(DATASET_STATE_FILE.read_text(encoding="utf-8-sig"))
++    except (OSError, json.JSONDecodeError):
++        return {}
++    return state if isinstance(state, dict) else {}
++
++
++def _write_state(entries: list[dict[str, Any]]) -> None:
++    DATASET_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
++    durable_entries = []
++    for entry in entries:
++        if entry.get("status") == "deleted":
++            continue
++        durable_entries.append(
++            {
++                key: entry[key]
++                for key in ("path", "name", "kind", "signature", "size", "modified_at", "doc_id", "fingerprint")
++                if key in entry
++            }
++        )
++    DATASET_STATE_FILE.write_text(
++        json.dumps(
++            {
++                "version": 1,
++                "dataset_dir": str(DATASET_DIR),
++                "dataset_name": DEFAULT_DATASET_NAME,
++                "scanned_at": _now(),
++                "entries": durable_entries,
++            },
++            ensure_ascii=False,
++            indent=2,
++        ),
++        encoding="utf-8",
++    )
++
++
++def _entry(path: Path, kind: str, status: str, signature: dict[str, int], skipped: bool = False) -> dict[str, Any]:
++    rel = _relative_path(path)
++    entry: dict[str, Any] = {
++        "path": rel,
++        "name": path.name if rel else DATASET_DIR.name,
++        "kind": kind,
++        "status": status,
++        "signature": signature,
++        "modified_at": signature["mtime_ns"] / 1_000_000_000,
++    }
++    if kind == "file":
++        entry["size"] = signature.get("size", 0)
++        entry["doc_id"] = _doc_id(rel)
++        entry["fingerprint"] = _fingerprint(rel, signature)
++    if skipped:
++        entry["skipped"] = True
++    return entry
++
++
++def _cached_subtree(previous_entries: list[dict[str, Any]], rel: str, status: str) -> list[dict[str, Any]]:
++    prefix = f"{rel}/" if rel else ""
++    cached = []
++    for previous in previous_entries:
++        previous_path = str(previous.get("path", ""))
++        if previous_path == rel or not rel or previous_path.startswith(prefix):
++            copied = dict(previous)
++            copied["status"] = status
++            if copied.get("kind") == "directory":
++                copied["skipped"] = status == "unchanged"
++            cached.append(copied)
++    return cached
++
++
++def _deleted_subtree(previous_entries: list[dict[str, Any]], rel: str) -> list[dict[str, Any]]:
++    deleted = _cached_subtree(previous_entries, rel, "deleted")
++    for entry in deleted:
++        entry.pop("skipped", None)
++    return deleted
++
++
++def _scan_directory(path: Path, previous_entries: list[dict[str, Any]], previous_by_path: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
++    rel = _relative_path(path)
++    signature = _signature(path)
++    previous = previous_by_path.get(rel)
++    if previous and previous.get("kind") == "directory" and previous.get("signature") == signature:
++        cached = _cached_subtree(previous_entries, rel, "unchanged")
++        if cached:
++            return cached
++
++    status = "new" if previous is None else "changed"
++    entries = [_entry(path, "directory", status, signature)]
++    current_children: set[str] = set()
++    try:
++        children = sorted(path.iterdir(), key=lambda item: item.name.lower())
++    except OSError as exc:
++        entries[0]["error"] = str(exc)
++        return entries
++
++    for child in children:
++        try:
++            child_rel = _relative_path(child)
++            current_children.add(child_rel)
++            if child.is_dir():
++                entries.extend(_scan_directory(child, previous_entries, previous_by_path))
++            elif child.is_file():
++                child_signature = _signature(child)
++                previous_file = previous_by_path.get(child_rel)
++                child_status = "new"
++                if previous_file and previous_file.get("kind") == "file":
++                    child_status = "unchanged" if previous_file.get("signature") == child_signature else "changed"
++                entries.append(_entry(child, "file", child_status, child_signature))
++        except OSError as exc:
++            entries.append({"path": _relative_path(child), "name": child.name, "kind": "unknown", "status": "error", "error": str(exc)})
++
++    for previous_entry in previous_entries:
++        previous_path = str(previous_entry.get("path", ""))
++        if previous_path and _parent_path(previous_path) == rel and previous_path not in current_children:
++            if previous_entry.get("kind") == "directory":
++                entries.extend(_deleted_subtree(previous_entries, previous_path))
++            else:
++                deleted = dict(previous_entry)
++                deleted["status"] = "deleted"
++                deleted.setdefault("doc_id", _doc_id(previous_path))
++                entries.append(deleted)
++
++    return entries
++
++
++def _scan_manifest() -> list[dict[str, Any]]:
++    DATASET_DIR.mkdir(parents=True, exist_ok=True)
++    state = _load_state()
++    previous_entries = [
++        entry
++        for entry in state.get("entries", [])
++        if isinstance(entry, dict) and isinstance(entry.get("path", ""), str)
++    ]
++    previous_by_path = {str(entry.get("path", "")): entry for entry in previous_entries}
++    entries = _scan_directory(DATASET_DIR, previous_entries, previous_by_path)
++    _write_state(entries)
++    return entries
++
++
++def _summary(entries: list[dict[str, Any]]) -> dict[str, Any]:
++    return {
++        "file_count": sum(1 for entry in entries if entry.get("kind") == "file" and entry.get("status") != "deleted"),
++        "directory_count": sum(1 for entry in entries if entry.get("kind") == "directory" and entry.get("status") != "deleted"),
++        "new_count": sum(1 for entry in entries if entry.get("status") == "new"),
++        "changed_count": sum(1 for entry in entries if entry.get("status") == "changed"),
++        "deleted_count": sum(1 for entry in entries if entry.get("status") == "deleted"),
++        "skipped_directory_count": sum(1 for entry in entries if entry.get("kind") == "directory" and entry.get("skipped")),
++    }
++
++
++def _default_user():
++    users = UserService.query(email=DEFAULT_USER_EMAIL, status=StatusEnum.VALID.value)
++    if users:
++        return users[0]
++    users = UserService.query(is_superuser=True, status=StatusEnum.VALID.value)
++    return users[0] if users else None
++
++
++@DB.connection_context()
++def ensure_default_dataset():
++    user = _default_user()
++    if not user:
++        logging.warning("LocalMathRAGFlow default dataset skipped: no default user found")
++        return None
++
++    existing = KnowledgebaseService.get_or_none(name=DEFAULT_DATASET_NAME, tenant_id=user.id, status=StatusEnum.VALID.value)
++    if existing:
++        return existing
++
++    ok, tenant = TenantService.get_by_id(user.id)
++    if not ok:
++        logging.warning("LocalMathRAGFlow default dataset skipped: tenant not found for user %s", user.id)
++        return None
++
++    ok, create_dict = KnowledgebaseService.create_with_name(
++        name=DEFAULT_DATASET_NAME,
++        tenant_id=user.id,
++        parser_id=ParserType.NAIVE.value,
++        description="LocalMathRAGFlow default local dataset.",
++    )
++    if not ok:
++        raise RuntimeError(create_dict)
++    create_dict["embd_id"] = create_dict.get("embd_id") or tenant.embd_id
++    if not KnowledgebaseService.save(**create_dict):
++        raise RuntimeError("Failed to save LocalMathRAGFlow default dataset")
++    ok, dataset = KnowledgebaseService.get_by_id(create_dict["id"])
++    return dataset if ok else None
++
++
++def _upload_changed_files(kb, entries: list[dict[str, Any]], tenant_id: str) -> tuple[int, list[str]]:
++    changed_entries = [
++        entry
++        for entry in entries
++        if entry.get("kind") == "file" and entry.get("status") in {"new", "changed"}
++    ]
++    files = []
++    for entry in changed_entries:
++        rel = str(entry.get("path") or "")
++        file_path = DATASET_DIR / rel
++        if not file_path.is_file():
++            continue
++        if filename_type(rel) == "other":
++            logging.info("LocalMathRAGFlow skipping unsupported local dataset file: %s", rel)
++            continue
++        files.append(LocalDatasetFile(file_path, rel, str(entry["doc_id"]), str(entry["fingerprint"])))
++    if not files:
++        return 0, []
++
++    errors, parsed_files = FileService().upload_document(kb, files, tenant_id, src="localmathrag")
++    kb_table_num_map: dict[str, int] = {}
++    for doc, _ in parsed_files:
++        doc["run"] = TaskStatus.RUNNING.value
++        DocumentService.update_by_id(doc["id"], {"run": TaskStatus.RUNNING.value, "progress": 0, "progress_msg": ""})
++        DocumentService.run(tenant_id, doc, kb_table_num_map)
++    return len(parsed_files), errors
++
++
++def _delete_removed_files(entries: list[dict[str, Any]], tenant_id: str) -> tuple[int, str]:
++    doc_ids = [
++        str(entry.get("doc_id") or _doc_id(str(entry.get("path") or "")))
++        for entry in entries
++        if entry.get("kind") == "file" and entry.get("status") == "deleted"
++    ]
++    if not doc_ids:
++        return 0, ""
++    error = FileService.delete_docs(doc_ids, tenant_id)
++    return len(doc_ids), error
++
++
++def refresh_local_dataset(tenant_id: str, dataset_id: str) -> tuple[bool, dict[str, Any] | str]:
++    if not REFRESH_LOCK.acquire(blocking=False):
++        return True, {"running": True, "message": "Local dataset refresh is already running."}
++    try:
++        kb = KnowledgebaseService.get_or_none(id=dataset_id, tenant_id=tenant_id, status=StatusEnum.VALID.value)
++        if kb is None:
++            return False, "Dataset not found."
++        if kb.name != DEFAULT_DATASET_NAME:
++            return False, f"Local folder refresh is only available for the {DEFAULT_DATASET_NAME} dataset."
++
++        entries = _scan_manifest()
++        uploaded_count, upload_errors = _upload_changed_files(kb, entries, tenant_id)
++        deleted_count, delete_error = _delete_removed_files(entries, tenant_id)
++        return True, {
++            "running": False,
++            "dataset_id": dataset_id,
++            "dataset_name": DEFAULT_DATASET_NAME,
++            "dataset_dir": str(DATASET_DIR),
++            "state_file": str(DATASET_STATE_FILE),
++            "uploaded_count": uploaded_count,
++            "deleted_count": deleted_count,
++            "upload_errors": upload_errors,
++            "delete_error": delete_error,
++            "summary": _summary(entries),
++        }
++    finally:
++        REFRESH_LOCK.release()
+diff --git a/api/ragflow_server.py b/api/ragflow_server.py
+--- a/api/ragflow_server.py
++++ b/api/ragflow_server.py
+@@ -45,0 +46 @@ from common.log_utils import init_root_logger
++from api.apps.services.local_dataset_service import ensure_default_dataset
+@@ -106,0 +108,4 @@ if __name__ == '__main__':
++    try:
++        ensure_default_dataset()
++    except Exception:
++        logging.exception("Failed to ensure LocalMathRAGFlow Default dataset")
+diff --git a/web/src/hooks/use-knowledge-request.ts b/web/src/hooks/use-knowledge-request.ts
+--- a/web/src/hooks/use-knowledge-request.ts
++++ b/web/src/hooks/use-knowledge-request.ts
+@@ -22,0 +23 @@ import kbService, {
++  refreshLocalDataset,
+@@ -326,0 +328,23 @@ export const useFetchKnowledgeBaseConfiguration = (props?: {
++export const useRefreshLocalDataset = () => {
++  const queryClient = useQueryClient();
++  const knowledgeBaseId = useKnowledgeBaseId();
++  const { data, isPending: loading, mutateAsync } = useMutation({
++    mutationFn: async (datasetId?: string) => {
++      const { data = {} } = await refreshLocalDataset(
++        datasetId || knowledgeBaseId,
++      );
++      if (data.code === 0) {
++        message.success('Local folder refreshed');
++        queryClient.invalidateQueries({ queryKey: ['fetchDocumentList'] });
++        queryClient.invalidateQueries({ queryKey: ['fetchDocumentFilter'] });
++        queryClient.invalidateQueries({
++          queryKey: [KnowledgeApiAction.FetchKnowledgeDetail],
++        });
++      }
++      return data;
++    },
++  });
++
++  return { data, loading, refreshLocalDataset: mutateAsync };
++};
++
+diff --git a/web/src/pages/dataset/dataset/index.tsx b/web/src/pages/dataset/dataset/index.tsx
+--- a/web/src/pages/dataset/dataset/index.tsx
++++ b/web/src/pages/dataset/dataset/index.tsx
+@@ -22,2 +22,5 @@ import { useFetchDocumentList } from '@/hooks/use-document-request';
+-import { useFetchKnowledgeBaseConfiguration } from '@/hooks/use-knowledge-request';
+-import { LucidePlus } from 'lucide-react';
++import {
++  useFetchKnowledgeBaseConfiguration,
++  useRefreshLocalDataset,
++} from '@/hooks/use-knowledge-request';
++import { LucidePlus, RefreshCw } from 'lucide-react';
+@@ -60,0 +64,5 @@ export default function Dataset() {
++  const {
++    loading: localDatasetRefreshLoading,
++    refreshLocalDataset,
++  } = useRefreshLocalDataset();
++  const isDefaultDataset = knowledgeBase?.name === 'Default';
+@@ -167 +175,19 @@ export default function Dataset() {
+-          preChildren={<Generate disabled={!(dataSetData.chunk_count > 0)} />}
++          preChildren={
++            <div className="flex items-center gap-2">
++              {isDefaultDataset && (
++                <Button
++                  variant="ghost"
++                  className="border border-border-button"
++                  disabled={localDatasetRefreshLoading}
++                  onClick={() => refreshLocalDataset()}
++                >
++                  <RefreshCw
++                    className={localDatasetRefreshLoading ? 'animate-spin' : ''}
++                    size={16}
++                  />
++                  {t('knowledgeDetails.localRefresh')}
++                </Button>
++              )}
++              <Generate disabled={!(dataSetData.chunk_count > 0)} />
++            </div>
++          }
+diff --git a/web/src/locales/en.ts b/web/src/locales/en.ts
+--- a/web/src/locales/en.ts
++++ b/web/src/locales/en.ts
+@@ -450,0 +451 @@ Example: A 1 KB message with 1024-dim embedding uses ~9 KB. The 5 MB default limit holds ~500 such messages.`,
++      localRefresh: 'Refresh',
+diff --git a/web/src/locales/zh.ts b/web/src/locales/zh.ts
+--- a/web/src/locales/zh.ts
++++ b/web/src/locales/zh.ts
+@@ -402,0 +403 @@ export default {
++      localRefresh: '刷新',
+diff --git a/web/src/services/knowledge-service.ts b/web/src/services/knowledge-service.ts
+--- a/web/src/services/knowledge-service.ts
++++ b/web/src/services/knowledge-service.ts
+@@ -262,0 +263,3 @@ export const updateKb = (datasetId: string, data: Record<string, any>) =>
++export const refreshLocalDataset = (datasetId: string) =>
++  request.post(api.localDatasetRefresh(datasetId));
++
+diff --git a/web/src/utils/api.ts b/web/src/utils/api.ts
+--- a/web/src/utils/api.ts
++++ b/web/src/utils/api.ts
+@@ -130,0 +131,2 @@ export default {
++  localDatasetRefresh: (datasetId: string) =>
++    `${restAPIv1}/datasets/${datasetId}/local-refresh`,

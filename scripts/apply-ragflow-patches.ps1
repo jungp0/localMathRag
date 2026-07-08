@@ -36,7 +36,7 @@ $patches = Get-ChildItem $PatchDir -Filter "*.patch" | Sort-Object Name
 foreach ($patch in $patches) {
     Push-Location $RagflowRoot
     try {
-        $baseArgs = @("-c", "safe.directory=$RagflowRoot", "apply")
+        $baseArgs = @("-c", "safe.directory=$RagflowRoot", "apply", "--unidiff-zero")
         $check = Invoke-Git ($baseArgs + @("--check", $patch.FullName))
         if ($check.Code -eq 0) {
             $apply = Invoke-Git ($baseArgs + @($patch.FullName))
@@ -47,7 +47,7 @@ foreach ($patch in $patches) {
             continue
         }
 
-        $reverseCheck = Invoke-Git ($baseArgs + @("--reverse", "--check", $patch.FullName))
+        $reverseCheck = Invoke-Git ($baseArgs + @("--reverse", "--check", "--ignore-whitespace", $patch.FullName))
         if ($reverseCheck.Code -eq 0) {
             Write-Host "Already applied $($patch.Name)"
             continue

@@ -7,11 +7,10 @@
     <Nullable>enable</Nullable>
     <AssemblyName>LocalMathRAGFlow</AssemblyName>
     <RootNamespace>LocalMathRAGFlow</RootNamespace>
-    <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>Assets\ragflow.ico</ApplicationIcon>
   </PropertyGroup>
   <ItemGroup>
-    <Content Include="Assets\ragflow.ico" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="Assets\ragflow.ico" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
     <Content Include="Assets\ragflow-logo.svg" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

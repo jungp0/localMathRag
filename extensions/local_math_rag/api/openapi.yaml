@@ -46,6 +46,20 @@ paths:
       responses:
         "200":
           description: Normalized object.
+  /v1/dataset/status:
+    get:
+      operationId: datasetStatus
+      description: Scan the default local dataset directory and return change counts without file contents.
+      responses:
+        "200":
+          description: Dataset scan status and summary.
+  /v1/dataset/files:
+    get:
+      operationId: datasetFiles
+      description: Scan the default local dataset directory and return the cached incremental file manifest.
+      responses:
+        "200":
+          description: Dataset scan status with file and folder entries.
   /v1/search/objects:
     post:
       operationId: searchObjects

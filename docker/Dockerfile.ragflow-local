@@ -1,0 +1,25 @@
+ARG RAGFLOW_BASE_IMAGE=infiniflow/ragflow:v0.26.3
+FROM ${RAGFLOW_BASE_IMAGE}
+
+USER root
+WORKDIR /ragflow
+
+ENV LOCALMATHRAG_LOCAL_ONLY=1
+ENV LOCALMATHRAG_DISABLE_LOGIN=1
+
+COPY docker/ragflow-localize-conf.py /tmp/ragflow-localize-conf.py
+RUN python /tmp/ragflow-localize-conf.py
+
+COPY third_party/ragflow/api/apps/services/provider_api_service.py /ragflow/api/apps/services/provider_api_service.py
+COPY third_party/ragflow/api/apps/services/dataset_api_service.py /ragflow/api/apps/services/dataset_api_service.py
+COPY third_party/ragflow/api/apps/services/local_dataset_service.py /ragflow/api/apps/services/local_dataset_service.py
+COPY third_party/ragflow/api/apps/llm_app.py /ragflow/api/apps/llm_app.py
+COPY third_party/ragflow/api/ragflow_server.py /ragflow/api/ragflow_server.py
+COPY third_party/ragflow/api/apps/restful_apis/dataset_api.py /ragflow/api/apps/restful_apis/dataset_api.py
+COPY third_party/ragflow/api/apps/restful_apis/document_api.py /ragflow/api/apps/restful_apis/document_api.py
+COPY third_party/ragflow/api/db/services/task_service.py /ragflow/api/db/services/task_service.py
+COPY third_party/ragflow/api/utils/validation_utils.py /ragflow/api/utils/validation_utils.py
+COPY third_party/ragflow/deepdoc/parser/figure_parser.py /ragflow/deepdoc/parser/figure_parser.py
+COPY third_party/ragflow/rag/app/naive.py /ragflow/rag/app/naive.py
+COPY third_party/ragflow/rag/svr/task_executor.py /ragflow/rag/svr/task_executor.py
+COPY third_party/ragflow/web/dist /ragflow/web/dist

@@ -23,6 +23,8 @@ Copy-Item -Recurse -Force (Join-Path $Root "patches") $Out
 Copy-Item -Force (Join-Path $Root "README.md") $Out
 
 New-Item -ItemType Directory -Force (Join-Path $Out "data\models") | Out-Null
+New-Item -ItemType Directory -Force (Join-Path $Out "data\dataset") | Out-Null
+New-Item -ItemType Directory -Force (Join-Path $Out "data\cache") | Out-Null
 New-Item -ItemType Directory -Force (Join-Path $Out "third_party") | Out-Null
 
 Compress-Archive -Force -Path (Join-Path $Out "*") -DestinationPath (Join-Path $Root "dist\LocalMathRAGFlow-win-x64.zip")

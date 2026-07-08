@@ -1,11 +1,14 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Net;
 using System.Net.Http.Json;
+using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Windows.Forms;
 
 namespace LocalMathRAGFlow;
@@ -16,668 +19,411 @@ internal static class Program
     private static void Main()
     {
         ApplicationConfiguration.Initialize();
+        Application.ThreadException += (_, e) => TrayContext.LogStartup("THREAD ERROR " + e.Exception);
+        AppDomain.CurrentDomain.UnhandledException += (_, e) => TrayContext.LogStartup("UNHANDLED ERROR " + e.ExceptionObject);
+        Application.ApplicationExit += (_, _) => TrayContext.LogStartup("APPLICATION EXIT");
+        StartupStatusServer.StartDetached();
+        BackgroundStartupTask.StartDetached();
         Application.Run(new TrayContext());
     }
 }
-
-internal sealed partial class TrayContext : ApplicationContext
+internal sealed class TrayContext : ApplicationContext
 {
-    private NativeTrayIcon? tray;
-    private readonly ContextMenuStrip menu;
-    private TrayHostForm? menuHost;
-    private readonly ToolStripMenuItem statusItem;
-    private readonly ToolStripMenuItem startItem;
-    private readonly ToolStripMenuItem stopItem;
-    private readonly ToolStripMenuItem restartItem;
-    private readonly SynchronizationContext uiContext;
-    private readonly string root;
-    private readonly string logDir;
-    private readonly Icon appIcon;
+    private NotifyIcon? tray;
+    private readonly string logFile;
+    private readonly System.Windows.Forms.Timer windowStateTimer;
     private Process? browserProcess;
-    private string lastStatus = "";
-    private DateTimeOffset lastTrayOpenAt = DateTimeOffset.MinValue;
-    private CancellationTokenSource? currentRun;
+    private DateTimeOffset lastOpenAt = DateTimeOffset.MinValue;
 
     public TrayContext()
     {
-        uiContext = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
-        root = FindRoot();
-        logDir = Path.Combine(root, "data", "launcher");
-        Directory.CreateDirectory(logDir);
-        appIcon = LoadAppIcon(root);
+        logFile = Path.Combine(AppContext.BaseDirectory, "launcher-tray.log");
+        Log("launcher tray starting");
+        windowStateTimer = new System.Windows.Forms.Timer { Interval = 3000 };
+        windowStateTimer.Tick += (_, _) => SaveCurrentBrowserWindowState();
+        windowStateTimer.Start();
 
-        statusItem = new ToolStripMenuItem("Status: starting")
+        var menu = CreateTrayMenu();
+        menu.Opening += (_, _) => Log("menu opening");
+        menu.Opened += (_, _) =>
         {
-            Enabled = false,
-            Font = new Font("Segoe UI Semibold", 10F, FontStyle.Bold),
-            Image = MenuGlyph.Status(Color.FromArgb(22, 119, 255)),
-            Padding = new Padding(4, 8, 8, 8)
+            ApplyRoundedRegion(menu);
+            Log("menu opened");
         };
-        startItem = MenuItem("Start services", async () => await StartServicesAsync(openBrowser: true), MenuGlyph.Play());
-        stopItem = MenuItem("Stop services", async () => await StopServicesAsync(), MenuGlyph.Stop());
-        restartItem = MenuItem("Restart services", async () => await RestartServicesAsync(), MenuGlyph.Restart());
-        menu = CreateMenu();
-        menu.Items.Add(statusItem);
-        menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add(MenuItem("Open RAGFlow", async () => await OpenRagflowAsync(CancellationToken.None), MenuGlyph.Open()));
-        menu.Items.Add(MenuItem("Open object service", () => OpenUrl("http://127.0.0.1:8088/health"), MenuGlyph.Link()));
-        menu.Items.Add(startItem);
-        menu.Items.Add(stopItem);
-        menu.Items.Add(restartItem);
-        menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add(MenuItem("Open data directory", () => OpenPath(Path.Combine(root, "data")), MenuGlyph.Folder()));
-        menu.Items.Add(MenuItem("View launcher log", () => OpenPath(LogFile), MenuGlyph.Log()));
-        menu.Items.Add(MenuItem("View compose log", () => OpenPath(ComposeLogFile), MenuGlyph.Log()));
-        menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add(MenuItem("Exit", async () => await ExitAsync(), MenuGlyph.Exit()));
-
-        menu.Opening += (_, _) => Log("TRAY menu opening");
-        menu.Opened += (_, _) => Log("TRAY menu opened");
-        Application.Idle += InitializeAfterMessageLoop;
-    }
-
-    private void InitializeAfterMessageLoop(object? sender, EventArgs e)
-    {
-        Application.Idle -= InitializeAfterMessageLoop;
-        menuHost = CreateMenuHost();
-        menuHost.HandleCreated += (_, _) => Log($"TRAY host handle created hwnd=0x{menuHost.Handle.ToInt64():X}");
-        menuHost.HandleDestroyed += (_, _) => Log("TRAY host handle destroyed");
-        MainForm = menuHost;
-        tray = new NativeTrayIcon(menuHost.Handle, appIcon.Handle, "LocalMathRAGFlow");
-        menuHost.ShellMessage += (_, message) => tray?.HandleShellMessage(message);
-        tray.Diagnostic += (_, message) => Log(message);
-        tray.LeftClick += async (_, _) => await OpenFromTrayAsync("left click");
-        tray.LeftDoubleClick += async (_, _) => await OpenFromTrayAsync("left double click");
-        tray.RightClick += (_, _) =>
+        AddHeader(menu, "LocalMathRAGFlow");
+        AddTrayItem(menu, "Open RAGFlow", (_, _) => OpenWeb());
+        AddTrayItem(menu, "Start services", (_, _) =>
         {
-            Log("TRAY native right click");
-            ShowTrayMenu();
-        };
-        tray.TaskbarCreated += (_, _) => Log("TRAY restored after Explorer taskbar recreation");
-        tray.Show();
-        Log("TRAY native icon created");
-        var hostHandle = menuHost.Handle;
-        _ = Task.Run(async () =>
-        {
-            await Task.Delay(2500);
-            Log($"TRAY host verify hwnd=0x{hostHandle.ToInt64():X}, alive={IsWindow(hostHandle)}, current=0x{menuHost.Handle.ToInt64():X}");
+            BackgroundStartupTask.StartDetached();
+            OpenWeb();
         });
+        AddTrayItem(menu, "Stop services", async (_, _) =>
+        {
+            OpenWeb(forceStatusPage: true);
+            await BackgroundStartupTask.StopServicesAsync();
+        });
+        AddSeparator(menu);
+        AddTrayItem(menu, "Open dataset", (_, _) => OpenPath(Path.Combine(FindRoot(), "data", "dataset")));
+        AddTrayItem(menu, "Open data directory", (_, _) => OpenPath(Path.Combine(FindRoot(), "data")));
+        AddSeparator(menu);
+        AddTrayItem(menu, "Exit", async (_, _) => await ExitAsync());
 
-        _ = StartServicesAsync(openBrowser: true);
+        tray = new NotifyIcon
+        {
+            Icon = LoadTrayIcon(),
+            Text = "LocalMathRAGFlow",
+            ContextMenuStrip = menu,
+            Visible = true
+        };
+        tray.MouseClick += (_, e) =>
+        {
+            Log($"mouse click {e.Button} clicks={e.Clicks}");
+            if (e.Button == MouseButtons.Left)
+            {
+                OpenWeb();
+            }
+        };
+        tray.DoubleClick += (_, _) => OpenWeb();
+        Log("launcher tray icon created");
+        OpenWeb();
     }
 
-    private static ContextMenuStrip CreateMenu()
+    private static ContextMenuStrip CreateTrayMenu()
     {
         return new ContextMenuStrip
         {
-            BackColor = Color.FromArgb(250, 252, 255),
-            ForeColor = Color.FromArgb(16, 24, 40),
+            BackColor = Color.FromArgb(255, 255, 255),
+            ForeColor = Color.FromArgb(31, 35, 40),
             Font = new Font("Segoe UI", 10F, FontStyle.Regular),
-            Padding = new Padding(8, 8, 8, 8),
-            ShowImageMargin = true,
-            Renderer = new ModernMenuRenderer()
+            Padding = new Padding(8, 9, 8, 9),
+            ShowImageMargin = false,
+            Renderer = new MutedTrayMenuRenderer()
         };
     }
 
-    private static ToolStripMenuItem MenuItem(string text, Action action, Image? image = null)
+    private static void AddHeader(ContextMenuStrip menu, string text)
     {
-        var item = new ToolStripMenuItem(text) { Image = image, Padding = new Padding(4, 6, 8, 6) };
-        item.Click += (_, _) => action();
-        return item;
+        var item = new ToolStripMenuItem(text)
+        {
+            Enabled = false,
+            Font = new Font("Segoe UI Semibold", 10F, FontStyle.Bold),
+            Padding = new Padding(12, 8, 18, 8),
+            Margin = new Padding(3, 1, 3, 3)
+        };
+        menu.Items.Add(item);
+        AddSeparator(menu);
     }
 
-    private static ToolStripMenuItem MenuItem(string text, Func<Task> action, Image? image = null)
+    private static void AddTrayItem(ContextMenuStrip menu, string text, EventHandler onClick)
     {
-        var item = new ToolStripMenuItem(text) { Image = image, Padding = new Padding(4, 6, 8, 6) };
-        item.Click += async (_, _) => await action();
-        return item;
+        var item = new ToolStripMenuItem(text)
+        {
+            Padding = new Padding(12, 7, 18, 7),
+            Margin = new Padding(3, 1, 3, 1)
+        };
+        item.Click += onClick;
+        menu.Items.Add(item);
     }
 
-    private string WebUrl => $"http://127.0.0.1:{GetRagflowWebPort()}";
-    private string LogFile => Path.Combine(logDir, "launcher.log");
-    private string ComposeLogFile => Path.Combine(logDir, "compose.log");
-
-    private async Task StartServicesAsync(bool openBrowser)
+    private static void AddSeparator(ContextMenuStrip menu)
     {
-        if (currentRun is not null)
-        {
-            SetStatus("already running a task");
-            return;
-        }
-
-        currentRun = new CancellationTokenSource();
-        SetBusy(true);
-        try
-        {
-            SetStatus("checking Docker");
-            if (!CommandExists("docker"))
-            {
-                MessageBox.Show(
-                    "Docker CLI was not found. Please install Docker Desktop first.",
-                    "LocalMathRAGFlow",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Warning);
-                return;
-            }
-
-            if (!await DockerReadyAsync(currentRun.Token))
-            {
-                SetStatus("starting Docker Desktop");
-                StartDockerDesktop();
-                if (!await WaitForDockerAsync(TimeSpan.FromMinutes(5), currentRun.Token))
-                {
-                    MessageBox.Show(
-                        "Docker Desktop did not become ready within 5 minutes. Please check Docker Desktop and try again.",
-                        "LocalMathRAGFlow",
-                        MessageBoxButtons.OK,
-                        MessageBoxIcon.Warning);
-                    return;
-                }
-            }
-
-            if (!Directory.Exists(RagflowDockerDir))
-            {
-                var result = MessageBox.Show(
-                    "RAGFlow source is missing. Download it now from GitHub?",
-                    "LocalMathRAGFlow",
-                    MessageBoxButtons.YesNo,
-                    MessageBoxIcon.Question);
-                if (result != DialogResult.Yes)
-                {
-                    return;
-                }
-                SetStatus("downloading RAGFlow");
-                await RunPowerShellScriptAsync(Path.Combine(root, "scripts", "bootstrap-ragflow.ps1"), "", currentRun.Token);
-            }
-
-            var allowLlama = await ConfirmLocalModelRuntimeAsync(currentRun.Token);
-            SetStatus("starting containers");
-            await RunDockerComposeAsync("up -d --build", currentRun.Token, allowLlama);
-            SetStatus("waiting for RAGFlow web");
-            var webReady = await WaitForHttpOkAsync($"{WebUrl}/api/v1/system/config", TimeSpan.FromMinutes(3), currentRun.Token);
-            SetStatus("running");
-            if (!webReady)
-            {
-                tray?.ShowBalloonTip(3000, "LocalMathRAGFlow", "Containers are running, but RAGFlow Web may still be warming up.", ToolTipIcon.Warning);
-            }
-            if (openBrowser)
-            {
-                await OpenRagflowAsync(currentRun.Token);
-            }
-        }
-        catch (OperationCanceledException)
-        {
-            SetStatus("cancelled");
-        }
-        catch (Exception ex)
-        {
-            Log("ERROR " + ex);
-            SetStatus("error");
-            MessageBox.Show(ex.Message, "LocalMathRAGFlow", MessageBoxButtons.OK, MessageBoxIcon.Error);
-        }
-        finally
-        {
-            SetBusy(false);
-            currentRun?.Dispose();
-            currentRun = null;
-        }
+        menu.Items.Add(new ToolStripSeparator { Margin = new Padding(4, 5, 4, 5) });
     }
 
-    private async Task StopServicesAsync()
+    private static void ApplyRoundedRegion(ContextMenuStrip menu)
     {
-        SetBusy(true);
-        try
-        {
-            currentRun?.Cancel();
-            SetStatus("stopping containers");
-            await RunDockerComposeAsync("down", CancellationToken.None);
-            SetStatus("stopped");
-        }
-        catch (Exception ex)
-        {
-            Log("ERROR " + ex);
-            MessageBox.Show(ex.Message, "LocalMathRAGFlow", MessageBoxButtons.OK, MessageBoxIcon.Error);
-        }
-        finally
-        {
-            SetBusy(false);
-        }
-    }
-
-    private async Task RestartServicesAsync()
-    {
-        await StopServicesAsync();
-        await StartServicesAsync(openBrowser: true);
-    }
-
-    private async Task ExitAsync()
-    {
-        var result = MessageBox.Show(
-            "Stop Docker services before exit?",
-            "LocalMathRAGFlow",
-            MessageBoxButtons.YesNoCancel,
-            MessageBoxIcon.Question);
-        if (result == DialogResult.Cancel)
+        if (menu.Width <= 0 || menu.Height <= 0)
         {
             return;
         }
-        if (result == DialogResult.Yes)
-        {
-            await StopServicesAsync();
-        }
-        menu.Dispose();
-        tray?.Dispose();
-        appIcon.Dispose();
-        menuHost?.Dispose();
-        ExitThread();
+        using var path = RoundedRect(new Rectangle(0, 0, menu.Width, menu.Height), 8);
+        menu.Region?.Dispose();
+        menu.Region = new Region(path);
     }
 
-    private string RagflowDockerDir => Path.Combine(root, "third_party", "ragflow", "docker");
-    private string OverrideCompose => Path.Combine(root, "docker", "docker-compose.localmathrag.yml");
-    private string WebDistCompose => Path.Combine(root, "docker", "docker-compose.webdist.yml");
+    private static GraphicsPath RoundedRect(Rectangle rect, int radius)
+    {
+        var path = new GraphicsPath();
+        var diameter = radius * 2;
+        path.AddArc(rect.Left, rect.Top, diameter, diameter, 180, 90);
+        path.AddArc(rect.Right - diameter - 1, rect.Top, diameter, diameter, 270, 90);
+        path.AddArc(rect.Right - diameter - 1, rect.Bottom - diameter - 1, diameter, diameter, 0, 90);
+        path.AddArc(rect.Left, rect.Bottom - diameter - 1, diameter, diameter, 90, 90);
+        path.CloseFigure();
+        return path;
+    }
 
-    private static Icon LoadAppIcon(string root)
+    private static Icon LoadTrayIcon()
     {
         var candidates = new[]
         {
             Path.Combine(AppContext.BaseDirectory, "Assets", "ragflow.ico"),
-            Path.Combine(root, "launcher", "LocalMathRAGFlow", "Assets", "ragflow.ico"),
-            Path.Combine(root, "Assets", "ragflow.ico")
+            Path.Combine(FindRoot(), "launcher", "LocalMathRAGFlow", "Assets", "ragflow.ico"),
+            Path.Combine(FindRoot(), "Assets", "ragflow.ico")
         };
-        var iconPath = candidates.FirstOrDefault(File.Exists);
-        return iconPath is null ? SystemIcons.Application : new Icon(iconPath);
-    }
-
-    private async Task OpenRagflowAsync(CancellationToken token)
-    {
-        var loginUrl = await TryBuildAutoLoginUrlAsync(token);
-        OpenOrFocusAppWindow(loginUrl ?? WebUrl);
-    }
-
-    private async Task OpenFromTrayAsync(string reason)
-    {
-        var now = DateTimeOffset.UtcNow;
-        if (now - lastTrayOpenAt < TimeSpan.FromMilliseconds(750))
-        {
-            return;
-        }
-        lastTrayOpenAt = now;
-        Log("TRAY open requested: " + reason);
-        await OpenRagflowAsync(CancellationToken.None);
-    }
-
-    private void ShowTrayMenu()
-    {
-        uiContext.Post(_ =>
-        {
-            if (menuHost is null)
-            {
-                Log("TRAY menu skipped: menu host is not ready");
-                return;
-            }
-            if (menu.Visible)
-            {
-                menu.Close();
-            }
-            var position = Cursor.Position;
-            menuHost.Location = new Point(position.X, position.Y);
-            SetForegroundWindow(menuHost.Handle);
-            menu.Show(menuHost, menuHost.PointToClient(position));
-        }, null);
-    }
-
-    private async Task<string?> TryBuildAutoLoginUrlAsync(CancellationToken token)
-    {
-        try
-        {
-            using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(10) };
-            var payload = new
-            {
-                email = "admin@ragflow.io",
-                password = EncryptRagflowPassword("admin")
-            };
-            using var response = await client.PostAsJsonAsync($"{WebUrl}/api/v1/auth/login", payload, token);
-            var content = await response.Content.ReadAsStringAsync(token);
-            if (!response.IsSuccessStatusCode || !content.Contains("\"code\":0", StringComparison.Ordinal))
-            {
-                Log("AUTOLOGIN failed: " + content);
-                return null;
-            }
-            if (!response.Headers.TryGetValues("Authorization", out var values))
-            {
-                Log("AUTOLOGIN failed: missing Authorization header");
-                return null;
-            }
-            var auth = values.FirstOrDefault();
-            return string.IsNullOrWhiteSpace(auth) ? null : $"{WebUrl}/?auth={Uri.EscapeDataString(auth)}";
-        }
-        catch (Exception ex)
-        {
-            Log("AUTOLOGIN failed: " + ex.Message);
-            return null;
-        }
-    }
-
-    private static string EncryptRagflowPassword(string password)
-    {
-        const string publicKey = """
------BEGIN PUBLIC KEY-----
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArq9XTUSeYr2+N1h3Afl/z8Dse/2yD0ZGrKwx+EEEcdsBLca9Ynmx3nIB5obmLlSfmskLpBo0UACBmB5rEjBp2Q2f3AG3Hjd4B+gNCG6BDaawuDlgANIhGnaTLrIqWrrcm4EMzJOnAOI1fgzJRsOOUEfaS318Eq9OVO3apEyCCt0lOQK6PuksduOjVxtltDav+guVAA068NrPYmRNabVKRNLJpL8w4D44sfth5RvZ3q9t+6RTArpEtc5sh5ChzvqPOzKGMXW83C95TxmXqpbK6olN4RevSfVjEAgCydH6HN6OhtOQEcnrU97r9H0iZOWwbw3pVrZiUkuRD1R56Wzs2wIDAQAB
------END PUBLIC KEY-----
-""";
-        using var rsa = RSA.Create();
-        rsa.ImportFromPem(publicKey);
-        var base64Password = Convert.ToBase64String(Encoding.UTF8.GetBytes(password));
-        var encrypted = rsa.Encrypt(Encoding.UTF8.GetBytes(base64Password), RSAEncryptionPadding.Pkcs1);
-        return Convert.ToBase64String(encrypted);
-    }
-
-    private async Task RunDockerComposeAsync(string args, CancellationToken token, bool allowLlama = true)
-    {
-        var composeFiles = $"-f docker-compose.yml -f \"{OverrideCompose}\"";
-        if (Directory.Exists(Path.Combine(root, "third_party", "ragflow", "web", "dist")) &&
-            File.Exists(WebDistCompose))
-        {
-            composeFiles += $" -f \"{WebDistCompose}\"";
-        }
-        var composeArgs = $"compose {composeFiles} {args}";
-        var profiles = BuildComposeProfiles(allowLlama);
-        var env = new Dictionary<string, string?>
-        {
-            ["LOCALMATHRAG_ROOT"] = root,
-            ["DOC_ENGINE"] = "elasticsearch",
-            ["DEVICE"] = "cpu",
-            ["COMPOSE_PROFILES"] = string.Join(",", profiles)
-        };
-        var modelName = FindDefaultGgufModelName();
-        if (modelName is not null)
-        {
-            env["LOCALMATHRAG_GGUF_MODEL"] = modelName;
-        }
-        Action<string>? onOutput = args.StartsWith("up", StringComparison.OrdinalIgnoreCase) ? HandleComposeOutput : null;
-        await RunProcessAsync("docker", composeArgs, RagflowDockerDir, ComposeLogFile, env, token, onOutput);
-    }
-
-    private List<string> BuildComposeProfiles(bool allowLlama)
-    {
-        var profiles = new List<string> { "elasticsearch", "cpu" };
-        var modelName = FindDefaultGgufModelName();
-        if (!allowLlama || modelName is null)
-        {
-            return profiles;
-        }
-
-        var llamaProfile = Environment.GetEnvironmentVariable("LOCALMATHRAG_LLAMA_PROFILE");
-        if (string.Equals(llamaProfile, "none", StringComparison.OrdinalIgnoreCase))
-        {
-            return profiles;
-        }
-        profiles.Add(string.Equals(llamaProfile, "cuda", StringComparison.OrdinalIgnoreCase)
-            ? "llama-cpp-cuda"
-            : "llama-cpp-cpu");
-        return profiles;
-    }
-
-    private async Task<bool> ConfirmLocalModelRuntimeAsync(CancellationToken token)
-    {
-        var modelName = FindDefaultGgufModelName();
-        if (modelName is null)
-        {
-            return false;
-        }
-        if (string.Equals(Environment.GetEnvironmentVariable("LOCALMATHRAG_LLAMA_PROFILE"), "none", StringComparison.OrdinalIgnoreCase))
-        {
-            return false;
-        }
-
-        var image = GetLlamaDockerImage();
-        if (await DockerImageExistsAsync(image, token))
-        {
-            return true;
-        }
-
-        var result = MessageBox.Show(
-            $"Detected local model {modelName}, but the local llama.cpp Docker image is not installed yet.\n\nDownload image now?\n\nChoose No to start RAGFlow without the local model endpoint.",
-            "LocalMathRAGFlow",
-            MessageBoxButtons.YesNo,
-            MessageBoxIcon.Question);
-        return result == DialogResult.Yes;
-    }
-
-    private string GetLlamaDockerImage()
-    {
-        return string.Equals(Environment.GetEnvironmentVariable("LOCALMATHRAG_LLAMA_PROFILE"), "cuda", StringComparison.OrdinalIgnoreCase)
-            ? "ghcr.io/ggml-org/llama.cpp:server-cuda"
-            : "ghcr.io/ggml-org/llama.cpp:server";
-    }
-
-    private async Task<bool> DockerImageExistsAsync(string image, CancellationToken token)
-    {
-        var code = await RunProcessAsync("docker", $"image inspect \"{image}\"", root, LogFile, null, token, throwOnError: false);
-        return code == 0;
-    }
-
-    private string? FindDefaultGgufModelName()
-    {
-        var modelDir = Path.Combine(root, "data", "models");
-        if (!Directory.Exists(modelDir))
-        {
-            return null;
-        }
-        return Directory.EnumerateFiles(modelDir, "*.gguf", SearchOption.TopDirectoryOnly)
-            .Select(Path.GetFileName)
-            .FirstOrDefault(name => !string.IsNullOrWhiteSpace(name));
-    }
-
-    private async Task RunPowerShellScriptAsync(string script, string args, CancellationToken token)
-    {
-        var psArgs = $"-NoProfile -ExecutionPolicy Bypass -File \"{script}\" {args}";
-        await RunProcessAsync("powershell", psArgs, root, LogFile, null, token);
-    }
-
-    private async Task<bool> DockerReadyAsync(CancellationToken token)
-    {
-        try
-        {
-            var code = await RunProcessAsync("docker", "info", root, LogFile, null, token, throwOnError: false);
-            return code == 0;
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
-    private async Task<bool> WaitForDockerAsync(TimeSpan timeout, CancellationToken token)
-    {
-        var start = DateTimeOffset.UtcNow;
-        while (DateTimeOffset.UtcNow - start < timeout)
-        {
-            if (await DockerReadyAsync(token))
-            {
-                return true;
-            }
-            await Task.Delay(3000, token);
-        }
-        return false;
-    }
-
-    private static async Task<bool> WaitForHttpOkAsync(string url, TimeSpan timeout, CancellationToken token)
-    {
-        using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
-        var start = DateTimeOffset.UtcNow;
-        while (DateTimeOffset.UtcNow - start < timeout)
+        var path = candidates.FirstOrDefault(File.Exists);
+        if (path is not null)
         {
             try
             {
-                using var response = await client.GetAsync(url, token);
-                if ((int)response.StatusCode < 500)
-                {
-                    return true;
-                }
+                return new Icon(path);
             }
             catch
             {
-                // The web container can be up before the app is ready to accept requests.
             }
-            await Task.Delay(3000, token);
         }
-        return false;
+        try
+        {
+            return Icon.ExtractAssociatedIcon(Application.ExecutablePath) ?? SystemIcons.Application;
+        }
+        catch
+        {
+            return SystemIcons.Application;
+        }
     }
 
-    private static void StartDockerDesktop()
+    public static void LogStartup(string message)
     {
-        var candidates = new[]
+        var logFile = Path.Combine(AppContext.BaseDirectory, "launcher-startup.log");
+        LogTo(logFile, message);
+    }
+
+    private void Log(string message) => LogTo(logFile, message);
+
+    private void OpenWeb(bool forceStatusPage = false)
+    {
+        var now = DateTimeOffset.UtcNow;
+        if (!forceStatusPage && now - lastOpenAt < TimeSpan.FromMilliseconds(750))
         {
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Docker", "Docker", "Docker Desktop.exe"),
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Docker", "Docker Desktop.exe")
-        };
-        var dockerDesktop = candidates.FirstOrDefault(File.Exists);
-        if (dockerDesktop is null)
-        {
-            throw new FileNotFoundException("Docker Desktop was not found. Please install Docker Desktop first.");
+            return;
         }
-        Process.Start(new ProcessStartInfo
+        lastOpenAt = now;
+        Log("open web requested");
+        var url = StartupStatusServer.EntryUrl;
+        var state = LoadBrowserWindowState();
+        var browser = FindChromiumBrowser();
+        if (browser is null)
         {
-            FileName = dockerDesktop,
-            UseShellExecute = true,
-            WindowStyle = ProcessWindowStyle.Minimized
+            Process.Start(new ProcessStartInfo { FileName = url, UseShellExecute = true });
+            return;
+        }
+
+        if (forceStatusPage)
+        {
+            CloseBrowserProcess();
+            browserProcess = null;
+        }
+
+        if (browserProcess is { HasExited: false })
+        {
+            browserProcess.Refresh();
+            if (browserProcess.MainWindowHandle != IntPtr.Zero)
+            {
+                ApplyBrowserWindowState(browserProcess.MainWindowHandle, state);
+                SetForegroundWindow(browserProcess.MainWindowHandle);
+                return;
+            }
+        }
+
+        var launcherDataDir = Path.Combine(FindRoot(), "data", "launcher");
+        var profileDir = Path.Combine(
+            launcherDataDir,
+            $"browser-profile-run-{Environment.ProcessId}-{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}");
+        Directory.CreateDirectory(profileDir);
+        CleanupOldBrowserProfiles(launcherDataDir);
+        Log($"starting browser app with profile {profileDir}");
+        browserProcess = Process.Start(new ProcessStartInfo
+        {
+            FileName = browser,
+            Arguments = $"--app=\"{url}\" --user-data-dir=\"{profileDir}\" --no-first-run{(state.Maximized ? " --start-maximized" : "")}",
+            UseShellExecute = false
         });
     }
 
-    private async Task<int> RunProcessAsync(
-        string fileName,
-        string arguments,
-        string workingDirectory,
-        string logFile,
-        IReadOnlyDictionary<string, string?>? environment,
-        CancellationToken token,
-        bool throwOnError = true)
-        => await RunProcessAsync(fileName, arguments, workingDirectory, logFile, environment, token, null, throwOnError);
-
-    private async Task<int> RunProcessAsync(
-        string fileName,
-        string arguments,
-        string workingDirectory,
-        string logFile,
-        IReadOnlyDictionary<string, string?>? environment,
-        CancellationToken token,
-        Action<string>? onOutput,
-        bool throwOnError = true)
+    private static void CleanupOldBrowserProfiles(string launcherDataDir)
     {
-        Directory.CreateDirectory(Path.GetDirectoryName(logFile)!);
-        await File.AppendAllTextAsync(logFile, $"\n[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {fileName} {arguments}\n", Encoding.UTF8, token);
-
-        var psi = new ProcessStartInfo
+        try
         {
-            FileName = fileName,
-            Arguments = arguments,
-            WorkingDirectory = workingDirectory,
-            CreateNoWindow = true,
-            UseShellExecute = false,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            StandardOutputEncoding = Encoding.UTF8,
-            StandardErrorEncoding = Encoding.UTF8
-        };
-        if (environment is not null)
-        {
-            foreach (var kv in environment)
+            foreach (var profile in Directory.EnumerateDirectories(launcherDataDir, "browser-profile-run-*"))
             {
-                psi.Environment[kv.Key] = kv.Value;
+                try
+                {
+                    var age = DateTimeOffset.Now - Directory.GetLastWriteTime(profile);
+                    if (age > TimeSpan.FromDays(2))
+                    {
+                        Directory.Delete(profile, recursive: true);
+                    }
+                }
+                catch
+                {
+                    // Old browser profiles can be locked by a still-running Edge process.
+                }
             }
         }
-
-        using var process = new Process { StartInfo = psi, EnableRaisingEvents = true };
-        process.OutputDataReceived += (_, e) =>
+        catch
         {
-            if (e.Data is not null)
-            {
-                LogTo(logFile, e.Data);
-                onOutput?.Invoke(e.Data);
-            }
-        };
-        process.ErrorDataReceived += (_, e) =>
-        {
-            if (e.Data is not null)
-            {
-                LogTo(logFile, e.Data);
-                onOutput?.Invoke(e.Data);
-            }
-        };
-
-        process.Start();
-        process.BeginOutputReadLine();
-        process.BeginErrorReadLine();
-        await process.WaitForExitAsync(token);
-
-        if (throwOnError && process.ExitCode != 0)
-        {
-            throw new InvalidOperationException($"{fileName} exited with code {process.ExitCode}. See {logFile}");
-        }
-        return process.ExitCode;
-    }
-
-    private void HandleComposeOutput(string line)
-    {
-        if (line.Contains("Downloading", StringComparison.OrdinalIgnoreCase) ||
-            line.Contains("Pulling", StringComparison.OrdinalIgnoreCase))
-        {
-            SetStatus("downloading Docker images");
-        }
-        else if (line.Contains("Extracting", StringComparison.OrdinalIgnoreCase))
-        {
-            SetStatus("extracting Docker images");
-        }
-        else if (line.Contains("Building", StringComparison.OrdinalIgnoreCase) ||
-                 line.Contains("=>", StringComparison.Ordinal))
-        {
-            SetStatus("building local services");
-        }
-        else if (line.Contains("Creating", StringComparison.OrdinalIgnoreCase) ||
-                 line.Contains("Recreating", StringComparison.OrdinalIgnoreCase))
-        {
-            SetStatus("creating containers");
-        }
-        else if (line.Contains("Starting", StringComparison.OrdinalIgnoreCase))
-        {
-            SetStatus("starting containers");
-        }
-        else if (line.Contains("Started", StringComparison.OrdinalIgnoreCase) ||
-                 line.Contains("Running", StringComparison.OrdinalIgnoreCase))
-        {
-            SetStatus("containers running");
         }
     }
 
-    private void SetBusy(bool busy)
+    private static BrowserWindowState LoadBrowserWindowState()
     {
-        startItem.Enabled = !busy;
-        stopItem.Enabled = !busy;
-        restartItem.Enabled = !busy;
+        var path = BrowserWindowStatePath();
+        if (!File.Exists(path))
+        {
+            return new BrowserWindowState(true);
+        }
+
+        try
+        {
+            return JsonSerializer.Deserialize<BrowserWindowState?>(File.ReadAllText(path, Encoding.UTF8)) ?? new BrowserWindowState(true);
+        }
+        catch
+        {
+            return new BrowserWindowState(true);
+        }
     }
 
-    private void SetStatus(string status)
+    private static string BrowserWindowStatePath()
     {
-        if (SynchronizationContext.Current != uiContext)
-        {
-            uiContext.Post(_ => SetStatus(status), null);
-            return;
-        }
-        if (status == lastStatus)
+        return Path.Combine(FindRoot(), "data", "launcher", "window-state.json");
+    }
+
+    private void SaveCurrentBrowserWindowState()
+    {
+        if (browserProcess is not { HasExited: false })
         {
             return;
         }
-        lastStatus = status;
-        statusItem.Text = "Status: " + status;
-        if (tray is not null)
+
+        browserProcess.Refresh();
+        var handle = browserProcess.MainWindowHandle;
+        if (handle == IntPtr.Zero || !TryGetWindowPlacement(handle, out var placement))
         {
-            tray.Text = status.Length > 40 ? "LocalMathRAGFlow" : $"LocalMathRAGFlow - {status}";
+            return;
         }
-        Log("STATUS " + status);
+
+        if (placement.ShowCmd == ShowWindowMinimized)
+        {
+            return;
+        }
+
+        var path = BrowserWindowStatePath();
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(path) ?? FindRoot());
+            File.WriteAllText(path, JsonSerializer.Serialize(new BrowserWindowState(placement.ShowCmd == ShowWindowMaximized)), Encoding.UTF8);
+        }
+        catch
+        {
+        }
     }
 
-    private void Log(string message) => LogTo(LogFile, message);
+    private static void ApplyBrowserWindowState(IntPtr handle, BrowserWindowState state)
+    {
+        ShowWindow(handle, state.Maximized ? ShowWindowMaximized : ShowWindowRestore);
+    }
+
+    private static bool TryGetWindowPlacement(IntPtr handle, out WindowPlacement placement)
+    {
+        placement = new WindowPlacement { Length = Marshal.SizeOf<WindowPlacement>() };
+        return GetWindowPlacement(handle, ref placement);
+    }
+
+    private async Task ExitAsync()
+    {
+        Log("menu exit clicked");
+        OpenWeb(forceStatusPage: true);
+        await BackgroundStartupTask.StopServicesAsync(exitAfterStop: true);
+        CloseBrowserProcess();
+        tray?.Dispose();
+        ExitThread();
+    }
+
+    private void CloseBrowserProcess()
+    {
+        try
+        {
+            if (browserProcess is { HasExited: false })
+            {
+                browserProcess.Kill(entireProcessTree: true);
+            }
+        }
+        catch
+        {
+        }
+    }
+
+    private static void OpenPath(string path)
+    {
+        if (!File.Exists(path) && !Directory.Exists(path))
+        {
+            if (Path.HasExtension(path))
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(path) ?? path);
+                File.WriteAllText(path, "", Encoding.UTF8);
+            }
+            else
+            {
+                Directory.CreateDirectory(path);
+            }
+        }
+        Process.Start(new ProcessStartInfo { FileName = path, UseShellExecute = true });
+    }
+
+    private static string FindRoot()
+    {
+        var current = AppContext.BaseDirectory;
+        var candidates = new List<string>();
+        for (var dir = new DirectoryInfo(current); dir is not null; dir = dir.Parent)
+        {
+            if (File.Exists(Path.Combine(dir.FullName, "docker", "docker-compose.localmathrag.yml")) &&
+                Directory.Exists(Path.Combine(dir.FullName, "scripts")))
+            {
+                candidates.Add(dir.FullName);
+            }
+        }
+
+        var installedRoot = candidates.FirstOrDefault(candidate =>
+            File.Exists(Path.Combine(candidate, "third_party", "ragflow", "docker", "docker-compose.yml")));
+        if (installedRoot is not null)
+        {
+            return installedRoot;
+        }
+
+        return candidates.FirstOrDefault() ?? Directory.GetCurrentDirectory();
+    }
+
+    private static int GetRagflowWebPort()
+    {
+        var envPath = Path.Combine(FindRoot(), "third_party", "ragflow", "docker", ".env");
+        if (!File.Exists(envPath))
+        {
+            return 80;
+        }
+        foreach (var line in File.ReadLines(envPath))
+        {
+            if (line.StartsWith("SVR_WEB_HTTP_PORT=", StringComparison.Ordinal) &&
+                int.TryParse(line.Split('=', 2)[1].Trim(), out var port))
+            {
+                return port;
+            }
+        }
+        return 80;
+    }
+
+    private static string? FindChromiumBrowser()
+    {
+        var candidates = new[]
+        {
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Microsoft", "Edge", "Application", "msedge.exe"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Microsoft", "Edge", "Application", "msedge.exe"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Microsoft", "Edge", "Application", "msedge.exe"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Google", "Chrome", "Application", "chrome.exe"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Google", "Chrome", "Application", "chrome.exe"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Google", "Chrome", "Application", "chrome.exe")
+        };
+        return candidates.FirstOrDefault(File.Exists);
+    }
 
     private static void LogTo(string file, string message)
     {
@@ -687,8 +433,403 @@ MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArq9XTUSeYr2+N1h3Afl/z8Dse/2yD0ZGrKwx
         }
         catch
         {
-            // Logging should never break the tray app.
         }
+    }
+
+    [DllImport("user32.dll")]
+    private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    [DllImport("user32.dll")]
+    private static extern bool GetWindowPlacement(IntPtr hWnd, ref WindowPlacement lpwndpl);
+
+    private const int ShowWindowRestore = 9;
+    private const int ShowWindowMaximized = 3;
+    private const int ShowWindowMinimized = 2;
+
+    private readonly record struct BrowserWindowState(bool Maximized);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct WindowPlacement
+    {
+        public int Length;
+        public int Flags;
+        public int ShowCmd;
+        public Point MinPosition;
+        public Point MaxPosition;
+        public Rectangle NormalPosition;
+    }
+}
+
+internal static class StartupStatusServer
+{
+    public const int Port = 18765;
+    public static string EntryUrl => $"http://127.0.0.1:{Port}/";
+    private static int started;
+    private static TcpListener? listener;
+
+    public static void StartDetached()
+    {
+        if (Interlocked.Exchange(ref started, 1) == 1)
+        {
+            return;
+        }
+
+        try
+        {
+            listener = new TcpListener(IPAddress.Loopback, Port);
+            listener.Start();
+        }
+        catch (Exception ex)
+        {
+            BackgroundStartupTask.WriteStatus("status_server_error", ex.Message);
+            return;
+        }
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await RunAsync(CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                BackgroundStartupTask.WriteStatus("status_server_error", ex.Message);
+            }
+        });
+    }
+
+    private static async Task RunAsync(CancellationToken token)
+    {
+        if (listener is null)
+        {
+            return;
+        }
+        while (!token.IsCancellationRequested)
+        {
+            var client = await listener.AcceptTcpClientAsync(token);
+            _ = Task.Run(async () => await HandleClientAsync(client), token);
+        }
+    }
+
+    private static async Task HandleClientAsync(TcpClient client)
+    {
+        using var _client = client;
+        using var stream = client.GetStream();
+        using var reader = new StreamReader(stream, Encoding.ASCII, leaveOpen: true);
+        var requestLine = await reader.ReadLineAsync() ?? "";
+        while (!string.IsNullOrEmpty(await reader.ReadLineAsync()))
+        {
+        }
+
+        var path = requestLine.Split(' ', StringSplitOptions.RemoveEmptyEntries).Skip(1).FirstOrDefault() ?? "/";
+        if (path.StartsWith("/start", StringComparison.OrdinalIgnoreCase))
+        {
+            BackgroundStartupTask.StartDetached();
+            await WriteResponseAsync(stream, "application/json; charset=utf-8", "{\"ok\":true}");
+            return;
+        }
+        if (path.StartsWith("/stop", StringComparison.OrdinalIgnoreCase))
+        {
+            _ = Task.Run(async () => await BackgroundStartupTask.StopServicesAsync());
+            await WriteResponseAsync(stream, "application/json; charset=utf-8", "{\"ok\":true}");
+            return;
+        }
+        if (path.StartsWith("/status", StringComparison.OrdinalIgnoreCase))
+        {
+            await WriteResponseAsync(stream, "application/json; charset=utf-8", BuildStatusJson());
+            return;
+        }
+
+        await WriteResponseAsync(stream, "text/html; charset=utf-8", BuildLoadingHtmlPage());
+    }
+
+    private static async Task WriteResponseAsync(NetworkStream stream, string contentType, string body)
+    {
+        var bodyBytes = Encoding.UTF8.GetBytes(body);
+        var header = Encoding.ASCII.GetBytes(
+            "HTTP/1.1 200 OK\r\n" +
+            $"Content-Type: {contentType}\r\n" +
+            "Cache-Control: no-store\r\n" +
+            $"Content-Length: {bodyBytes.Length}\r\n" +
+            "Connection: close\r\n\r\n");
+        await stream.WriteAsync(header);
+        await stream.WriteAsync(bodyBytes);
+    }
+
+    private static string BuildStatusJson()
+    {
+        var root = FindRoot();
+        var statusPath = Path.Combine(root, "data", "launcher", "startup-status.json");
+        var webUrl = $"http://127.0.0.1:{GetRagflowWebPort(root)}";
+        var state = "starting";
+        var message = "Starting LocalMathRAGFlow.";
+        var updatedAt = DateTimeOffset.Now.ToString("O");
+
+        if (File.Exists(statusPath))
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(File.ReadAllText(statusPath, Encoding.UTF8));
+                var rootElement = doc.RootElement;
+                state = rootElement.TryGetProperty("state", out var stateValue) ? stateValue.GetString() ?? state : state;
+                message = rootElement.TryGetProperty("message", out var messageValue) ? messageValue.GetString() ?? message : message;
+                updatedAt = rootElement.TryGetProperty("updated_at", out var updatedValue) ? updatedValue.GetString() ?? updatedAt : updatedAt;
+            }
+            catch
+            {
+            }
+        }
+
+        var payload = new
+        {
+            state,
+            message,
+            updated_at = updatedAt,
+            ready = state is "running",
+            stopped = state is "stopped",
+            close = state is "stopped_exit",
+            web_url = $"{webUrl}/?localmathrag_reload={DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}"
+        };
+        return JsonSerializer.Serialize(payload);
+    }
+
+    private static string BuildLoadingHtmlPage()
+    {
+        return """
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LocalMathRAGFlow</title>
+  <style>
+    :root { color-scheme: light; font-family: "Segoe UI", "Microsoft YaHei", sans-serif; color: #1f2328; background: #f6f8fa; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; }
+    main { width: min(520px, calc(100vw - 40px)); background: #fff; border: 1px solid #d8dee4; border-radius: 14px; padding: 26px 28px; box-shadow: 0 18px 48px rgba(31,35,40,.08); }
+    h1 { margin: 0 0 8px; font-size: 22px; font-weight: 650; letter-spacing: 0; }
+    p { margin: 0; color: #59636e; line-height: 1.6; }
+    button { margin-top: 18px; border: 1px solid #0969da; border-radius: 8px; background: #0969da; color: #fff; font: inherit; font-weight: 600; padding: 9px 14px; cursor: pointer; }
+    button[hidden] { display: none; }
+    .bar { margin: 22px 0 14px; height: 8px; overflow: hidden; border-radius: 999px; background: #eaeef2; }
+    .bar::before { content: ""; display: block; width: 42%; height: 100%; border-radius: inherit; background: #0969da; animation: move 1.2s ease-in-out infinite; }
+    .meta { margin-top: 16px; font-size: 13px; color: #6e7781; }
+    @keyframes move { 0% { transform: translateX(-100%); } 50% { transform: translateX(110%); } 100% { transform: translateX(250%); } }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>LocalMathRAGFlow &#27491;&#22312;&#21551;&#21160;</h1>
+    <p id="message">&#27491;&#22312;&#26816;&#26597;&#21518;&#21488;&#26381;&#21153;&#12290;</p>
+    <div class="bar" id="bar" aria-hidden="true"></div>
+    <p class="meta" id="state">starting</p>
+    <button id="start" hidden>Start service</button>
+  </main>
+  <script>
+    const startButton = document.getElementById('start');
+    const title = document.querySelector('h1');
+    const bar = document.getElementById('bar');
+    startButton.addEventListener('click', async () => {
+      startButton.hidden = true;
+      bar.classList.remove('stopped');
+      title.textContent = 'LocalMathRAGFlow \u6b63\u5728\u542f\u52a8';
+      document.getElementById('message').textContent = '\u6b63\u5728\u542f\u52a8\u540e\u53f0\u670d\u52a1\u3002';
+      await fetch('/start', { method: 'POST' });
+      tick();
+    });
+    async function tick() {
+      let data;
+      try {
+        const res = await fetch('/status', { cache: 'no-store' });
+        data = await res.json();
+      } catch (e) {
+        document.getElementById('message').textContent = '\u6b63\u5728\u7b49\u5f85\u542f\u52a8\u5668\u72b6\u6001\u670d\u52a1\u3002';
+        return;
+      }
+      if (data.state === 'stopping') {
+        title.textContent = 'LocalMathRAGFlow \u6b63\u5728\u505c\u6b62';
+        bar.classList.remove('stopped');
+      } else if (data.stopped) {
+        title.textContent = 'LocalMathRAGFlow \u5df2\u505c\u6b62';
+        bar.classList.add('stopped');
+      } else {
+        title.textContent = 'LocalMathRAGFlow \u6b63\u5728\u542f\u52a8';
+        bar.classList.remove('stopped');
+      }
+      document.getElementById('message').textContent = data.message || '\u6b63\u5728\u542f\u52a8\u540e\u53f0\u670d\u52a1\u3002';
+      document.getElementById('state').textContent = data.state || 'starting';
+      startButton.hidden = !data.stopped || data.state === 'stopping';
+      if (data.close) window.close();
+      if (data.ready && data.web_url) window.location.replace(data.web_url);
+    }
+    tick();
+    setInterval(tick, 1200);
+  </script>
+</body>
+</html>
+""";
+    }
+
+    private static string FindRoot()
+    {
+        var current = AppContext.BaseDirectory;
+        var candidates = new List<string>();
+        for (var dir = new DirectoryInfo(current); dir is not null; dir = dir.Parent)
+        {
+            if (File.Exists(Path.Combine(dir.FullName, "docker", "docker-compose.localmathrag.yml")) &&
+                Directory.Exists(Path.Combine(dir.FullName, "scripts")))
+            {
+                candidates.Add(dir.FullName);
+            }
+        }
+
+        var installedRoot = candidates.FirstOrDefault(candidate =>
+            File.Exists(Path.Combine(candidate, "third_party", "ragflow", "docker", "docker-compose.yml")));
+        return installedRoot ?? candidates.FirstOrDefault() ?? Directory.GetCurrentDirectory();
+    }
+
+    private static int GetRagflowWebPort(string root)
+    {
+        var envPath = Path.Combine(root, "third_party", "ragflow", "docker", ".env");
+        if (!File.Exists(envPath))
+        {
+            return 80;
+        }
+        foreach (var line in File.ReadLines(envPath))
+        {
+            if (line.StartsWith("SVR_WEB_HTTP_PORT=", StringComparison.Ordinal) &&
+                int.TryParse(line.Split('=', 2)[1].Trim(), out var port))
+            {
+                return port;
+            }
+        }
+        return 80;
+    }
+}
+
+internal static class BackgroundStartupTask
+{
+    private static readonly object StatusLock = new();
+    private static readonly object RunLock = new();
+    private static CancellationTokenSource? runCts;
+    private static Task? runTask;
+    private static int stopRequested;
+
+    public static void StartDetached()
+    {
+        lock (RunLock)
+        {
+            if (runTask is { IsCompleted: false })
+            {
+                return;
+            }
+            runCts?.Dispose();
+            Interlocked.Exchange(ref stopRequested, 0);
+            runCts = new CancellationTokenSource();
+            var token = runCts.Token;
+            runTask = Task.Run(async () =>
+            {
+                try
+                {
+                    await RunAsync(token);
+                }
+                catch (OperationCanceledException)
+                {
+                    if (Interlocked.CompareExchange(ref stopRequested, 0, 0) == 0)
+                    {
+                        WriteStatus("cancelled", "Startup task was cancelled.");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    WriteStatus("error", ex.Message);
+                    Log("ERROR " + ex);
+                }
+            }, token);
+        }
+    }
+
+    public static async Task StopServicesAsync(bool exitAfterStop = false)
+    {
+        CancellationTokenSource? cts;
+        lock (RunLock)
+        {
+            cts = runCts;
+        }
+        Interlocked.Exchange(ref stopRequested, 1);
+        cts?.Cancel();
+
+        var root = FindRoot();
+        WriteStatus("stopping", "Stopping Docker Compose services.");
+        var script = Path.Combine(root, "scripts", "dev-down.ps1");
+        if (!File.Exists(script))
+        {
+            WriteStatus("stop_failed", "dev-down.ps1 was not found.");
+            return;
+        }
+
+        var exitCode = await RunProcessAsync(
+            "powershell",
+            $"-NoProfile -ExecutionPolicy Bypass -File \"{script}\"",
+            root,
+            CancellationToken.None);
+        WriteStatus(exitCode == 0 ? (exitAfterStop ? "stopped_exit" : "stopped") : "stop_failed", exitCode == 0 ? "Background services stopped." : $"dev-down.ps1 exited with code {exitCode}.");
+    }
+
+    private static async Task RunAsync(CancellationToken token)
+    {
+        var root = FindRoot();
+        Directory.CreateDirectory(Path.Combine(root, "data", "launcher"));
+        var webUrl = $"http://127.0.0.1:{GetRagflowWebPort(root)}";
+        WriteStatus("checking_service", "Checking whether RAGFlow Web is already running.");
+        if (await WaitForRagflowWebReadyAsync(webUrl, TimeSpan.FromSeconds(3), token))
+        {
+            WriteStatus("running", "RAGFlow Web is already running.");
+            return;
+        }
+
+        WriteStatus("checking_docker", "Checking Docker availability.");
+        if (!CommandExists("docker"))
+        {
+            WriteStatus("docker_missing", "Docker CLI was not found. Install Docker Desktop and restart LocalMathRAGFlow.");
+            return;
+        }
+
+        if (!await DockerReadyAsync(token))
+        {
+            WriteStatus("starting_docker", "Starting Docker Desktop.");
+            StartDockerDesktop();
+            if (!await WaitForDockerAsync(TimeSpan.FromMinutes(5), token))
+            {
+                WriteStatus("docker_timeout", "Docker Desktop did not become ready within 5 minutes.");
+                return;
+            }
+        }
+
+        var ragflowDocker = Path.Combine(root, "third_party", "ragflow", "docker");
+        if (!Directory.Exists(ragflowDocker))
+        {
+            WriteStatus("ragflow_missing", "RAGFlow source is missing; user confirmation is required before downloading.");
+            return;
+        }
+
+        WriteStatus("starting_compose", "Starting Docker Compose services.");
+        var exitCode = await RunProcessAsync(
+            "powershell",
+            $"-NoProfile -ExecutionPolicy Bypass -File \"{Path.Combine(root, "scripts", "dev-up.ps1")}\"",
+            root,
+            token);
+        if (exitCode != 0)
+        {
+            WriteStatus("compose_failed", $"dev-up.ps1 exited with code {exitCode}.");
+            return;
+        }
+
+        WriteStatus("waiting_web", "Waiting for RAGFlow Web.");
+        var webReady = await WaitForRagflowWebReadyAsync(webUrl, TimeSpan.FromMinutes(3), token);
+        WriteStatus(webReady ? "running" : "web_warming", webReady ? "RAGFlow Web is ready." : "Containers are running; RAGFlow Web may still be warming up.");
     }
 
     private static bool CommandExists(string command)
@@ -713,22 +854,196 @@ MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArq9XTUSeYr2+N1h3Afl/z8Dse/2yD0ZGrKwx
         }
     }
 
-    private int GetRagflowWebPort()
+    private static async Task<bool> DockerReadyAsync(CancellationToken token)
     {
-        var envPath = Path.Combine(RagflowDockerDir, ".env");
+        try
+        {
+            return await RunProcessAsync("docker", "info", FindRoot(), token) == 0;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static async Task<bool> WaitForDockerAsync(TimeSpan timeout, CancellationToken token)
+    {
+        var start = DateTimeOffset.UtcNow;
+        while (DateTimeOffset.UtcNow - start < timeout)
+        {
+            if (await DockerReadyAsync(token))
+            {
+                return true;
+            }
+            await Task.Delay(2000, token);
+        }
+        return false;
+    }
+
+    private static async Task<bool> WaitForHttpOkAsync(string url, TimeSpan timeout, CancellationToken token)
+    {
+        using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+        var start = DateTimeOffset.UtcNow;
+        while (DateTimeOffset.UtcNow - start < timeout)
+        {
+            try
+            {
+                using var response = await client.GetAsync(url, token);
+                if ((int)response.StatusCode < 500)
+                {
+                    return true;
+                }
+            }
+            catch
+            {
+            }
+            await Task.Delay(2000, token);
+        }
+        return false;
+    }
+
+    private static async Task<bool> WaitForRagflowWebReadyAsync(string webUrl, TimeSpan timeout, CancellationToken token)
+    {
+        using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+        var start = DateTimeOffset.UtcNow;
+        while (DateTimeOffset.UtcNow - start < timeout)
+        {
+            try
+            {
+                if (!await IsHttpOkAsync(client, $"{webUrl}/api/v1/system/config", token))
+                {
+                    await Task.Delay(2000, token);
+                    continue;
+                }
+
+                var indexHtml = await client.GetStringAsync($"{webUrl}/", token);
+                if (!indexHtml.Contains("<div id=\"root\"></div>", StringComparison.OrdinalIgnoreCase))
+                {
+                    await Task.Delay(2000, token);
+                    continue;
+                }
+
+                var assetsReady = true;
+                foreach (var assetPath in ExtractStartupAssetPaths(indexHtml))
+                {
+                    if (!await IsHttpOkAsync(client, $"{webUrl}{assetPath}", token))
+                    {
+                        assetsReady = false;
+                        break;
+                    }
+                }
+                if (assetsReady)
+                {
+                    return true;
+                }
+            }
+            catch
+            {
+            }
+            await Task.Delay(2000, token);
+        }
+        return false;
+    }
+
+    private static async Task<bool> IsHttpOkAsync(HttpClient client, string url, CancellationToken token)
+    {
+        using var response = await client.GetAsync(url, token);
+        return response.IsSuccessStatusCode;
+    }
+
+    private static IEnumerable<string> ExtractStartupAssetPaths(string html)
+    {
+        foreach (Match match in Regex.Matches(html, "(?:src|href)=\"(?<path>/(?:entry|chunk|assets)/[^\"]+)\"", RegexOptions.IgnoreCase))
+        {
+            yield return match.Groups["path"].Value;
+        }
+    }
+
+    private static void StartDockerDesktop()
+    {
+        var candidates = new[]
+        {
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Docker", "Docker", "Docker Desktop.exe"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Docker", "Docker Desktop.exe")
+        };
+        var path = candidates.FirstOrDefault(File.Exists);
+        if (path is null)
+        {
+            return;
+        }
+        Process.Start(new ProcessStartInfo
+        {
+            FileName = path,
+            UseShellExecute = true,
+            WindowStyle = ProcessWindowStyle.Hidden
+        });
+    }
+
+    private static async Task<int> RunProcessAsync(string fileName, string arguments, string workingDirectory, CancellationToken token)
+    {
+        Log($"> {fileName} {arguments}");
+        using var process = Process.Start(new ProcessStartInfo
+        {
+            FileName = fileName,
+            Arguments = arguments,
+            WorkingDirectory = workingDirectory,
+            CreateNoWindow = true,
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        });
+        if (process is null)
+        {
+            return -1;
+        }
+
+        process.OutputDataReceived += (_, e) => { if (e.Data is not null) Log(e.Data); };
+        process.ErrorDataReceived += (_, e) => { if (e.Data is not null) Log(e.Data); };
+        process.BeginOutputReadLine();
+        process.BeginErrorReadLine();
+        using var registration = token.Register(() =>
+        {
+            try
+            {
+                if (!process.HasExited)
+                {
+                    process.Kill(entireProcessTree: true);
+                }
+            }
+            catch
+            {
+            }
+        });
+        await process.WaitForExitAsync(token);
+        Log($"< exit {process.ExitCode}");
+        return process.ExitCode;
+    }
+
+    private static void OpenUrl(string url)
+    {
+        try
+        {
+            Process.Start(new ProcessStartInfo { FileName = url, UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            Log("OPEN URL ERROR " + ex.Message);
+        }
+    }
+
+    private static int GetRagflowWebPort(string root)
+    {
+        var envPath = Path.Combine(root, "third_party", "ragflow", "docker", ".env");
         if (!File.Exists(envPath))
         {
             return 80;
         }
         foreach (var line in File.ReadLines(envPath))
         {
-            if (line.StartsWith("SVR_WEB_HTTP_PORT=", StringComparison.Ordinal))
+            if (line.StartsWith("SVR_WEB_HTTP_PORT=", StringComparison.Ordinal) &&
+                int.TryParse(line.Split('=', 2)[1].Trim(), out var port))
             {
-                var raw = line.Split('=', 2)[1].Trim();
-                if (int.TryParse(raw, out var port))
-                {
-                    return port;
-                }
+                return port;
             }
         }
         return 80;
@@ -757,335 +1072,66 @@ MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArq9XTUSeYr2+N1h3Afl/z8Dse/2yD0ZGrKwx
         return candidates.FirstOrDefault() ?? Directory.GetCurrentDirectory();
     }
 
-    private static TrayHostForm CreateMenuHost()
+    public static void WriteStatus(string state, string message)
     {
-        var form = new TrayHostForm
+        var root = FindRoot();
+        var statusPath = Path.Combine(root, "data", "launcher", "startup-status.json");
+        var payload = new
         {
-            FormBorderStyle = FormBorderStyle.FixedToolWindow,
-            ShowInTaskbar = false,
-            StartPosition = FormStartPosition.Manual,
-            Size = new Size(1, 1),
-            Location = new Point(-32000, -32000),
-            Opacity = 0
+            state,
+            message,
+            updated_at = DateTimeOffset.Now
         };
-        form.Show();
-        return form;
+        lock (StatusLock)
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(statusPath) ?? root);
+            File.WriteAllText(statusPath, JsonSerializer.Serialize(payload, new JsonSerializerOptions { WriteIndented = true }), Encoding.UTF8);
+        }
+        Log($"{state}: {message}");
     }
 
-    private void OpenOrFocusAppWindow(string url)
-    {
-        if (TryFocusBrowserProcess())
-        {
-            return;
-        }
-
-        var browser = FindChromiumBrowser();
-        if (browser is not null)
-        {
-            var profileDir = Path.Combine(root, "data", "launcher", "browser-profile");
-            Directory.CreateDirectory(profileDir);
-            browserProcess = Process.Start(new ProcessStartInfo
-            {
-                FileName = browser,
-                Arguments = $"--app=\"{url}\" --user-data-dir=\"{profileDir}\" --no-first-run",
-                UseShellExecute = false
-            });
-            return;
-        }
-
-        OpenUrl(url);
-    }
-
-    private bool TryFocusBrowserProcess()
+    private static void Log(string message)
     {
         try
         {
-            if (browserProcess is null || browserProcess.HasExited)
-            {
-                return false;
-            }
-            browserProcess.Refresh();
-            if (browserProcess.MainWindowHandle == IntPtr.Zero)
-            {
-                return false;
-            }
-            ShowWindow(browserProcess.MainWindowHandle, ShowWindowRestore);
-            SetForegroundWindow(browserProcess.MainWindowHandle);
-            return true;
+            var root = FindRoot();
+            var logPath = Path.Combine(root, "data", "launcher", "startup.log");
+            Directory.CreateDirectory(Path.GetDirectoryName(logPath) ?? root);
+            File.AppendAllText(logPath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {message}\n", Encoding.UTF8);
         }
         catch
         {
-            return false;
         }
-    }
-
-    private static string? FindChromiumBrowser()
-    {
-        var candidates = new[]
-        {
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Microsoft", "Edge", "Application", "msedge.exe"),
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Microsoft", "Edge", "Application", "msedge.exe"),
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Microsoft", "Edge", "Application", "msedge.exe"),
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Google", "Chrome", "Application", "chrome.exe"),
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Google", "Chrome", "Application", "chrome.exe"),
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Google", "Chrome", "Application", "chrome.exe")
-        };
-        return candidates.FirstOrDefault(File.Exists);
-    }
-
-    private static void OpenUrl(string url) => Process.Start(new ProcessStartInfo { FileName = url, UseShellExecute = true });
-
-    private static void OpenPath(string path)
-    {
-        if (!File.Exists(path) && !Directory.Exists(path))
-        {
-            Directory.CreateDirectory(Path.GetDirectoryName(path) ?? path);
-            File.WriteAllText(path, "", Encoding.UTF8);
-        }
-        Process.Start(new ProcessStartInfo { FileName = path, UseShellExecute = true });
     }
 }
 
-internal sealed partial class TrayContext
+
+internal sealed class MutedTrayMenuRenderer : ToolStripProfessionalRenderer
 {
-    private const int ShowWindowRestore = 9;
+    private static readonly Color Back = Color.FromArgb(255, 255, 255);
+    private static readonly Color Border = Color.FromArgb(218, 223, 230);
+    private static readonly Color Hover = Color.FromArgb(244, 246, 248);
+    private static readonly Color Pressed = Color.FromArgb(235, 238, 242);
+    private static readonly Color ImageMargin = Color.FromArgb(255, 255, 255);
 
-    [DllImport("user32.dll")]
-    private static extern bool SetForegroundWindow(IntPtr hWnd);
-
-    [DllImport("user32.dll")]
-    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-
-    [DllImport("user32.dll")]
-    private static extern bool IsWindow(IntPtr hWnd);
-}
-
-internal sealed class TrayHostForm : Form
-{
-    public event EventHandler<Message>? ShellMessage;
-
-    protected override bool ShowWithoutActivation => true;
-
-    protected override void WndProc(ref Message m)
-    {
-        ShellMessage?.Invoke(this, m);
-        base.WndProc(ref m);
-    }
-}
-
-internal sealed class NativeTrayIcon : IDisposable
-{
-    private const uint NimAdd = 0x00000000;
-    private const uint NimModify = 0x00000001;
-    private const uint NimDelete = 0x00000002;
-    private const uint NimSetVersion = 0x00000004;
-    private const uint NifMessage = 0x00000001;
-    private const uint NifIcon = 0x00000002;
-    private const uint NifTip = 0x00000004;
-    private const uint NifInfo = 0x00000010;
-    private const uint CallbackMessage = 0x0400 + 77;
-    private const uint NotifyIconVersion4 = 4;
-    private const int WmLButtonUp = 0x0202;
-    private const int WmLButtonDblClk = 0x0203;
-    private const int WmRButtonUp = 0x0205;
-    private const int WmContextMenu = 0x007B;
-
-    private readonly IntPtr ownerHandle;
-    private readonly IntPtr iconHandle;
-    private readonly uint taskbarCreatedMessage;
-    private string text;
-    private bool visible;
-    private bool disposed;
-
-    public NativeTrayIcon(IntPtr ownerHandle, IntPtr iconHandle, string text)
-    {
-        this.ownerHandle = ownerHandle;
-        this.iconHandle = iconHandle;
-        this.text = text;
-        taskbarCreatedMessage = RegisterWindowMessage("TaskbarCreated");
-    }
-
-    public event EventHandler<string>? Diagnostic;
-    public event EventHandler? LeftClick;
-    public event EventHandler? LeftDoubleClick;
-    public event EventHandler? RightClick;
-    public event EventHandler? TaskbarCreated;
-
-    public string Text
-    {
-        get => text;
-        set
-        {
-            text = value.Length > 127 ? value[..127] : value;
-            if (visible)
-            {
-                Modify(NifMessage | NifIcon | NifTip);
-            }
-        }
-    }
-
-    public void Show()
-    {
-        if (visible)
-        {
-            return;
-        }
-        visible = true;
-        Add();
-        SetVersion();
-    }
-
-    public void ShowBalloonTip(int timeout, string title, string message, ToolTipIcon icon)
-    {
-        if (!visible)
-        {
-            return;
-        }
-        var data = CreateData(NifInfo);
-        data.szInfoTitle = title.Length > 63 ? title[..63] : title;
-        data.szInfo = message.Length > 255 ? message[..255] : message;
-        data.dwInfoFlags = icon switch
-        {
-            ToolTipIcon.Warning => 2,
-            ToolTipIcon.Error => 3,
-            ToolTipIcon.Info => 1,
-            _ => 0
-        };
-        data.uTimeoutOrVersion = (uint)Math.Max(timeout, 0);
-        Shell_NotifyIcon(NimModify, ref data);
-    }
-
-    public void Dispose()
-    {
-        if (disposed)
-        {
-            return;
-        }
-        disposed = true;
-        if (visible)
-        {
-            var data = CreateData(0);
-            Shell_NotifyIcon(NimDelete, ref data);
-            visible = false;
-        }
-    }
-
-    private void Add()
-    {
-        var data = CreateData(NifMessage | NifIcon | NifTip);
-        var ok = Shell_NotifyIcon(NimAdd, ref data);
-        Diagnostic?.Invoke(this, $"Shell_NotifyIcon add ok={ok}, hwnd=0x{ownerHandle.ToInt64():X}, callback=0x{CallbackMessage:X}");
-    }
-
-    private void Modify(uint flags)
-    {
-        var data = CreateData(flags);
-        Shell_NotifyIcon(NimModify, ref data);
-    }
-
-    private void SetVersion()
-    {
-        var data = CreateData(0);
-        data.uTimeoutOrVersion = NotifyIconVersion4;
-        var ok = Shell_NotifyIcon(NimSetVersion, ref data);
-        Diagnostic?.Invoke(this, $"Shell_NotifyIcon set version ok={ok}");
-    }
-
-    private NOTIFYICONDATA CreateData(uint flags)
-    {
-        return new NOTIFYICONDATA
-        {
-            cbSize = Marshal.SizeOf<NOTIFYICONDATA>(),
-            hWnd = ownerHandle,
-            uID = 1,
-            uFlags = flags,
-            uCallbackMessage = CallbackMessage,
-            hIcon = iconHandle,
-            szTip = text.Length > 127 ? text[..127] : text
-        };
-    }
-
-    public void HandleShellMessage(Message message)
-    {
-        if ((uint)message.Msg == taskbarCreatedMessage)
-        {
-            if (visible)
-            {
-                Add();
-            }
-            TaskbarCreated?.Invoke(this, EventArgs.Empty);
-            return;
-        }
-
-        if ((uint)message.Msg != CallbackMessage)
-        {
-            return;
-        }
-
-        var mouseMessage = message.LParam.ToInt32();
-        Diagnostic?.Invoke(this, $"TRAY shell callback lparam=0x{mouseMessage:X}");
-        switch (mouseMessage)
-        {
-            case WmLButtonUp:
-                LeftClick?.Invoke(this, EventArgs.Empty);
-                break;
-            case WmLButtonDblClk:
-                LeftDoubleClick?.Invoke(this, EventArgs.Empty);
-                break;
-            case WmRButtonUp:
-            case WmContextMenu:
-                RightClick?.Invoke(this, EventArgs.Empty);
-                break;
-        }
-    }
-
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-    private struct NOTIFYICONDATA
-    {
-        public int cbSize;
-        public IntPtr hWnd;
-        public uint uID;
-        public uint uFlags;
-        public uint uCallbackMessage;
-        public IntPtr hIcon;
-        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
-        public string szTip;
-        public uint dwState;
-        public uint dwStateMask;
-        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)]
-        public string szInfo;
-        public uint uTimeoutOrVersion;
-        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)]
-        public string szInfoTitle;
-        public uint dwInfoFlags;
-        public Guid guidItem;
-        public IntPtr hBalloonIcon;
-    }
-
-    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
-    private static extern bool Shell_NotifyIcon(uint dwMessage, ref NOTIFYICONDATA lpData);
-
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    private static extern uint RegisterWindowMessage(string lpString);
-}
-
-internal sealed class ModernMenuRenderer : ToolStripProfessionalRenderer
-{
-    private static readonly Color HoverBack = Color.FromArgb(232, 243, 255);
-    private static readonly Color PressedBack = Color.FromArgb(213, 231, 255);
-    private static readonly Color Border = Color.FromArgb(214, 224, 240);
-    private static readonly Color ImageMargin = Color.FromArgb(245, 248, 252);
-
-    public ModernMenuRenderer() : base(new ModernColorTable())
+    public MutedTrayMenuRenderer() : base(new MutedColorTable())
     {
         RoundedEdges = true;
     }
 
+    protected override void OnRenderToolStripBackground(ToolStripRenderEventArgs e)
+    {
+        using var brush = new SolidBrush(Back);
+        e.Graphics.FillRectangle(brush, e.AffectedBounds);
+    }
+
     protected override void OnRenderToolStripBorder(ToolStripRenderEventArgs e)
     {
+        e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
         using var pen = new Pen(Border);
         var rect = new Rectangle(0, 0, e.ToolStrip.Width - 1, e.ToolStrip.Height - 1);
-        e.Graphics.DrawRectangle(pen, rect);
+        using var path = RoundedRect(rect, 8);
+        e.Graphics.DrawPath(pen, path);
     }
 
     protected override void OnRenderImageMargin(ToolStripRenderEventArgs e)
@@ -1096,16 +1142,15 @@ internal sealed class ModernMenuRenderer : ToolStripProfessionalRenderer
 
     protected override void OnRenderMenuItemBackground(ToolStripItemRenderEventArgs e)
     {
-        if (e.Item is not ToolStripMenuItem item || !item.Selected)
+        if (e.Item is not ToolStripMenuItem item || !item.Selected || !item.Enabled)
         {
-            base.OnRenderMenuItemBackground(e);
             return;
         }
 
-        var bounds = new Rectangle(6, 3, e.Item.Width - 12, e.Item.Height - 6);
-        using var path = RoundedRect(bounds, 7);
-        using var brush = new SolidBrush(item.Pressed ? PressedBack : HoverBack);
+        var bounds = new Rectangle(5, 3, e.Item.Width - 10, e.Item.Height - 6);
         e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        using var path = RoundedRect(bounds, 7);
+        using var brush = new SolidBrush(item.Pressed ? Pressed : Hover);
         e.Graphics.FillPath(brush, path);
     }
 
@@ -1113,7 +1158,7 @@ internal sealed class ModernMenuRenderer : ToolStripProfessionalRenderer
     {
         using var pen = new Pen(Border);
         var y = e.Item.Height / 2;
-        e.Graphics.DrawLine(pen, 40, y, e.Item.Width - 10, y);
+        e.Graphics.DrawLine(pen, 12, y, e.Item.Width - 12, y);
     }
 
     private static GraphicsPath RoundedRect(Rectangle rect, int radius)
@@ -1128,117 +1173,17 @@ internal sealed class ModernMenuRenderer : ToolStripProfessionalRenderer
         return path;
     }
 
-    private sealed class ModernColorTable : ProfessionalColorTable
+    private sealed class MutedColorTable : ProfessionalColorTable
     {
+        public override Color ToolStripDropDownBackground => Back;
         public override Color MenuBorder => Border;
-        public override Color ToolStripDropDownBackground => Color.FromArgb(250, 252, 255);
         public override Color ImageMarginGradientBegin => ImageMargin;
         public override Color ImageMarginGradientMiddle => ImageMargin;
         public override Color ImageMarginGradientEnd => ImageMargin;
-        public override Color MenuItemSelected => HoverBack;
-        public override Color MenuItemBorder => HoverBack;
-        public override Color MenuItemPressedGradientBegin => PressedBack;
-        public override Color MenuItemPressedGradientMiddle => PressedBack;
-        public override Color MenuItemPressedGradientEnd => PressedBack;
-    }
-}
-
-internal static class MenuGlyph
-{
-    private static readonly Color Blue = Color.FromArgb(22, 119, 255);
-    private static readonly Color Dark = Color.FromArgb(52, 64, 84);
-    private static readonly Color Red = Color.FromArgb(217, 45, 32);
-
-    public static Image Open() => Draw(g =>
-    {
-        using var pen = Pen(Blue, 2.2f);
-        g.DrawRectangle(pen, 4, 5, 12, 10);
-        g.DrawLine(pen, 9, 10, 16, 3);
-        g.DrawLine(pen, 12, 3, 16, 3);
-        g.DrawLine(pen, 16, 3, 16, 7);
-    });
-
-    public static Image Link() => Draw(g =>
-    {
-        using var pen = Pen(Blue, 2.2f);
-        g.DrawArc(pen, 3, 5, 9, 9, 120, 220);
-        g.DrawArc(pen, 8, 5, 9, 9, -60, 220);
-        g.DrawLine(pen, 8, 10, 12, 10);
-    });
-
-    public static Image Folder() => Draw(g =>
-    {
-        using var pen = Pen(Blue, 2f);
-        using var brush = new SolidBrush(Color.FromArgb(232, 243, 255));
-        var body = new Rectangle(3, 7, 14, 9);
-        g.FillRectangle(brush, body);
-        g.DrawRectangle(pen, body);
-        g.DrawLine(pen, 4, 7, 7, 4);
-        g.DrawLine(pen, 7, 4, 11, 4);
-        g.DrawLine(pen, 11, 4, 13, 7);
-    });
-
-    public static Image Log() => Draw(g =>
-    {
-        using var pen = Pen(Dark, 1.8f);
-        g.DrawRectangle(pen, 5, 3, 10, 14);
-        g.DrawLine(pen, 7, 7, 13, 7);
-        g.DrawLine(pen, 7, 10, 13, 10);
-        g.DrawLine(pen, 7, 13, 11, 13);
-    });
-
-    public static Image Exit() => Draw(g =>
-    {
-        using var pen = Pen(Red, 2.2f);
-        g.DrawLine(pen, 6, 6, 14, 14);
-        g.DrawLine(pen, 14, 6, 6, 14);
-    });
-
-    public static Image Play() => Draw(g =>
-    {
-        using var brush = new SolidBrush(Blue);
-        var points = new[] { new PointF(7, 5), new PointF(15, 10), new PointF(7, 15) };
-        g.FillPolygon(brush, points);
-    });
-
-    public static Image Stop() => Draw(g =>
-    {
-        using var brush = new SolidBrush(Dark);
-        g.FillRectangle(brush, 6, 6, 9, 9);
-    });
-
-    public static Image Restart() => Draw(g =>
-    {
-        using var pen = Pen(Blue, 2.1f);
-        g.DrawArc(pen, 4, 4, 12, 12, 35, 285);
-        using var brush = new SolidBrush(Blue);
-        var points = new[] { new PointF(13, 3), new PointF(17, 4), new PointF(15, 8) };
-        g.FillPolygon(brush, points);
-    });
-
-    public static Image Status(Color color) => Draw(g =>
-    {
-        using var brush = new SolidBrush(color);
-        g.FillEllipse(brush, 6, 6, 8, 8);
-    });
-
-    private static Bitmap Draw(Action<Graphics> paint)
-    {
-        var bmp = new Bitmap(20, 20);
-        using var g = Graphics.FromImage(bmp);
-        g.SmoothingMode = SmoothingMode.AntiAlias;
-        g.Clear(Color.Transparent);
-        paint(g);
-        return bmp;
-    }
-
-    private static Pen Pen(Color color, float width)
-    {
-        return new Pen(color, width)
-        {
-            StartCap = LineCap.Round,
-            EndCap = LineCap.Round,
-            LineJoin = LineJoin.Round
-        };
+        public override Color MenuItemSelected => Hover;
+        public override Color MenuItemBorder => Hover;
+        public override Color MenuItemPressedGradientBegin => Pressed;
+        public override Color MenuItemPressedGradientMiddle => Pressed;
+        public override Color MenuItemPressedGradientEnd => Pressed;
     }
 }
