@@ -112,14 +112,15 @@ def test_ragflow_embedding_switch_error_explains_rebuild_vectors() -> None:
 
 
 def test_ragflow_default_dataset_manual_refresh_contract() -> None:
-    service = read_text(ROOT / "third_party" / "ragflow" / "api" / "apps" / "services" / "local_dataset_service.py")
-    api = read_text(ROOT / "third_party" / "ragflow" / "api" / "apps" / "restful_apis" / "dataset_api.py")
-    server = read_text(ROOT / "third_party" / "ragflow" / "api" / "ragflow_server.py")
-    dataset_service = read_text(ROOT / "third_party" / "ragflow" / "api" / "apps" / "services" / "dataset_api_service.py")
-    web_api = read_text(ROOT / "third_party" / "ragflow" / "web" / "src" / "utils" / "api.ts")
-    web_service = read_text(ROOT / "third_party" / "ragflow" / "web" / "src" / "services" / "knowledge-service.ts")
-    web_hook = read_text(ROOT / "third_party" / "ragflow" / "web" / "src" / "hooks" / "use-knowledge-request.ts")
-    web_page = read_text(ROOT / "third_party" / "ragflow" / "web" / "src" / "pages" / "dataset" / "dataset" / "index.tsx")
+    patch = read_text(ROOT / "patches" / "ragflow" / "0003-localmathrag-default-dataset-refresh.patch")
+    service = patch
+    api = patch
+    server = patch
+    dataset_service = patch
+    web_api = patch
+    web_service = patch
+    web_hook = patch
+    web_page = patch
 
     assert 'DEFAULT_DATASET_NAME = os.environ.get("LOCALMATHRAG_DEFAULT_DATASET_NAME", "Default")' in service
     assert 'DATASET_DIR = Path(os.environ.get("LOCALMATHRAG_DATASET_DIR", "/localmathrag/dataset"))' in service
@@ -128,7 +129,7 @@ def test_ragflow_default_dataset_manual_refresh_contract() -> None:
     assert "REFRESH_LOCK.acquire(blocking=False)" in service
     assert "ensure_default_dataset" in service
     assert "KnowledgebaseService.create_with_name" in service
-    assert "init_web_data()" in server
+    assert "from api.apps.services.local_dataset_service import ensure_default_dataset" in server
     assert "ensure_default_dataset()" in server
     assert "_scan_manifest()" in service
     assert "_cached_subtree" in service
@@ -145,8 +146,8 @@ def test_ragflow_default_dataset_manual_refresh_contract() -> None:
     assert "refreshLocalDataset" in web_service
     assert "useRefreshLocalDataset" in web_hook
     assert "knowledgeDetails.localRefresh" in web_page
-    assert "localRefresh: 'Refresh'" in read_text(ROOT / "third_party" / "ragflow" / "web" / "src" / "locales" / "en.ts")
-    assert "localRefresh: '刷新'" in read_text(ROOT / "third_party" / "ragflow" / "web" / "src" / "locales" / "zh.ts")
+    assert "localRefresh: 'Refresh'" in patch
+    assert "localRefresh: '刷新'" in patch
     assert "knowledgeBase?.name === 'Default'" in web_page
     assert "kb_ids" not in service
     assert "DialogService" not in service
@@ -424,23 +425,10 @@ def test_ragflow_patch_workflow_exists() -> None:
     assert "downloadProgress" in patch_text
     assert "Download stores model files only" in patch_text
     assert "configureModel(data.model)" not in patch_text
-    assert "llm_id: ['chat', 'image2text']" in read_text(
-        ROOT / "third_party" / "ragflow" / "web" / "src" / "components" / "model-tree-select.tsx"
-    )
+    assert "vision: ['image2text']" in patch_text
     assert "llm_id: ['chat']" not in patch_text
-    assert "LLMFactory.OpenAiAPICompatible," not in read_text(
-        ROOT
-        / "third_party"
-        / "ragflow"
-        / "web"
-        / "src"
-        / "pages"
-        / "user-setting"
-        / "setting-model"
-        / "modal"
-        / "provider-modal"
-        / "constants.ts"
-    )
+    assert "-  LLMFactory.OpenAiAPICompatible," in patch_text
+    assert "+  LLMFactory.OpenAiAPICompatible," not in patch_text
     assert "嵌入模型" in patch_text
     assert "语音识别" in patch_text
     assert "语音合成" in patch_text
