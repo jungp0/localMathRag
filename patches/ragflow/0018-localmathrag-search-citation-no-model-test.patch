@@ -1,0 +1,88 @@
+diff --git a/api/db/services/dialog_service.py b/api/db/services/dialog_service.py
+--- a/api/db/services/dialog_service.py
++++ b/api/db/services/dialog_service.py
+@@ -221,6 +221,10 @@ def _localmathrag_search_citation_timeout_seconds():
+     return _localmathrag_float_env("LOCALMATHRAG_SEARCH_CITATION_TIMEOUT_SECONDS", 20.0, 1.0)
+ 
+ 
++def _localmathrag_search_citation_use_model():
++    return _localmathrag_bool_env("LOCALMATHRAG_SEARCH_CITATION_USE_MODEL", False)
++
++
+ def _localmathrag_fast_reference(kbinfos, max_chunks=12):
+     refs = deepcopy(kbinfos)
+     chunks = refs.get("chunks", [])
+@@ -2026,11 +2030,13 @@ async def async_ask(question, kb_ids, tenant_id, chat_llm_name=None, search_confi
+     full_answer = last_state.full_text if summary_completed and last_state else ""
++    citation_use_model = _localmathrag_search_citation_use_model()
+     yield {
+         "answer": "",
+         "reference": {},
+         "final": False,
+         "progress": _localmathrag_search_progress(
+-            "citations",
++            "citations" if citation_use_model else "references",
+             90,
+-            "Preparing citations",
++            "Preparing citations" if citation_use_model else "Preparing references",
+             citation_timeout_seconds=_localmathrag_search_citation_timeout_seconds(),
++            citation_use_model=citation_use_model,
+         ),
+@@ -2040,29 +2045,38 @@ async def async_ask(question, kb_ids, tenant_id, chat_llm_name=None, search_confi
+             f"\u539f\u56e0\uff1a{last_error}"
+         )
+     visible_answer = _extract_visible_answer(full_answer)
+-    try:
+-        with localmathrag_embedding_purpose("citation"):
+-            final = await asyncio.wait_for(
+-                decorate_answer(visible_answer),
+-                timeout=_localmathrag_search_citation_timeout_seconds(),
+-            )
+-    except asyncio.TimeoutError:
+-        logging.warning(
+-            "LocalMathRAG search citation preparation timed out after %.0fs; returning answer with lightweight references",
+-            _localmathrag_search_citation_timeout_seconds(),
+-        )
++    if not citation_use_model:
++        logging.info("LocalMathRAG search citation model disabled; returning lightweight references without inline citations")
+         final = {
+             "answer": visible_answer,
+             "reference": _localmathrag_fast_reference(kbinfos),
+-            "citation_warning": "citation preparation timed out; returned answer with lightweight references",
++            "citation_warning": "citation model disabled; returned answer with lightweight references",
++            "citation_model_disabled": True,
+         }
+-    except Exception as exc:  # noqa: BLE001 - citation failures should not drop a completed answer
+-        logging.warning("LocalMathRAG search citation preparation failed; returning answer without inline citations: %s", exc)
+-        final = {
+-            "answer": visible_answer,
+-            "reference": _localmathrag_fast_reference(kbinfos),
+-            "citation_warning": f"citation preparation failed: {exc}",
+-        }
++    else:
++        try:
++            with localmathrag_embedding_purpose("citation"):
++                final = await asyncio.wait_for(
++                    decorate_answer(visible_answer),
++                    timeout=_localmathrag_search_citation_timeout_seconds(),
++                )
++        except asyncio.TimeoutError:
++            logging.warning(
++                "LocalMathRAG search citation preparation timed out after %.0fs; returning answer with lightweight references",
++                _localmathrag_search_citation_timeout_seconds(),
++            )
++            final = {
++                "answer": visible_answer,
++                "reference": _localmathrag_fast_reference(kbinfos),
++                "citation_warning": "citation preparation timed out; returned answer with lightweight references",
++            }
++        except Exception as exc:  # noqa: BLE001 - citation failures should not drop a completed answer
++            logging.warning("LocalMathRAG search citation preparation failed; returning answer without inline citations: %s", exc)
++            final = {
++                "answer": visible_answer,
++                "reference": _localmathrag_fast_reference(kbinfos),
++                "citation_warning": f"citation preparation failed: {exc}",
++            }
+     final["final"] = True
+     if not summary_completed and last_error:
+         final["answer_reset"] = True

@@ -1,0 +1,34 @@
+diff --git a/rag/nlp/search.py b/rag/nlp/search.py
+index 3a702f3..e230eef 100644
+--- a/rag/nlp/search.py
++++ b/rag/nlp/search.py
+@@ -639,15 +639,20 @@ class Dealer:
+         )
+ 
+         if rerank_mdl and sres.total > 0:
+-            sim, tsim, vsim = self.rerank_by_model(
+-                rerank_mdl,
+-                sres,
+-                question,
+-                term_similarity_weight,
+-                vector_similarity_weight,
+-                rank_feature=rank_feature,
+-            )
+-        else:
++            try:
++                sim, tsim, vsim = self.rerank_by_model(
++                    rerank_mdl,
++                    sres,
++                    question,
++                    term_similarity_weight,
++                    vector_similarity_weight,
++                    rank_feature=rank_feature,
++                )
++            except Exception:
++                logging.exception("[Search] external rerank failed; falling back to ES/KNN scoring")
++                rerank_mdl = None
++
++        if not rerank_mdl:
+             if settings.DOC_ENGINE_INFINITY:
+                 # Don't need rerank here since Infinity normalizes each way score before fusion.
+                 sim = [sres.field[id].get("_score", 0.0) for id in sres.ids]

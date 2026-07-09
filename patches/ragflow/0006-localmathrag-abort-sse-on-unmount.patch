@@ -1,0 +1,133 @@
+diff --git a/web/src/hooks/logic-hooks.ts b/web/src/hooks/logic-hooks.ts
+--- a/web/src/hooks/logic-hooks.ts
++++ b/web/src/hooks/logic-hooks.ts
+@@ -211,9 +211,20 @@ export const useSendMessageWithSse = () => {
+     useSetDoneRecord();
+   const timer = useRef<any>();
+   const sseRef = useRef<AbortController>();
++  const activeControllerRef = useRef<AbortController>();
+ 
+-  const initializeSseRef = useCallback(() => {
+-    sseRef.current = new AbortController();
++  const initializeSseRef = useCallback((controller?: AbortController) => {
++    if (controller) {
++      sseRef.current?.abort();
++      activeControllerRef.current = controller;
++      return controller;
++    }
++
++    activeControllerRef.current?.abort();
++    const nextController = new AbortController();
++    sseRef.current = nextController;
++    activeControllerRef.current = nextController;
++    return nextController;
+   }, []);
+ 
+   const resetAnswer = useCallback(() => {
+@@ -243,7 +254,7 @@ export const useSendMessageWithSse = () => {
+       body: any,
+       controller?: AbortController,
+     ): Promise<{ response: Response; data: ResponseType } | undefined> => {
+-      initializeSseRef();
++      const activeController = initializeSseRef(controller);
+       try {
+         setDoneValue(body, false);
+         const response = await fetch(url, {
+@@ -253,7 +264,7 @@ export const useSendMessageWithSse = () => {
+             'Content-Type': 'application/json',
+           },
+           body: JSON.stringify(omit(body, 'chatBoxId')),
+-          signal: controller?.signal || sseRef.current?.signal,
++          signal: activeController.signal,
+         });
+ 
+         const res = response.clone().json();
+@@ -329,7 +340,16 @@ export const useSendMessageWithSse = () => {
+   );
+ 
+   const stopOutputMessage = useCallback(() => {
+-    sseRef.current?.abort();
++    activeControllerRef.current?.abort();
++  }, []);
++
++  useEffect(() => {
++    return () => {
++      activeControllerRef.current?.abort();
++      if (timer.current) {
++        clearTimeout(timer.current);
++      }
++    };
+   }, []);
+ 
+   return {
+diff --git a/web/src/hooks/use-send-message.ts b/web/src/hooks/use-send-message.ts
+--- a/web/src/hooks/use-send-message.ts
++++ b/web/src/hooks/use-send-message.ts
+@@ -5,7 +5,7 @@ import { IReferenceObject } from '@/interfaces/database/chat';
+ import { BeginQuery } from '@/pages/agent/interface';
+ import { getAuthorization } from '@/utils/authorization-util';
+ import { EventSourceParserStream } from 'eventsource-parser/stream';
+-import { useCallback, useRef, useState } from 'react';
++import { useCallback, useEffect, useRef, useState } from 'react';
+ 
+ export enum MessageEventType {
+   WorkflowStarted = 'workflow_started',
+@@ -114,9 +114,20 @@ export const useSendMessageBySSE = (url: string) => {
+   const [done, setDone] = useState(true);
+   const timer = useRef<any>();
+   const sseRef = useRef<AbortController>();
++  const activeControllerRef = useRef<AbortController>();
+ 
+-  const initializeSseRef = useCallback(() => {
+-    sseRef.current = new AbortController();
++  const initializeSseRef = useCallback((controller?: AbortController) => {
++    if (controller) {
++      sseRef.current?.abort();
++      activeControllerRef.current = controller;
++      return controller;
++    }
++
++    activeControllerRef.current?.abort();
++    const nextController = new AbortController();
++    sseRef.current = nextController;
++    activeControllerRef.current = nextController;
++    return nextController;
+   }, []);
+ 
+   const resetAnswerList = useCallback(() => {
+@@ -134,7 +145,7 @@ export const useSendMessageBySSE = (url: string) => {
+       body: any,
+       controller?: AbortController,
+     ): Promise<{ response: Response; data: ResponseType } | undefined> => {
+-      initializeSseRef();
++      const activeController = initializeSseRef(controller);
+       try {
+         setDone(false);
+         const response = await fetch(url, {
+@@ -144,7 +155,7 @@ export const useSendMessageBySSE = (url: string) => {
+             'Content-Type': 'application/json',
+           },
+           body: JSON.stringify(body),
+-          signal: controller?.signal || sseRef.current?.signal,
++          signal: activeController.signal,
+         });
+         // SSE streams (text/event-stream) emit `data: {...}\n\n` frames, not
+         // a single JSON document. The .clone().json() call below is kept
+@@ -269,7 +280,16 @@ export const useSendMessageBySSE = (url: string) => {
+   );
+ 
+   const stopOutputMessage = useCallback(() => {
+-    sseRef.current?.abort();
++    activeControllerRef.current?.abort();
++  }, []);
++
++  useEffect(() => {
++    return () => {
++      activeControllerRef.current?.abort();
++      if (timer.current) {
++        clearTimeout(timer.current);
++      }
++    };
+   }, []);
+ 
+   return {

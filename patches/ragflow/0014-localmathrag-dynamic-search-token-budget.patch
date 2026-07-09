@@ -1,0 +1,131 @@
+diff --git a/api/db/services/dialog_service.py b/api/db/services/dialog_service.py
+--- a/api/db/services/dialog_service.py
++++ b/api/db/services/dialog_service.py
+@@ -82,13 +82,86 @@ def _localmathrag_float_env(name, default, minimum=0.1):
+     raw = os.environ.get(name)
+     if raw is None:
+         return default
+     try:
+         return max(minimum, float(raw))
+     except (TypeError, ValueError):
+         logging.warning("Invalid %s=%r; using %s", name, raw, default)
+         return default
+ 
+ 
++def _localmathrag_bool_env(name, default=True):
++    raw = os.environ.get(name)
++    if raw is None:
++        return default
++    return str(raw).strip().lower() not in {"0", "false", "no", "off"}
++
++
++def _localmathrag_clamp(value, minimum, maximum):
++    return max(minimum, min(maximum, value))
++
++
++def _localmathrag_search_token_budgets(max_tokens, question):
++    default_answer_token_budget = min(1024, max(512, int(max_tokens * 0.125)))
++    default_knowledge_token_budget = min(4096, max(1024, int(max_tokens * 0.25)))
++    if not _localmathrag_bool_env("LOCALMATHRAG_SEARCH_DYNAMIC_TOKEN_BUDGET", True):
++        return {
++            "mode": "fixed",
++            "reserved_token_budget": 0,
++            "answer_token_budget": min(
++                max_tokens,
++                _localmathrag_int_env("LOCALMATHRAG_SEARCH_ANSWER_TOKEN_BUDGET", default_answer_token_budget, 128),
++            ),
++            "knowledge_token_budget": min(
++                max_tokens,
++                _localmathrag_int_env("LOCALMATHRAG_SEARCH_KNOWLEDGE_TOKEN_BUDGET", default_knowledge_token_budget, 512),
++            ),
++        }
++
++    default_reserved = max(2048, int(max_tokens * 0.12))
++    reserved = min(max_tokens - 1024, _localmathrag_int_env("LOCALMATHRAG_SEARCH_CONTEXT_RESERVED_TOKENS", default_reserved, 512))
++    available = max(1024, max_tokens - reserved)
++    question_tokens = num_tokens_from_string(question or "")
++    answer_min = _localmathrag_int_env("LOCALMATHRAG_SEARCH_ANSWER_TOKEN_BUDGET_MIN", 1024, 128)
++    answer_max = _localmathrag_int_env(
++        "LOCALMATHRAG_SEARCH_ANSWER_TOKEN_BUDGET_MAX",
++        min(8192, max(2048, int(max_tokens * 0.25))),
++        answer_min,
++    )
++    knowledge_min = _localmathrag_int_env("LOCALMATHRAG_SEARCH_KNOWLEDGE_TOKEN_BUDGET_MIN", 2048, 512)
++    knowledge_max = _localmathrag_int_env(
++        "LOCALMATHRAG_SEARCH_KNOWLEDGE_TOKEN_BUDGET_MAX",
++        min(16384, max(4096, int(max_tokens * 0.55))),
++        knowledge_min,
++    )
++    answer_ratio = _localmathrag_float_env("LOCALMATHRAG_SEARCH_ANSWER_TOKEN_BUDGET_RATIO", 0.28, 0.05)
++    knowledge_ratio = _localmathrag_float_env("LOCALMATHRAG_SEARCH_KNOWLEDGE_TOKEN_BUDGET_RATIO", 0.60, 0.05)
++
++    answer = _localmathrag_clamp(int(available * answer_ratio), answer_min, answer_max)
++    if question_tokens > 512:
++        answer = min(answer_max, answer + min(1024, int(question_tokens * 0.25)))
++    knowledge = _localmathrag_clamp(int(available * knowledge_ratio), knowledge_min, knowledge_max)
++
++    if answer + knowledge > available:
++        knowledge = min(knowledge, max(512, available - answer))
++    if answer + knowledge > available:
++        answer = min(answer, max(128, available - knowledge))
++
++    return {
++        "mode": "dynamic",
++        "reserved_token_budget": reserved,
++        "available_token_budget": available,
++        "question_token_count": question_tokens,
++        "answer_token_budget": int(answer),
++        "knowledge_token_budget": int(knowledge),
++        "answer_token_budget_min": answer_min,
++        "answer_token_budget_max": answer_max,
++        "knowledge_token_budget_min": knowledge_min,
++        "knowledge_token_budget_max": knowledge_max,
++        "answer_token_budget_ratio": answer_ratio,
++        "knowledge_token_budget_ratio": knowledge_ratio,
++    }
++
++
+ def _localmathrag_search_budget_attempts(answer_budget, knowledge_budget):
+     max_retries = _localmathrag_int_env("LOCALMATHRAG_SEARCH_SUMMARY_MAX_RETRIES", 1, 0)
+     ratio = _localmathrag_float_env("LOCALMATHRAG_SEARCH_SUMMARY_RETRY_BUDGET_RATIO", 0.5, 0.1)
+@@ -1818,21 +1891,18 @@ async def async_ask(question, kb_ids, tenant_id, chat_llm_name=None, search_confi
+         )
+         _enrich_chunks_with_document_metadata(kbinfos.get("chunks", []), metadata_fields)
+ 
+-    default_answer_token_budget = min(1024, max(512, int(max_tokens * 0.125)))
+-    default_knowledge_token_budget = min(4096, max(1024, int(max_tokens * 0.25)))
+-    answer_token_budget = min(
+-        max_tokens,
+-        _localmathrag_int_env("LOCALMATHRAG_SEARCH_ANSWER_TOKEN_BUDGET", default_answer_token_budget, 128),
+-    )
+-    knowledge_token_budget = min(
+-        max_tokens,
+-        _localmathrag_int_env("LOCALMATHRAG_SEARCH_KNOWLEDGE_TOKEN_BUDGET", default_knowledge_token_budget, 512),
+-    )
++    budget = _localmathrag_search_token_budgets(max_tokens, question)
++    answer_token_budget = budget["answer_token_budget"]
++    knowledge_token_budget = budget["knowledge_token_budget"]
+     logging.info(
+-        "Search async_ask token budget: max=%s knowledge=%s answer=%s",
++        "Search async_ask token budget: mode=%s max=%s reserved=%s available=%s knowledge=%s answer=%s question=%s",
++        budget.get("mode"),
+         max_tokens,
++        budget.get("reserved_token_budget"),
++        budget.get("available_token_budget"),
+         knowledge_token_budget,
+         answer_token_budget,
++        budget.get("question_token_count"),
+     )
+     msg = [{"role": "user", "content": question}]
+ 
+@@ -1877,6 +1947,10 @@ async def async_ask(question, kb_ids, tenant_id, chat_llm_name=None, search_confi
+                 "Retrying summary with reduced context" if attempt["degraded"] else "Generating summary",
+                 attempt=attempt["attempt"],
+                 max_attempts=len(attempts),
++                budget_mode=budget.get("mode"),
++                reserved_token_budget=budget.get("reserved_token_budget"),
++                available_token_budget=budget.get("available_token_budget"),
++                question_token_count=budget.get("question_token_count"),
+                 answer_token_budget=attempt["answer_token_budget"],
+                 knowledge_token_budget=attempt["knowledge_token_budget"],
+             ),

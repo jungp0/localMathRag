@@ -15,11 +15,40 @@ $env:LOCALMATHRAG_ROOT = $Root.Path
 
 Push-Location $RagflowDocker
 try {
-    if ($Volumes) {
-        docker compose -f docker-compose.yml -f $Override down -v
+    $profiles = @(
+        "elasticsearch",
+        "infinity",
+        "opensearch",
+        "oceanbase",
+        "seekdb",
+        "deepdoc",
+        "sandbox",
+        "cpu",
+        "gpu",
+        "llama-cpp-cpu",
+        "llama-cpp-cuda",
+        "embedding-cpu",
+        "embedding-cuda",
+        "rerank-cpu",
+        "rerank-cuda",
+        "vlm-cuda",
+        "vlm-local",
+        "asr-cuda",
+        "asr-local",
+        "tts-cuda",
+        "tts-local"
+    )
+    $composeArgs = @("compose")
+    foreach ($profile in $profiles) {
+        $composeArgs += @("--profile", $profile)
     }
-    else {
-        docker compose -f docker-compose.yml -f $Override down
+    $composeArgs += @("-f", "docker-compose.yml", "-f", $Override, "down", "--remove-orphans")
+    if ($Volumes) {
+        $composeArgs += "-v"
+    }
+    docker @composeArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "docker compose down failed with exit code $LASTEXITCODE."
     }
 }
 finally {

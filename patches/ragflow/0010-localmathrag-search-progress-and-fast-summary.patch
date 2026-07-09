@@ -1,0 +1,217 @@
+diff --git a/api/db/services/dialog_service.py b/api/db/services/dialog_service.py
+--- a/api/db/services/dialog_service.py
++++ b/api/db/services/dialog_service.py
+@@ -15,6 +15,7 @@
+ #
+ import asyncio
+ import logging
++import os
+ import re
+ import time
+ import uuid
+@@ -52,6 +53,26 @@
+ from rag.utils.tts_cache import synthesize_with_cache
+ from common.string_utils import remove_redundant_spaces
+ from common import settings
++
++
++def _localmathrag_int_env(name, default, minimum=1):
++    raw = os.environ.get(name)
++    if raw is None:
++        return default
++    try:
++        return max(minimum, int(raw))
++    except (TypeError, ValueError):
++        logging.warning("Invalid %s=%r; using %s", name, raw, default)
++        return default
++
++
++def _localmathrag_search_progress(stage, percent, message, **extra):
++    return {
++        "stage": stage,
++        "percent": max(0, min(100, int(percent))),
++        "message": message,
++        **extra,
++    }
+ 
+ 
+ def _chunk_kb_id_for_doc(row_dict, kb_ids, doc_id):
+@@ -1636,6 +1657,12 @@
+             error = "**ERROR**: The selected KB is not valid"
+         yield {"answer": error, "reference": {}, "final": True}
+         return
++    yield {
++        "answer": "",
++        "reference": {},
++        "final": False,
++        "progress": _localmathrag_search_progress("initializing", 5, "Preparing local search"),
++    }
+ 
+     embedding_list = list(set([kb.embd_id for kb in kbs]))
+ 
+@@ -1676,6 +1703,12 @@
+         vector_similarity_weight,
+         full_text_weight,
+     )
++    yield {
++        "answer": "",
++        "reference": {},
++        "final": False,
++        "progress": _localmathrag_search_progress("retrieval", 15, "Retrieving and ranking chunks"),
++    }
+ 
+     kbinfos = await retriever.retrieval(
+         question=question,
+@@ -1693,6 +1726,18 @@
+         rank_feature=label_question(question, kbs),
+         trace_id=search_id,
+     )
++    chunk_count = len(kbinfos.get("chunks", []))
++    yield {
++        "answer": "",
++        "reference": {},
++        "final": False,
++        "progress": _localmathrag_search_progress(
++            "retrieved",
++            45,
++            "Retrieved matching chunks",
++            chunk_count=chunk_count,
++        ),
++    }
+     if include_reference_metadata:
+         logging.debug(
+             "reference_metadata enrichment enabled for async_ask: chunk_count=%d metadata_fields=%s",
+@@ -1701,8 +1746,16 @@
+         )
+         _enrich_chunks_with_document_metadata(kbinfos.get("chunks", []), metadata_fields)
+ 
+-    answer_token_budget = min(4096, max(1536, int(max_tokens * 0.25)))
+-    knowledge_token_budget = min(8192, max(2048, int(max_tokens * 0.5)))
++    default_answer_token_budget = min(1024, max(512, int(max_tokens * 0.125)))
++    default_knowledge_token_budget = min(4096, max(1024, int(max_tokens * 0.25)))
++    answer_token_budget = min(
++        max_tokens,
++        _localmathrag_int_env("LOCALMATHRAG_SEARCH_ANSWER_TOKEN_BUDGET", default_answer_token_budget, 128),
++    )
++    knowledge_token_budget = min(
++        max_tokens,
++        _localmathrag_int_env("LOCALMATHRAG_SEARCH_KNOWLEDGE_TOKEN_BUDGET", default_knowledge_token_budget, 512),
++    )
+     logging.info(
+         "Search async_ask token budget: max=%s knowledge=%s answer=%s",
+         max_tokens,
+@@ -1740,6 +1793,18 @@
+         msg,
+         {"temperature": 0.1, "max_tokens": answer_token_budget},
+     )
++    yield {
++        "answer": "",
++        "reference": {},
++        "final": False,
++        "progress": _localmathrag_search_progress(
++            "summary",
++            60,
++            "Generating summary",
++            answer_token_budget=answer_token_budget,
++            knowledge_token_budget=knowledge_token_budget,
++        ),
++    }
+     last_state = None
+     async for kind, value, state in _stream_with_think_delta(stream_iter):
+         last_state = state
+@@ -1749,9 +1814,16 @@
+             continue
+         yield {"answer": value, "reference": {}, "final": False}
+     full_answer = last_state.full_text if last_state else ""
++    yield {
++        "answer": "",
++        "reference": {},
++        "final": False,
++        "progress": _localmathrag_search_progress("citations", 90, "Preparing citations"),
++    }
+     final = await decorate_answer(_extract_visible_answer(full_answer))
+     final["final"] = True
+     final["answer"] = ""
++    final["progress"] = _localmathrag_search_progress("done", 100, "Search complete")
+     yield final
+ 
+ 
+diff --git a/web/src/hooks/logic-hooks.ts b/web/src/hooks/logic-hooks.ts
+--- a/web/src/hooks/logic-hooks.ts
++++ b/web/src/hooks/logic-hooks.ts
+@@ -313,6 +313,7 @@
+                       answer: newAnswer,
+                       conversationId: body?.session_id ?? body?.conversation_id,
+                       chatBoxId: body.chatBoxId,
++                      progress: d.progress ?? prev.progress,
+                     };
+                   });
+                 }
+diff --git a/web/src/interfaces/database/chat.ts b/web/src/interfaces/database/chat.ts
+--- a/web/src/interfaces/database/chat.ts
++++ b/web/src/interfaces/database/chat.ts
+@@ -144,6 +144,15 @@
+   doc_aggs: Record<string, Docagg>;
+ }
+ 
++export interface ISearchProgress {
++  stage: string;
++  percent: number;
++  message?: string;
++  chunk_count?: number;
++  answer_token_budget?: number;
++  knowledge_token_budget?: number;
++}
++
+ export interface IAnswer {
+   answer: string;
+   attachment?: IAttachment;
+@@ -155,6 +164,7 @@
+   audio_binary?: string;
+   data?: any;
+   chatBoxId?: string;
++  progress?: ISearchProgress;
+ }
+ 
+ export interface Docagg {
+diff --git a/web/src/pages/next-search/search-view.tsx b/web/src/pages/next-search/search-view.tsx
+--- a/web/src/pages/next-search/search-view.tsx
++++ b/web/src/pages/next-search/search-view.tsx
+@@ -12,6 +12,7 @@
+   PopoverContent,
+   PopoverTrigger,
+ } from '@/components/ui/popover';
++import { Progress } from '@/components/ui/progress';
+ import { IReference } from '@/interfaces/database/chat';
+ import { cn } from '@/lib/utils';
+ import { isEmpty } from 'lodash';
+@@ -73,6 +74,11 @@
+ 
+   const [searchText, setSearchText] = useState<string>('');
+   const [retrievalLoading, setRetrievalLoading] = useState(false);
++  const searchProgress = answer.progress;
++  const progressPercent = Math.max(
++    0,
++    Math.min(100, Number(searchProgress?.percent ?? 0)),
++  );
+ 
+   useEffect(() => {
+     setSearchText(searchStr);
+@@ -160,6 +166,17 @@
+                 <div className="flex justify-start items-start text-text-primary text-2xl">
+                   {t('search.AISummary')}
+                 </div>
++                {sendingLoading && searchProgress && (
++                  <div className="mt-3">
++                    <div className="flex items-center justify-between text-xs text-text-secondary">
++                      <span>
++                        {searchProgress.message || searchProgress.stage}
++                      </span>
++                      <span>{progressPercent}%</span>
++                    </div>
++                    <Progress className="mt-2 h-1.5" value={progressPercent} />
++                  </div>
++                )}
+                 {isEmpty(answer) && sendingLoading ? (
+                   <SkeletonCard className=" mt-2" />
+                 ) : (

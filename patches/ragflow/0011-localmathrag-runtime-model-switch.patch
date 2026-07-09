@@ -1,0 +1,122 @@
+diff --git a/api/apps/services/models_api_service.py b/api/apps/services/models_api_service.py
+--- a/api/apps/services/models_api_service.py
++++ b/api/apps/services/models_api_service.py
+@@ -15,6 +15,9 @@
+ #
+ import os
+ import logging
++import json
++import urllib.error
++import urllib.request
+ 
+ from api.db.joint_services.tenant_model_service import ensure_mineru_from_env, ensure_paddleocr_from_env, ensure_opendataloader_from_env
+ from common.constants import ActiveStatusEnum, LLMType
+@@ -45,6 +48,93 @@ MODEL_TAG_TO_TYPE = {
+     "ocr": "ocr",
+ }
+ 
++LOCALMATHRAG_RUNTIME_SWITCH_URL = os.getenv(
++    "LOCALMATHRAG_RUNTIME_SWITCH_URL",
++    "http://localmathrag-object-service:8088/v1/runtime/switch-model",
++)
++
++
++def _is_local_openai_compatible(provider_name: str, base_url: str | None) -> bool:
++    if provider_name not in {"OpenAI-API-Compatible", "VLLM", "LM-Studio"}:
++        return False
++    normalized = (base_url or "").lower()
++    return any(
++        marker in normalized
++        for marker in (
++            "127.0.0.1",
++            "localhost",
++            "host.docker.internal",
++            "localmathrag",
++            "llama",
++        )
++    )
++
++
++def _runtime_kind_for_model_type(model_type: str) -> str | None:
++    normalized = MODEL_TAG_TO_TYPE.get(model_type, model_type)
++    if normalized in {"chat", "embedding", "rerank", "asr", "tts"}:
++        return normalized
++    if normalized in {"image2text", "vision"}:
++        return "vision"
++    return None
++
++
++def _instance_base_url(instance_obj) -> str:
++    try:
++        extra = json.loads(instance_obj.extra or "{}")
++    except (TypeError, ValueError, json.JSONDecodeError):
++        extra = {}
++    return str(extra.get("base_url") or "")
++
++
++def _switch_local_runtime_model_if_needed(
++    tenant_id: str,
++    provider_name: str,
++    instance_name: str,
++    model_name: str,
++    model_type: str,
++) -> dict | None:
++    kind = _runtime_kind_for_model_type(model_type)
++    if not kind or not model_name:
++        return None
++
++    provider_obj = TenantModelProviderService.get_by_tenant_id_and_provider_name(tenant_id, provider_name)
++    if not provider_obj:
++        return None
++    instance_obj = TenantModelInstanceService.get_by_provider_id_and_instance_name(provider_obj.id, instance_name)
++    if not instance_obj:
++        return None
++
++    base_url = _instance_base_url(instance_obj)
++    if not _is_local_openai_compatible(provider_name, base_url):
++        return None
++
++    payload = {
++        "kind": kind,
++        "model": model_name,
++        "start": kind in {"chat", "rerank"},
++        "timeout_seconds": float(os.getenv("LOCALMATHRAG_RUNTIME_SWITCH_TIMEOUT_SECONDS", "240")),
++    }
++    body = json.dumps(payload).encode("utf-8")
++    req = urllib.request.Request(
++        LOCALMATHRAG_RUNTIME_SWITCH_URL,
++        data=body,
++        headers={"Content-Type": "application/json"},
++        method="POST",
++    )
++    try:
++        with urllib.request.urlopen(req, timeout=float(os.getenv("LOCALMATHRAG_RUNTIME_SWITCH_HTTP_TIMEOUT_SECONDS", "260"))) as response:
++            data = response.read().decode("utf-8", errors="replace")
++            result = json.loads(data) if data else {}
++            if isinstance(result, dict) and not result.get("ok", True):
++                logging.warning("LocalMathRAG runtime switch degraded: %s", result)
++            else:
++                logging.info("LocalMathRAG runtime switched: kind=%s model=%s", kind, model_name)
++            return result if isinstance(result, dict) else {"raw": result}
++    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError) as exc:
++        logging.warning("LocalMathRAG runtime switch failed for %s/%s: %s", kind, model_name, exc)
++        return {"ok": False, "kind": kind, "model": model_name, "reason": str(exc)}
++
+ 
+ def _to_int(v, default=500):
+     try:
+@@ -294,6 +384,14 @@ def set_tenant_default_models(tenant_id: str, model_provider: str, model_instanc
+         return False, "model_provider, model_instance and model_name must be specified together"
+ 
+     TenantService.update_by_id(tenant_id, {field_name: default_model})
++    if default_model:
++        _switch_local_runtime_model_if_needed(
++            tenant_id,
++            model_provider,
++            model_instance,
++            model_name,
++            model_type,
++        )
+     return True, "success"
+ 
+ 

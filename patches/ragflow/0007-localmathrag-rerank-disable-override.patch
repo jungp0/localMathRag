@@ -1,0 +1,15 @@
+diff --git a/api/apps/restful_apis/bot_api.py b/api/apps/restful_apis/bot_api.py
+--- a/api/apps/restful_apis/bot_api.py
++++ b/api/apps/restful_apis/bot_api.py
+@@ -420 +420 @@ async def retrieval_test_embedded(tenant_id=None):
+-            if not req.get("rerank_id"):
++            if "rerank_id" not in req:
+diff --git a/api/apps/services/dataset_api_service.py b/api/apps/services/dataset_api_service.py
+--- a/api/apps/services/dataset_api_service.py
++++ b/api/apps/services/dataset_api_service.py
+@@ -1077 +1077 @@ async def search(dataset_id: str, tenant_id: str, req: dict):
+-    rerank_id = search_config.get("rerank_id") or req.get("rerank_id")
++    rerank_id = req["rerank_id"] if "rerank_id" in req else search_config.get("rerank_id")
+@@ -1453 +1453 @@ async def search_datasets(tenant_id: str, req: dict):
+-    rerank_id = search_config.get("rerank_id") or req.get("rerank_id")
++    rerank_id = req["rerank_id"] if "rerank_id" in req else search_config.get("rerank_id")

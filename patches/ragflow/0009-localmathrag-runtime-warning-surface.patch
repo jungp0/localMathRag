@@ -1,0 +1,104 @@
+diff --git a/rag/llm/rerank_model.py b/rag/llm/rerank_model.py
+--- a/rag/llm/rerank_model.py
++++ b/rag/llm/rerank_model.py
+@@ -258,6 +258,9 @@ class OpenAI_APIRerank(Base):
+         response = requests.post(self.base_url, headers=self.headers, json=data, timeout=30)
+         response.raise_for_status()
+         res = response.json()
++        runtime = res.get("runtime") if isinstance(res, dict) else {}
++        if runtime and (runtime.get("fallback") or runtime.get("degraded")):
++            raise RuntimeError(runtime.get("warning") or runtime.get("reason") or "Local rerank runtime degraded")
+         rank = np.zeros(len(texts), dtype=float)
+         try:
+             for d in res.get("results", []):
+diff --git a/rag/nlp/search.py b/rag/nlp/search.py
+--- a/rag/nlp/search.py
++++ b/rag/nlp/search.py
+@@ -588,7 +588,7 @@ class Dealer:
+             rank_feature: dict | None = {PAGERANK_FLD: 10},
+             trace_id=None,
+     ):
+-        ranks = {"total": 0, "chunks": [], "doc_aggs": {}}
++        ranks = {"total": 0, "chunks": [], "doc_aggs": {}, "runtime_warnings": []}
+         if not question:
+             return ranks
+ 
+@@ -649,8 +649,15 @@ class Dealer:
+                     vector_similarity_weight,
+                     rank_feature=rank_feature,
+                 )
+-            except Exception:
++            except Exception as exc:
+                 logging.exception("[Search] external rerank failed; falling back to ES/KNN scoring")
++                ranks["runtime_warnings"].append(
++                    {
++                        "kind": "rerank",
++                        "message": f"Rerank model is configured but unavailable; using ES/KNN scoring. {exc}",
++                        "reason": str(exc),
++                    }
++                )
+                 rerank_mdl = None
+ 
+         if not rerank_mdl:
+diff --git a/web/src/utils/next-request.ts b/web/src/utils/next-request.ts
+--- a/web/src/utils/next-request.ts
++++ b/web/src/utils/next-request.ts
+@@ -76,6 +76,19 @@ const errorHandler = (error: {
+ // avoid duplicate 401 redirects
+ let isRedirecting = false;
+ 
++const showRuntimeWarnings = (payload?: Record<string, any>) => {
++  const warnings = payload?.runtime_warnings;
++  if (!Array.isArray(warnings)) {
++    return;
++  }
++  warnings.forEach((warning) => {
++    const text = warning?.message || warning?.reason;
++    if (text) {
++      message.warning(text);
++    }
++  });
++};
++
+ const request = axios.create({
+   //   errorHandler,
+   timeout: 300000,
+@@ -119,6 +132,7 @@ request.interceptors.response.use(
+ 
+     // Update LLM list cache when fetching my_llm or llm_list
+     if (data?.code === 0 && data?.data) {
++      showRuntimeWarnings(data.data);
+       const url = response?.config?.url || '';
+       if (url.includes('/v1/llm/my_llms') || url.includes('/v1/llm/list')) {
+         setCachedLlmList(data.data);
+diff --git a/web/src/utils/request.ts b/web/src/utils/request.ts
+--- a/web/src/utils/request.ts
++++ b/web/src/utils/request.ts
+@@ -87,6 +87,19 @@ const request: RequestMethod = extend({
+ // avoid duplicate 401 redirects
+ let isRedirecting = false;
+ 
++const showRuntimeWarnings = (payload?: Record<string, any>) => {
++  const warnings = payload?.runtime_warnings;
++  if (!Array.isArray(warnings)) {
++    return;
++  }
++  warnings.forEach((warning) => {
++    const text = warning?.message || warning?.reason;
++    if (text) {
++      message.warning(text);
++    }
++  });
++};
++
+ request.interceptors.request.use((url: string, options: any) => {
+   const data = convertTheKeysOfTheObjectToSnake(options.data);
+   const params = convertTheKeysOfTheObjectToSnake(options.params);
+@@ -149,6 +162,7 @@ request.interceptors.response.use(async (response: Response, options) => {
+ 
+   // Update LLM list cache when fetching my_llm or llm_list
+   if (data?.code === 0 && data?.data) {
++    showRuntimeWarnings(data.data as Record<string, any>);
+     const url = response?.url || '';
+     if (url.includes('/v1/llm/my_llms') || url.includes('/v1/llm/list')) {
+       setCachedLlmList(data.data);

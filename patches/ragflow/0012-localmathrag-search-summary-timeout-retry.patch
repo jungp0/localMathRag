@@ -1,0 +1,224 @@
+diff --git a/api/db/services/dialog_service.py b/api/db/services/dialog_service.py
+--- a/api/db/services/dialog_service.py
++++ b/api/db/services/dialog_service.py
+@@ -75,6 +75,74 @@ def _localmathrag_search_progress(stage, percent, message, **extra):
+     }
+ 
+ 
++class LocalMathRAGSummaryTimeout(Exception):
++    pass
++
++
++def _localmathrag_float_env(name, default, minimum=0.1):
++    raw = os.environ.get(name)
++    if raw is None:
++        return default
++    try:
++        return max(minimum, float(raw))
++    except (TypeError, ValueError):
++        logging.warning("Invalid %s=%r; using %s", name, raw, default)
++        return default
++
++
++def _localmathrag_search_budget_attempts(answer_budget, knowledge_budget):
++    max_retries = _localmathrag_int_env("LOCALMATHRAG_SEARCH_SUMMARY_MAX_RETRIES", 1, 0)
++    ratio = _localmathrag_float_env("LOCALMATHRAG_SEARCH_SUMMARY_RETRY_BUDGET_RATIO", 0.5, 0.1)
++    min_answer = _localmathrag_int_env("LOCALMATHRAG_SEARCH_SUMMARY_MIN_ANSWER_TOKENS", 384, 64)
++    min_knowledge = _localmathrag_int_env("LOCALMATHRAG_SEARCH_SUMMARY_MIN_KNOWLEDGE_TOKENS", 1024, 256)
++    attempts = []
++    for index in range(max_retries + 1):
++        factor = ratio ** index
++        answer = max(min_answer, int(answer_budget * factor))
++        knowledge = max(min_knowledge, int(knowledge_budget * factor))
++        if attempts and attempts[-1]["answer_token_budget"] == answer and attempts[-1]["knowledge_token_budget"] == knowledge:
++            continue
++        attempts.append(
++            {
++                "attempt": index + 1,
++                "answer_token_budget": answer,
++                "knowledge_token_budget": knowledge,
++                "degraded": index > 0,
++            }
++        )
++    return attempts
++
++
++async def _localmathrag_close_async_iter(stream_iter):
++    close = getattr(stream_iter, "aclose", None)
++    if callable(close):
++        try:
++            await close()
++        except Exception:
++            logging.debug("Failed to close timed-out local summary stream", exc_info=True)
++
++
++async def _localmathrag_stream_summary_with_timeout(stream_iter):
++    first_timeout = _localmathrag_float_env("LOCALMATHRAG_SEARCH_SUMMARY_FIRST_TOKEN_TIMEOUT_SECONDS", 120.0, 1.0)
++    idle_timeout = _localmathrag_float_env("LOCALMATHRAG_SEARCH_SUMMARY_IDLE_TIMEOUT_SECONDS", 120.0, 1.0)
++    iterator = _stream_with_think_delta(stream_iter)
++    saw_output = False
++    try:
++        while True:
++            timeout = idle_timeout if saw_output else first_timeout
++            try:
++                item = await asyncio.wait_for(iterator.__anext__(), timeout=timeout)
++            except StopAsyncIteration:
++                break
++            except asyncio.TimeoutError as exc:
++                await _localmathrag_close_async_iter(iterator)
++                phase = "idle" if saw_output else "first-token"
++                raise LocalMathRAGSummaryTimeout(f"local summary {phase} timeout after {timeout:.0f}s") from exc
++            saw_output = True
++            yield item
++    finally:
++        await _localmathrag_close_async_iter(iterator)
++
+ 
+ def _chunk_kb_id_for_doc(row_dict, kb_ids, doc_id):
+     if len(kb_ids or []) == 1:
+@@ -1763,9 +1831,6 @@ async def async_ask(question, kb_ids, tenant_id, chat_llm_name=None, search_conf
+         knowledge_token_budget,
+         answer_token_budget,
+     )
+-    knowledges = kb_prompt(kbinfos, knowledge_token_budget)
+-    sys_prompt = PROMPT_JINJA_ENV.from_string(ASK_SUMMARY).render(knowledge="\n".join(knowledges))
+-
+     msg = [{"role": "user", "content": question}]
+ 
+     async def decorate_answer(answer):
+@@ -1789,41 +1854,93 @@ async def async_ask(question, kb_ids, tenant_id, chat_llm_name=None, search_conf
+         refs["chunks"] = chunks_format(refs)
+         return {"answer": answer, "reference": refs}
+ 
+-    stream_iter = chat_mdl.async_chat_streamly_delta(
+-        sys_prompt,
+-        msg,
+-        {"temperature": 0.1, "max_tokens": answer_token_budget},
+-    )
+-    yield {
+-        "answer": "",
+-        "reference": {},
+-        "final": False,
+-        "progress": _localmathrag_search_progress(
+-            "summary",
+-            60,
+-            "Generating summary",
+-            answer_token_budget=answer_token_budget,
+-            knowledge_token_budget=knowledge_token_budget,
+-        ),
+-    }
++    attempts = _localmathrag_search_budget_attempts(answer_token_budget, knowledge_token_budget)
+     last_state = None
+-    async for kind, value, state in _stream_with_think_delta(stream_iter):
+-        last_state = state
+-        if kind == "marker":
+-            flags = {"start_to_think": True} if value == "<think>" else {"end_to_think": True}
+-            yield {"answer": "", "reference": {}, "final": False, **flags}
+-            continue
+-        yield {"answer": value, "reference": {}, "final": False}
+-    full_answer = last_state.full_text if last_state else ""
++    last_error = ""
++    summary_completed = False
++    knowledges = []
++    sys_prompt = ""
++    for attempt in attempts:
++        knowledges = kb_prompt(kbinfos, attempt["knowledge_token_budget"])
++        sys_prompt = PROMPT_JINJA_ENV.from_string(ASK_SUMMARY).render(knowledge="\n".join(knowledges))
++        stream_iter = chat_mdl.async_chat_streamly_delta(
++            sys_prompt,
++            msg,
++            {"temperature": 0.1, "max_tokens": attempt["answer_token_budget"]},
++        )
++        yield {
++            "answer": "",
++            "reference": {},
++            "final": False,
++            "answer_reset": bool(attempt["degraded"]),
++            "progress": _localmathrag_search_progress(
++                "summary_retry" if attempt["degraded"] else "summary",
++                60 if not attempt["degraded"] else 65,
++                "Retrying summary with reduced context" if attempt["degraded"] else "Generating summary",
++                attempt=attempt["attempt"],
++                max_attempts=len(attempts),
++                answer_token_budget=attempt["answer_token_budget"],
++                knowledge_token_budget=attempt["knowledge_token_budget"],
++            ),
++        }
++        last_state = None
++        try:
++            async for kind, value, state in _localmathrag_stream_summary_with_timeout(stream_iter):
++                last_state = state
++                if kind == "marker":
++                    flags = {"start_to_think": True} if value == "<think>" else {"end_to_think": True}
++                    yield {"answer": "", "reference": {}, "final": False, **flags}
++                    continue
++                yield {"answer": value, "reference": {}, "final": False}
++            last_error = ""
++            summary_completed = True
++            break
++        except LocalMathRAGSummaryTimeout as exc:
++            last_error = str(exc)
++            logging.warning(
++                "LocalMathRAG search summary timed out; dropping attempt %s/%s and retrying if possible: %s",
++                attempt["attempt"],
++                len(attempts),
++                last_error,
++            )
++            if attempt["attempt"] < len(attempts):
++                yield {
++                    "answer": "",
++                    "reference": {},
++                    "final": False,
++                    "answer_reset": True,
++                    "progress": _localmathrag_search_progress(
++                        "summary_degraded_retry",
++                        65,
++                        "Summary timed out; reducing context and retrying",
++                        attempt=attempt["attempt"] + 1,
++                        max_attempts=len(attempts),
++                        reason=last_error,
++                    ),
++                }
++                continue
++            break
++    full_answer = last_state.full_text if summary_completed and last_state else ""
+     yield {
+         "answer": "",
+         "reference": {},
+         "final": False,
+         "progress": _localmathrag_search_progress("citations", 90, "Preparing citations"),
+     }
++    if not summary_completed and last_error:
++        full_answer = (
++            "\u672c\u5730\u6458\u8981\u751f\u6210\u8d85\u65f6\uff0c"
++            "\u5df2\u505c\u6b62\u5f53\u524d\u8bf7\u6c42\u5e76\u964d\u7ea7\u91cd\u8bd5\uff0c"
++            "\u4f46\u4ecd\u672a\u5728\u65f6\u95f4\u9650\u5236\u5185\u5b8c\u6210\u3002"
++            "\u4ee5\u4e0b\u4fdd\u7559\u68c0\u7d22\u7ed3\u679c\u4f9b\u53c2\u8003\u3002"
++            f"\u539f\u56e0\uff1a{last_error}"
++        )
+     final = await decorate_answer(_extract_visible_answer(full_answer))
+     final["final"] = True
+-    final["answer"] = ""
++    if not summary_completed and last_error:
++        final["answer_reset"] = True
++    else:
++        final["answer"] = ""
+     final["progress"] = _localmathrag_search_progress("done", 100, "Search complete")
+     yield final
+ 
+diff --git a/web/src/hooks/logic-hooks.ts b/web/src/hooks/logic-hooks.ts
+--- a/web/src/hooks/logic-hooks.ts
++++ b/web/src/hooks/logic-hooks.ts
+@@ -289,9 +289,10 @@ export const useSendMessageWithSse = () => {
+                 const d = val?.data;
+                 if (typeof d !== 'boolean') {
+                   setAnswer((prev) => {
+-                    const prevAnswer = prev.answer || '';
++                    const shouldResetAnswer = d.answer_reset === true;
++                    const prevAnswer = shouldResetAnswer ? '' : prev.answer || '';
+                     const currentAnswer =
+-                      d.final && prevAnswer ? '' : d.answer || '';
++                      d.final && prevAnswer && !shouldResetAnswer ? '' : d.answer || '';
+ 
+                     let newAnswer: string;
+                     if (prevAnswer && currentAnswer.startsWith(prevAnswer)) {

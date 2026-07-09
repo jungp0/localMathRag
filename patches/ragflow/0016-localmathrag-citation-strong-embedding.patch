@@ -1,0 +1,76 @@
+diff --git a/api/db/services/dialog_service.py b/api/db/services/dialog_service.py
+--- a/api/db/services/dialog_service.py
++++ b/api/db/services/dialog_service.py
+@@ -46,6 +46,7 @@ from rag.graphrag.general.mind_map_extractor import MindMapExtractor
+ from rag.advanced_rag import DeepResearcher
+ from rag.app.tag import label_question
+ from rag.nlp.search import index_name
++from rag.llm.embedding_model import localmathrag_embedding_purpose
+ from rag.prompts.generator import chunks_format, citation_prompt, cross_languages, full_question, kb_prompt, keyword_extraction, message_fit_in, PROMPT_JINJA_ENV, ASK_SUMMARY
+ from common.token_utils import num_tokens_from_string
+ from rag.utils.tavily_conn import Tavily
+@@ -2037,10 +2038,11 @@ async def async_ask(question, kb_ids, tenant_id, chat_llm_name=None, search_confi
+         )
+     visible_answer = _extract_visible_answer(full_answer)
+     try:
+-        final = await asyncio.wait_for(
+-            decorate_answer(visible_answer),
+-            timeout=_localmathrag_search_citation_timeout_seconds(),
+-        )
++        with localmathrag_embedding_purpose("citation"):
++            final = await asyncio.wait_for(
++                decorate_answer(visible_answer),
++                timeout=_localmathrag_search_citation_timeout_seconds(),
++            )
+     except asyncio.TimeoutError:
+         logging.warning(
+             "LocalMathRAG search citation preparation timed out after %.0fs; returning answer with lightweight references",
+diff --git a/rag/llm/embedding_model.py b/rag/llm/embedding_model.py
+--- a/rag/llm/embedding_model.py
++++ b/rag/llm/embedding_model.py
+@@ -15,6 +15,7 @@
+ import json
+ import os
+ import threading
++import contextvars
+ from abc import ABC
+ from contextlib import contextmanager
+ from urllib.parse import urljoin, urlparse
+@@ -41,6 +42,26 @@ logger = logging.getLogger(__name__)
+ # text-embedding-*, Mistral, Bedrock Titan, ...). Inputs are truncated to this
+ # many tokens so boundary-sized chunks are not rejected by the provider.
+ DEFAULT_MAX_TOKENS = 8192
++LOCALMATHRAG_EMBEDDING_PURPOSE = contextvars.ContextVar("localmathrag_embedding_purpose", default=None)
++
++
++@contextmanager
++def localmathrag_embedding_purpose(purpose: str):
++    token = LOCALMATHRAG_EMBEDDING_PURPOSE.set(purpose)
++    try:
++        yield
++    finally:
++        LOCALMATHRAG_EMBEDDING_PURPOSE.reset(token)
++
++
++def _localmathrag_embedding_extra_body():
++    purpose = LOCALMATHRAG_EMBEDDING_PURPOSE.get()
++    if purpose == "citation":
++        return {
++            "localmathrag_embedding_purpose": purpose,
++            "localmathrag_strong_embedding": True,
++        }
++    return {}
+ 
+ 
+ class EmbeddingError(ModelException):
+@@ -263,7 +283,9 @@ class OpenAIEmbed(Base):
+         self.model_name = model_name
+ 
+     def _call(self, batch):
+-        res = self.client.embeddings.create(input=batch, model=self.model_name, encoding_format="float", extra_body={"drop_params": True})
++        extra_body = {"drop_params": True}
++        extra_body.update(_localmathrag_embedding_extra_body())
++        res = self.client.embeddings.create(input=batch, model=self.model_name, encoding_format="float", extra_body=extra_body)
+         return [d.embedding for d in _sorted_by_index(res.data)], total_token_count_from_response(res)
+ 
+     def encode(self, texts: list):

@@ -1,0 +1,57 @@
+diff --git a/rag/llm/chat_model.py b/rag/llm/chat_model.py
+--- a/rag/llm/chat_model.py
++++ b/rag/llm/chat_model.py
+@@ -258,7 +258,8 @@ class Base(ABC):
+ 
+     def _clean_conf(self, gen_conf):
+         if "max_tokens" in gen_conf:
+-            del gen_conf["max_tokens"]
++            max_tokens = gen_conf.pop("max_tokens")
++            gen_conf.setdefault("max_completion_tokens", max_tokens)
+ 
+         gen_conf = {k: v for k, v in gen_conf.items() if k in ALLOWED_GEN_CONF_KEYS}
+         return gen_conf
+@@ -1049,6 +1050,9 @@ class OpenAI_APIChat(Base):
+         model_name = model_name.split("___")[0]
+         super().__init__(key, model_name, base_url, **kwargs)
+ 
++    def _clean_conf(self, gen_conf):
++        return {k: v for k, v in gen_conf.items() if k in ALLOWED_GEN_CONF_KEYS or k == "max_tokens"}
++
+ 
+ class Xiaomi(Base):
+     _FACTORY_NAME = "Xiaomi"
+diff --git a/api/db/services/dialog_service.py b/api/db/services/dialog_service.py
+--- a/api/db/services/dialog_service.py
++++ b/api/db/services/dialog_service.py
+@@ -1701,8 +1701,16 @@ async def async_ask(question, kb_ids, tenant_id, chat_llm_name=None, search_confi
+             metadata_fields,
+         )
+         _enrich_chunks_with_document_metadata(kbinfos.get("chunks", []), metadata_fields)
+ 
+-    knowledges = kb_prompt(kbinfos, max_tokens)
++    answer_token_budget = min(4096, max(1536, int(max_tokens * 0.25)))
++    knowledge_token_budget = min(8192, max(2048, int(max_tokens * 0.5)))
++    logging.info(
++        "Search async_ask token budget: max=%s knowledge=%s answer=%s",
++        max_tokens,
++        knowledge_token_budget,
++        answer_token_budget,
++    )
++    knowledges = kb_prompt(kbinfos, knowledge_token_budget)
+     sys_prompt = PROMPT_JINJA_ENV.from_string(ASK_SUMMARY).render(knowledge="\n".join(knowledges))
+ 
+     msg = [{"role": "user", "content": question}]
+@@ -1726,7 +1734,11 @@ async def async_ask(question, kb_ids, tenant_id, chat_llm_name=None, search_confi
+         refs["chunks"] = chunks_format(refs)
+         return {"answer": answer, "reference": refs}
+ 
+-    stream_iter = chat_mdl.async_chat_streamly_delta(sys_prompt, msg, {"temperature": 0.1})
++    stream_iter = chat_mdl.async_chat_streamly_delta(
++        sys_prompt,
++        msg,
++        {"temperature": 0.1, "max_tokens": answer_token_budget},
++    )
+     last_state = None
+     async for kind, value, state in _stream_with_think_delta(stream_iter):
+         last_state = state

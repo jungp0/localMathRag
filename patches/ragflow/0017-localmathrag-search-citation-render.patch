@@ -1,0 +1,33 @@
+diff --git a/api/db/services/dialog_service.py b/api/db/services/dialog_service.py
+--- a/api/db/services/dialog_service.py
++++ b/api/db/services/dialog_service.py
+@@ -2063,7 +2063,7 @@ async def async_ask(question, kb_ids, tenant_id, chat_llm_name=None, search_confi
+     if not summary_completed and last_error:
+         final["answer_reset"] = True
+     else:
+-        final["answer"] = ""
++        final["answer_replace"] = True
+     final["progress"] = _localmathrag_search_progress("done", 100, "Search complete")
+     yield final
+ 
+diff --git a/web/src/hooks/logic-hooks.ts b/web/src/hooks/logic-hooks.ts
+--- a/web/src/hooks/logic-hooks.ts
++++ b/web/src/hooks/logic-hooks.ts
+@@ -290,9 +290,15 @@ export const useSendMessageWithSse = () => {
+                 if (typeof d !== 'boolean') {
+                   setAnswer((prev) => {
+                     const shouldResetAnswer = d.answer_reset === true;
+-                    const prevAnswer = shouldResetAnswer ? '' : prev.answer || '';
++                    const shouldReplaceAnswer =
++                      shouldResetAnswer || d.answer_replace === true;
++                    const prevAnswer = shouldReplaceAnswer
++                      ? ''
++                      : prev.answer || '';
+                     const currentAnswer =
+-                      d.final && prevAnswer && !shouldResetAnswer ? '' : d.answer || '';
++                      d.final && prevAnswer && !shouldReplaceAnswer
++                        ? ''
++                        : d.answer || '';
+ 
+                     let newAnswer: string;
+                     if (prevAnswer && currentAnswer.startsWith(prevAnswer)) {

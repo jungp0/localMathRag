@@ -1,0 +1,6 @@
+{
+  "private": true,
+  "scripts": {
+    "type-check": "pnpm --dir third_party/ragflow/web run type-check"
+  }
+}

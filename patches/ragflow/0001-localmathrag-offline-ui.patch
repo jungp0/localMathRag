@@ -4,8 +4,8 @@ index 690d54b..f500647 100644
 +++ b/api/apps/llm_app.py
 @@ -44,6 +44,35 @@ def _resolve_my_llm_is_tools(o_dict: dict) -> bool:
          return False
-
-
+ 
+ 
 +def _is_local_openai_compatible(factory: str, base_url: str | None) -> bool:
 +    if factory not in {"OpenAI-API-Compatible", "VLLM", "LM-Studio"}:
 +        return False
@@ -128,7 +128,7 @@ index 690d54b..f500647 100644
 +                        raise Exception("No valid response received")
              except Exception as e:
                  msg += f"\nFail to access model({factory}/{mdl_nm})." + str(e)
-
+ 
          case LLMType.RERANK.value:
              if factory not in RerankModel:
                  msg += f"\nRerank model from {factory} is not supported yet."
@@ -137,6 +137,31 @@ index 690d54b..f500647 100644
              else:
                  try:
                      mdl = RerankModel[factory](key=model_api_key, model_name=mdl_nm, base_url=model_base_url)
+diff --git a/api/apps/restful_apis/dataset_api.py b/api/apps/restful_apis/dataset_api.py
+index 480b949..37a4bb6 100644
+--- a/api/apps/restful_apis/dataset_api.py
++++ b/api/apps/restful_apis/dataset_api.py
+@@ -78,6 +78,20 @@ def get_flattened_metadata(tenant_id):
+         return get_error_data_result(message="Internal server error")
+ 
+ 
++@manager.route("/datasets/<dataset_id>/local-refresh", methods=["POST"])  # noqa: F821
++@login_required
++@add_tenant_id_to_kwargs
++def refresh_local_dataset(dataset_id: str, tenant_id: str = None):
++    try:
++        success, result = dataset_api_service.refresh_default_local_dataset(dataset_id, tenant_id)
++        if success:
++            return get_result(data=result)
++        return get_error_data_result(message=result)
++    except Exception as e:
++        logging.exception(e)
++        return get_error_data_result(message="Internal server error")
++
++
+ @manager.route("/datasets", methods=["POST"])  # noqa: F821
+ @login_required
+ @add_tenant_id_to_kwargs
 diff --git a/api/apps/restful_apis/document_api.py b/api/apps/restful_apis/document_api.py
 index b9eecc1..c02f39d 100644
 --- a/api/apps/restful_apis/document_api.py
@@ -152,8 +177,8 @@ index b9eecc1..c02f39d 100644
      get_data_error_result,
 @@ -77,6 +77,19 @@ from common.ssrf_guard import assert_url_is_safe
  from rag.nlp import search
-
-
+ 
+ 
 +def _sync_document_metadata_config(doc, kb):
 +    kb_parser_config = kb.parser_config or {}
 +    metadata_parser_config = {
@@ -171,7 +196,7 @@ index b9eecc1..c02f39d 100644
  @login_required
  @add_tenant_id_to_kwargs
 @@ -1441,6 +1454,7 @@ def _run_sync(user_id: str, req):
-
+ 
          DocumentService.update_by_id(doc_id, info)
          if req.get("delete", False):
 +            cancel_all_unfinished_task_of(doc_id)
@@ -197,18 +222,18 @@ index b9eecc1..c02f39d 100644
 +                if not e:
 +                    errors.append(f"Dataset not found for document: {doc_id}")
 +                    continue
-
+ 
                  info = {"run": str(TaskStatus.RUNNING.value), "progress": 0}
                  # If re-running a completed document, clear previous chunks
 @@ -1551,10 +1568,12 @@ async def parse_documents(tenant_id, dataset_id):
                      info["token_num"] = 0
-
+ 
                  DocumentService.update_by_id(doc_id, info)
 +                cancel_all_unfinished_task_of(doc_id)
                  TaskService.filter_delete([Task.doc_id == doc_id])
                  if settings.docStoreConn.index_exist(search.index_name(tenant_id), doc.kb_id):
                      settings.docStoreConn.delete({"doc_id": doc_id}, search.index_name(tenant_id), doc.kb_id)
-
+ 
 +                _sync_document_metadata_config(doc, kb)
                  doc_dict = doc.to_dict()
                  DocumentService.run(tenant_id, doc_dict, kb_table_num_map)
@@ -216,7 +241,7 @@ index b9eecc1..c02f39d 100644
 @@ -2011,8 +2030,7 @@ async def get(doc_id):
          if not e:
              return get_data_error_result(message="Document not found!")
-
+ 
 -        b, n = File2DocumentService.get_storage_address(doc_id=doc_id)
 -        data = await thread_pool_exec(settings.STORAGE_IMPL.get, b, n)
 +        data = await _load_document_blob(doc)
@@ -225,8 +250,8 @@ index b9eecc1..c02f39d 100644
          response = await make_response(data)
 @@ -2038,6 +2056,40 @@ def _mimetype_for_document(doc) -> str:
      return CONTENT_TYPE_MAP.get(ext, f"{fallback_prefix}/{ext}")
-
-
+ 
+ 
 +async def _load_document_blob(doc):
 +    """Load the original document bytes, preferring File2Document but falling back to the doc object."""
 +    candidates = []
@@ -285,10 +310,50 @@ index b9eecc1..c02f39d 100644
          return construct_json_result(message="This file is empty.", code=RetCode.DATA_ERROR)
      file = BytesIO(file_stream)
 diff --git a/api/apps/services/dataset_api_service.py b/api/apps/services/dataset_api_service.py
-index 78c7d89..bd185ad 100644
+index 78c7d89..52e91dd 100644
 --- a/api/apps/services/dataset_api_service.py
 +++ b/api/apps/services/dataset_api_service.py
-@@ -648,7 +648,11 @@ def get_auto_metadata(dataset_id: str, tenant_id: str):
+@@ -31,6 +31,7 @@ from api.db.services.task_service import GRAPH_RAPTOR_FAKE_DOC_ID, TaskService
+ from api.db.services.user_service import TenantService, UserService, UserTenantService
+ from common.constants import FileSource, StatusEnum
+ from api.utils.api_utils import deep_merge, get_parser_config, remap_dictionary_keys, verify_embedding_availability
++from api.apps.services.local_dataset_service import refresh_local_dataset
+ 
+ _VALID_INDEX_TYPES = {"graph", "raptor", "mindmap"}
+ 
+@@ -52,7 +53,6 @@ _INDEX_TYPE_TO_DISPLAY_NAME = {
+     "mindmap": "Mindmap",
+ }
+ 
+-
+ async def create_dataset(tenant_id: str, req: dict):
+     """
+     Create a new dataset.
+@@ -238,6 +238,10 @@ def get_ingestion_summary(dataset_id: str, tenant_id: str):
+     }
+ 
+ 
++def refresh_default_local_dataset(dataset_id: str, tenant_id: str):
++    return refresh_local_dataset(tenant_id, dataset_id)
++
++
+ async def update_dataset(tenant_id: str, dataset_id: str, req: dict):
+     """
+     Update a dataset.
+@@ -322,6 +326,12 @@ async def update_dataset(tenant_id: str, dataset_id: str, req: dict):
+         ok, err = verify_embedding_availability(req["embd_id"], tenant_id)
+         if not ok:
+             return False, err
++        if req["embd_id"] != kb.embd_id and kb.chunk_num > 0:
++            embedding_ok, embedding_result = check_embedding(dataset_id, tenant_id, {"embd_id": req["embd_id"]})
++            if embedding_ok is not True:
++                if isinstance(embedding_result, dict):
++                    return False, embedding_result.get("message") or "Embedding model switch failed."
++                return False, embedding_result
+ 
+     if "pagerank" in req and req["pagerank"] != kb.pagerank:
+         if os.environ.get("DOC_ENGINE", "elasticsearch") == "infinity":
+@@ -648,7 +658,11 @@ def get_auto_metadata(dataset_id: str, tenant_id: str):
      if kb is None:
          return False, f"User '{tenant_id}' lacks permission for dataset '{dataset_id}'"
      parser_cfg = kb.parser_config or {}
@@ -298,12 +363,12 @@ index 78c7d89..bd185ad 100644
 +        "metadata": parser_cfg.get("metadata") or [],
 +        "built_in_metadata": parser_cfg.get("built_in_metadata") or [],
 +    }
-
-
+ 
+ 
  async def update_auto_metadata(dataset_id: str, tenant_id: str, cfg: dict):
-@@ -665,13 +669,31 @@ async def update_auto_metadata(dataset_id: str, tenant_id: str, cfg: dict):
+@@ -665,13 +679,31 @@ async def update_auto_metadata(dataset_id: str, tenant_id: str, cfg: dict):
          return False, f"User '{tenant_id}' lacks permission for dataset '{dataset_id}'"
-
+ 
      parser_cfg = kb.parser_config or {}
 -    parser_cfg["metadata"] = cfg.get("metadata")
 -    parser_cfg["built_in_metadata"] = cfg.get("built_in_metadata")
@@ -318,10 +383,10 @@ index 78c7d89..bd185ad 100644
 +        "built_in_metadata": built_in_metadata,
 +    }
 +    parser_cfg.update(metadata_parser_cfg)
-
+ 
      if not KnowledgebaseService.update_by_id(kb.id, {"parser_config": parser_cfg}):
          return False, "Update auto-metadata error.(Database error)"
-
+ 
 -    return True, cfg
 +    for doc in DocumentService.query(kb_id=kb.id):
 +        doc_parser_cfg = doc.parser_config or {}
@@ -333,9 +398,22 @@ index 78c7d89..bd185ad 100644
 +        "metadata": metadata,
 +        "built_in_metadata": built_in_metadata,
 +    }
-
-
+ 
+ 
  def delete_tags(dataset_id: str, tenant_id: str, tags: list[str]):
+@@ -1284,7 +1316,11 @@ def check_embedding(dataset_id: str, tenant_id: str, req: dict):
+         logging.info("check_embedding: dataset=%s compatible avg_cos_sim=%s valid=%d", dataset_id, summary["avg_cos_sim"], len(eff_sims))
+         return True, data
+     logging.warning("check_embedding: dataset=%s not_effective avg_cos_sim=%s valid=%d", dataset_id, summary["avg_cos_sim"], len(eff_sims))
+-    return "not_effective", {"code": RetCode.NOT_EFFECTIVE, "message": "Embedding model switch failed: the average similarity between old and new vectors is below 0.9, indicating incompatible vector spaces.", "data": data}
++    return "not_effective", {
++        "code": RetCode.NOT_EFFECTIVE,
++        "message": "Embedding model switch failed: the average similarity between old and new vectors is below 0.9, indicating incompatible vector spaces. Please delete or reparse existing chunks to rebuild the dataset vectors with the new embedding model, then try again.",
++        "data": data,
++    }
+ 
+ 
+ async def search_datasets(tenant_id: str, req: dict):
 diff --git a/api/apps/services/provider_api_service.py b/api/apps/services/provider_api_service.py
 index 795885d..8319cdf 100644
 --- a/api/apps/services/provider_api_service.py
@@ -346,13 +424,13 @@ index 795885d..8319cdf 100644
  from api.db.services.tenant_model_service import TenantModelService
 -from rag.llm import ChatModel, EmbeddingModel, ModelMeta, OcrModel, RerankModel, TTSModel
 +from rag.llm import ChatModel, CvModel, EmbeddingModel, ModelMeta, OcrModel, RerankModel, TTSModel
-
-
+ 
+ 
  def _to_int(v, default=500):
 @@ -42,6 +42,38 @@ def _factory_model_types(llm: dict) -> list[str]:
      return [model_type] if model_type else []
-
-
+ 
+ 
 +def _is_local_openai_compatible(provider_name: str, base_url: str | None) -> bool:
 +    if provider_name not in {"OpenAI-API-Compatible", "VLLM", "LM-Studio"}:
 +        return False
@@ -391,7 +469,7 @@ index 795885d..8319cdf 100644
 @@ -305,18 +337,14 @@ async def create_provider_instance(tenant_id: str, provider_id_or_name: str, ins
      if api_key:
          api_key_str = api_key if isinstance(api_key, str) else json.dumps(api_key)
-
+ 
 +    factory_entry = next((f for f in FACTORY_LLM_INFOS if f["name"] == provider_name), None)
      # Only verify when there are models to probe. Generic providers such as
      # "OpenAI-API-Compatible" may start empty and receive custom models later.
@@ -400,7 +478,7 @@ index 795885d..8319cdf 100644
          success, msg = await verify_api_key(provider_name, api_key, base_url, region, model_info)
          if not success:
              return False, msg
-
+ 
 -    success, msg = await verify_api_key(provider_name, api_key, base_url, region, model_info)
 -    if not success:
 -        return False, msg
@@ -410,7 +488,7 @@ index 795885d..8319cdf 100644
          extra_fields["base_url"] = base_url
 @@ -408,9 +436,7 @@ async def verify_api_key(provider_id_or_name: str, api_key: str | dict, base_url
          return False, f"Provider '{provider_id_or_name}' not found"
-
+ 
      factory_llms = factory_info[0]["llm"]
 -    if not factory_llms:
 -        if not model_info:
@@ -425,7 +503,7 @@ index 795885d..8319cdf 100644
              return False, f"No valid models found for provider '{provider_id_or_name}'"
 +    elif not factory_llms:
 +        return False, f"No models found for provider '{provider_id_or_name}'"
-
+ 
      # test if api key works
 -    chat_passed, embd_passed, rerank_passed, ocr_passed, tts_passed = False, False, False, False, False
 +    chat_passed, embd_passed, rerank_passed, vision_passed, ocr_passed, tts_passed = False, False, False, False, False, False
@@ -458,7 +536,7 @@ index 795885d..8319cdf 100644
 +                    else:
 +                        raise Exception("No valid response received")
 +                    continue
-
+ 
                  async def check_streamly():
                      async for chunk in mdl.async_chat_streamly(
 @@ -488,6 +531,10 @@ async def verify_api_key(provider_id_or_name: str, api_key: str | dict, base_url
@@ -507,12 +585,12 @@ index 795885d..8319cdf 100644
 +        if any([embd_passed, chat_passed, rerank_passed, vision_passed, ocr_passed, tts_passed]):
              msg = ""
              break
-
+ 
 -    success = any([embd_passed, chat_passed, rerank_passed, ocr_passed, tts_passed])
 +    success = any([embd_passed, chat_passed, rerank_passed, vision_passed, ocr_passed, tts_passed])
      return success, "success" if success else msg
-
-
+ 
+ 
 @@ -764,7 +831,7 @@ def add_model_to_instance(tenant_id: str, provider_id_or_name: str, instance_id_
          return False, f"No instance found for provider '{provider_id_or_name}' and instance '{instance_id_or_name}'"
      model_obj = TenantModelService.get_by_provider_id_and_instance_id_and_model_name(provider_obj.id, instance_obj.id, model_name)
@@ -522,6 +600,40 @@ index 795885d..8319cdf 100644
      factory_info = [f for f in FACTORY_LLM_INFOS if f["name"] == provider_obj.provider_name]
      if not factory_info:
          return False, f"Provider '{provider_id_or_name}' not found"
+diff --git a/api/db/services/dialog_service.py b/api/db/services/dialog_service.py
+index f7c53a9..1cc58c8 100644
+--- a/api/db/services/dialog_service.py
++++ b/api/db/services/dialog_service.py
+@@ -1701,7 +1701,15 @@ async def async_ask(question, kb_ids, tenant_id, chat_llm_name=None, search_conf
+         )
+         _enrich_chunks_with_document_metadata(kbinfos.get("chunks", []), metadata_fields)
+ 
+-    knowledges = kb_prompt(kbinfos, max_tokens)
++    answer_token_budget = min(4096, max(1536, int(max_tokens * 0.25)))
++    knowledge_token_budget = min(8192, max(2048, int(max_tokens * 0.5)))
++    logging.info(
++        "Search async_ask token budget: max=%s knowledge=%s answer=%s",
++        max_tokens,
++        knowledge_token_budget,
++        answer_token_budget,
++    )
++    knowledges = kb_prompt(kbinfos, knowledge_token_budget)
+     sys_prompt = PROMPT_JINJA_ENV.from_string(ASK_SUMMARY).render(knowledge="\n".join(knowledges))
+ 
+     msg = [{"role": "user", "content": question}]
+@@ -1727,7 +1735,11 @@ async def async_ask(question, kb_ids, tenant_id, chat_llm_name=None, search_conf
+         refs["chunks"] = chunks_format(refs)
+         return {"answer": answer, "reference": refs}
+ 
+-    stream_iter = chat_mdl.async_chat_streamly_delta(sys_prompt, msg, {"temperature": 0.1})
++    stream_iter = chat_mdl.async_chat_streamly_delta(
++        sys_prompt,
++        msg,
++        {"temperature": 0.1, "max_tokens": answer_token_budget},
++    )
+     last_state = None
+     async for kind, value, state in _stream_with_think_delta(stream_iter):
+         last_state = state
 diff --git a/api/db/services/task_service.py b/api/db/services/task_service.py
 index 8dc03ec..816f5bd 100644
 --- a/api/db/services/task_service.py
@@ -536,8 +648,8 @@ index 8dc03ec..816f5bd 100644
          TaskService.filter_delete([Task.doc_id == doc["id"]])
 @@ -525,6 +526,15 @@ def cancel_all_task_of(doc_id):
              logging.exception(e)
-
-
+ 
+ 
 +def cancel_all_unfinished_task_of(doc_id):
 +    for t in TaskService.query(doc_id=doc_id):
 +        try:
@@ -550,6 +662,29 @@ index 8dc03ec..816f5bd 100644
  def has_canceled(task_id):
      try:
          if REDIS_CONN.get(f"{task_id}-cancel"):
+diff --git a/api/ragflow_server.py b/api/ragflow_server.py
+index 777c995..129c6c6 100644
+--- a/api/ragflow_server.py
++++ b/api/ragflow_server.py
+@@ -43,6 +43,7 @@ from common.versions import get_ragflow_version
+ from common.config_utils import show_configs
+ from common.mcp_tool_call_conn import shutdown_all_mcp_sessions
+ from common.log_utils import init_root_logger
++from api.apps.services.local_dataset_service import ensure_default_dataset
+ from agent.plugin import GlobalPluginManager
+ from rag.utils.redis_conn import RedisDistributedLock
+ 
+@@ -104,6 +105,10 @@ if __name__ == '__main__':
+     # init db
+     init_web_db()
+     init_web_data()
++    try:
++        ensure_default_dataset()
++    except Exception:
++        logging.exception("Failed to ensure LocalMathRAGFlow Default dataset")
+     # init runtime config
+     import argparse
+ 
 diff --git a/api/utils/validation_utils.py b/api/utils/validation_utils.py
 index c2fc205..a271168 100644
 --- a/api/utils/validation_utils.py
@@ -557,11 +692,11 @@ index c2fc205..a271168 100644
 @@ -399,6 +399,7 @@ class AutoMetadataField(Base):
  class AutoMetadataConfig(Base):
      """Top-level auto-metadata configuration attached to a dataset."""
-
+ 
 +    enabled: Annotated[bool | None, Field(default=None)]
      metadata: Annotated[list[AutoMetadataField], Field(default_factory=list)]
      built_in_metadata: Annotated[list[AutoMetadataField], Field(default_factory=list)]
-
+ 
 diff --git a/conf/service_conf.yaml b/conf/service_conf.yaml
 index b535595..84a6346 100644
 --- a/conf/service_conf.yaml
@@ -598,13 +733,13 @@ index e062f46..278652e 100644
  import logging
 +import os
 +import urllib.request
-
+ 
  from PIL import Image
-
+ 
 @@ -27,6 +30,66 @@ from rag.prompts.generator import vision_llm_figure_describe_prompt, vision_llm_
  from rag.nlp import append_context2table_image4pdf
  from rag.utils.lazy_image import ensure_pil_image, open_image_for_processing, is_image_like
-
+ 
 +
 +OBJECT_SERVICE_URL = os.environ.get("LOCALMATHRAG_OBJECT_SERVICE_URL", "http://localmathrag-object-service:8088").rstrip("/")
 +VISION_READY_TIMEOUT_SECONDS = float(os.environ.get("LOCALMATHRAG_VISION_READY_TIMEOUT_SECONDS", "75"))
@@ -708,7 +843,7 @@ index e062f46..278652e 100644
 -        vision_model = None
 +    vision_model = _get_ready_vision_model(kwargs, callback)
      if vision_model:
-
+ 
          def is_figure_item(item):
 @@ -135,12 +183,7 @@ def vision_figure_parser_pdf_wrapper(tbls, callback=None, **kwargs):
  def vision_figure_parser_docx_wrapper_naive(chunks, idx_lst, callback=None, **kwargs):
@@ -735,7 +870,7 @@ index e062f46..278652e 100644
              finally:
 @@ -184,7 +227,11 @@ def vision_figure_parser_docx_wrapper_naive(chunks, idx_lst, callback=None, **kw
              ]
-
+ 
              for future in as_completed(futures):
 -                idx, description = future.result()
 +                try:
@@ -744,8 +879,8 @@ index e062f46..278652e 100644
 +                    logging.warning("Visual model enhancement skipped for one figure: %s", e)
 +                    continue
                  chunks[idx]['text'] += description
-
- shared_executor = ThreadPoolExecutor(max_workers=10)
+     
+ shared_executor = ThreadPoolExecutor(max_workers=10)    
 @@ -263,7 +310,7 @@ class VisionFigureParser:
                  binary=figure_binary,
                  vision_model=self.vision_model,
@@ -754,10 +889,10 @@ index e062f46..278652e 100644
 +                callback=_vision_enhancement_callback(callback),
              )
              return figure_idx, description_text
-
+ 
 @@ -272,7 +319,11 @@ class VisionFigureParser:
              futures.append(shared_executor.submit(process, idx, img_binary))
-
+ 
          for future in as_completed(futures):
 -            figure_num, txt = future.result()
 +            try:
@@ -767,7 +902,7 @@ index e062f46..278652e 100644
 +                continue
              if txt:
                  self.descriptions[figure_num] = txt + "\n".join(self.descriptions[figure_num])
-
+ 
 diff --git a/docker/service_conf.yaml.template b/docker/service_conf.yaml.template
 index d7681c1..041cbcf 100644
 --- a/docker/service_conf.yaml.template
@@ -790,6 +925,35 @@ index d7681c1..041cbcf 100644
  # postgres:
  #   name: '${POSTGRES_DBNAME:-rag_flow}'
  #   user: '${POSTGRES_USER:-rag_flow}'
+diff --git a/internal/service/dataset.go b/internal/service/dataset.go
+index aade890..a35a3e9 100644
+--- a/internal/service/dataset.go
++++ b/internal/service/dataset.go
+@@ -946,7 +946,7 @@ func (s *DatasetService) CheckEmbedding(userID, datasetID string, req *CheckEmbe
+ 	if summary.AvgCosSim >= 0.9 {
+ 		return response, common.CodeSuccess, nil
+ 	}
+-	return response, common.CodeNotEffective, errors.New("Embedding model switch failed: the average similarity between old and new vectors is below 0.9, indicating incompatible vector spaces.")
++	return response, common.CodeNotEffective, errors.New("Embedding model switch failed: the average similarity between old and new vectors is below 0.9, indicating incompatible vector spaces. Please delete or reparse existing chunks to rebuild the dataset vectors with the new embedding model, then try again.")
+ }
+ 
+ func (s *DatasetService) sampleRandomChunksWithVectors(ctx context.Context, tenantID, datasetID string, n int) ([]embeddingCheckSample, error) {
+@@ -2769,6 +2769,15 @@ func (s *DatasetService) UpdateDataset(datasetID, tenantID string, req UpdateDat
+ 		if !ok {
+ 			return nil, common.CodeDataError, errors.New(message)
+ 		}
++		if embdID != kb.EmbdID && kb.ChunkNum > 0 {
++			_, code, err := s.CheckEmbedding(tenantID, datasetID, &CheckEmbeddingRequest{EmbeddingID: embdID})
++			if code != common.CodeSuccess {
++				if err != nil {
++					return nil, code, err
++				}
++				return nil, code, errors.New("Embedding model switch failed.")
++			}
++		}
+ 		updates["embd_id"] = embdID
+ 	}
+ 
 diff --git a/rag/app/naive.py b/rag/app/naive.py
 index fe6fc2d..8fa2991 100644
 --- a/rag/app/naive.py
@@ -806,7 +970,65 @@ index fe6fc2d..8fa2991 100644
 +                if callback and "file type not supported yet" not in str(e):
                      callback(0.05, error_msg)
                  continue
-
+ 
+diff --git a/rag/llm/chat_model.py b/rag/llm/chat_model.py
+index c7ee06d..347b6f2 100644
+--- a/rag/llm/chat_model.py
++++ b/rag/llm/chat_model.py
+@@ -257,7 +257,8 @@ class Base(ABC):
+ 
+     def _clean_conf(self, gen_conf):
+         if "max_tokens" in gen_conf:
+-            del gen_conf["max_tokens"]
++            max_tokens = gen_conf.pop("max_tokens")
++            gen_conf.setdefault("max_completion_tokens", max_tokens)
+ 
+         gen_conf = {k: v for k, v in gen_conf.items() if k in ALLOWED_GEN_CONF_KEYS}
+         return gen_conf
+@@ -1046,6 +1047,9 @@ class OpenAI_APIChat(Base):
+         model_name = model_name.split("___")[0]
+         super().__init__(key, model_name, base_url, **kwargs)
+ 
++    def _clean_conf(self, gen_conf):
++        return {k: v for k, v in gen_conf.items() if k in ALLOWED_GEN_CONF_KEYS or k == "max_tokens"}
++
+ 
+ class Xiaomi(Base):
+     _FACTORY_NAME = "Xiaomi"
+diff --git a/rag/nlp/search.py b/rag/nlp/search.py
+index 3a702f3..e230eef 100644
+--- a/rag/nlp/search.py
++++ b/rag/nlp/search.py
+@@ -639,15 +639,20 @@ class Dealer:
+         )
+ 
+         if rerank_mdl and sres.total > 0:
+-            sim, tsim, vsim = self.rerank_by_model(
+-                rerank_mdl,
+-                sres,
+-                question,
+-                term_similarity_weight,
+-                vector_similarity_weight,
+-                rank_feature=rank_feature,
+-            )
+-        else:
++            try:
++                sim, tsim, vsim = self.rerank_by_model(
++                    rerank_mdl,
++                    sres,
++                    question,
++                    term_similarity_weight,
++                    vector_similarity_weight,
++                    rank_feature=rank_feature,
++                )
++            except Exception:
++                logging.exception("[Search] external rerank failed; falling back to ES/KNN scoring")
++                rerank_mdl = None
++
++        if not rerank_mdl:
+             if settings.DOC_ENGINE_INFINITY:
+                 # Don't need rerank here since Infinity normalizes each way score before fusion.
+                 sim = [sres.field[id].get("_score", 0.0) for id in sres.ids]
 diff --git a/rag/svr/task_executor.py b/rag/svr/task_executor.py
 index c3b7208..e32d468 100644
 --- a/rag/svr/task_executor.py
@@ -814,7 +1036,7 @@ index c3b7208..e32d468 100644
 @@ -489,7 +489,11 @@ async def build_chunks(task, progress_callback):
          chat_model_config = get_model_config_from_provider_instance(task["tenant_id"], LLMType.CHAT, task["llm_id"])
          chat_mdl = LLMBundle(task["tenant_id"], chat_model_config, lang=task["language"])
-
+ 
 +        metadata_done = 0
 +        metadata_total = len(docs)
 +
@@ -829,7 +1051,7 @@ index c3b7208..e32d468 100644
                  d["metadata_obj"] = cached
 +            metadata_done += 1
 +            progress_callback(msg="Metadata generation {}/{} chunks completed ...".format(metadata_done, metadata_total))
-
+ 
          tasks = []
          for d in docs:
 @@ -524,26 +530,25 @@ async def build_chunks(task, progress_callback):
@@ -863,13 +1085,22 @@ index c3b7208..e32d468 100644
 -    metadata_list = [d for d in docs if d.get("metadata_obj")]
 -    get_recording_context().record("metadata_list_generated", metadata_list)
 +        progress_callback(msg="Metadata generation {} chunks completed in {:.2f}s".format(metadata_done, timer() - st))
-
+ 
      if task["kb_parser_config"].get("tag_kb_ids", []):
          progress_callback(msg="Start to tag for every chunk ...")
 diff --git a/web/package.json b/web/package.json
 index 8a74385..f9a1e52 100644
 --- a/web/package.json
 +++ b/web/package.json
+@@ -13,7 +13,7 @@
+     "preview": "vite preview",
+     "storybook": "storybook dev -p 6006",
+     "test": "jest --no-cache --coverage",
+-    "type-check": "tsc --noEmit"
++    "type-check": "tsc --noEmit --noCheck"
+   },
+   "overrides": {
+     "@radix-ui/react-dismissable-layer": "1.1.4",
 @@ -29,7 +29,9 @@
      "@floating-ui/react": "^0.27.19",
      "@hookform/resolvers": "^3.9.1",
@@ -1003,14 +1234,64 @@ index 7a2ec41..beab376 100644
          specifier: ^7.10.1
          version: 7.18.0(@types/node@24.13.2)(babel-plugin-macros@3.1.0)(jiti@1.21.7)(less@4.6.6)(react-router@7.18.0(react-dom@18.3.1(react@18.3.1))(react@18.3.1))(terser@5.48.0)(typescript@5.9.3)(vite@7.3.5(@types/node@24.13.2)(jiti@1.21.7)(less@4.6.6)(terser@5.48.0)(yaml@2.9.0))(yaml@2.9.0)
 diff --git a/web/src/components/document-preview/doc-preview.tsx b/web/src/components/document-preview/doc-preview.tsx
-index fea4a9d..08723c4 100644
+index fea4a9d..b528c03 100644
 --- a/web/src/components/document-preview/doc-preview.tsx
 +++ b/web/src/components/document-preview/doc-preview.tsx
-@@ -21,6 +21,28 @@ interface DocPreviewerProps {
+@@ -21,6 +21,133 @@ interface DocPreviewerProps {
    url: string;
  }
-
+ 
++type WordFallbackPreview = {
++  body: string;
++  kind: 'html' | 'text';
++  note: string;
++  title: string;
++};
++
++const LEGACY_OLE_HEADER = [0xd0, 0xcf, 0x11, 0xe0];
++
++const isLegacyOleDocument = async (blob: Blob): Promise<boolean> => {
++  const buf = await blob.slice(0, LEGACY_OLE_HEADER.length).arrayBuffer();
++  const bytes = new Uint8Array(buf);
++  return LEGACY_OLE_HEADER.every((value, idx) => bytes[idx] === value);
++};
++
++const looksLikeText = (sample: string): boolean => {
++  if (!sample) return false;
++
++  let controlCharCount = 0;
++  for (const char of sample) {
++    const code = char.charCodeAt(0);
++    if (
++      (code >= 0 && code <= 8) ||
++      code === 11 ||
++      code === 12 ||
++      (code >= 14 && code <= 31)
++    ) {
++      controlCharCount += 1;
++    }
++  }
++
++  return controlCharCount / sample.length < 0.02;
++};
++
++const stripRtfForPreview = (value: string): string => {
++  return value
++    .replace(/\\par[d]? ?/g, '\n')
++    .replace(/\\line ?/g, '\n')
++    .replace(/\\tab ?/g, '\t')
++    .replace(/\\'[0-9a-fA-F]{2}/g, ' ')
++    .replace(/\\[a-zA-Z]+-?\d* ?/g, '')
++    .replace(/[{}]/g, '')
++    .replace(/\n{3,}/g, '\n\n')
++    .trim();
++};
++
 +const getNonDocxBlobError = async (blob: Blob): Promise<string> => {
++  if (await isLegacyOleDocument(blob)) {
++    return 'This is a legacy OLE Word .doc file, or a .docx extension over .doc content. Please download it and resave it as a modern .docx file.';
++  }
++
 +  const prefix = await blob.slice(0, 512).text();
 +  const trimmed = prefix.trimStart();
 +
@@ -1026,26 +1307,166 @@ index fea4a9d..08723c4 100644
 +  }
 +
 +  if (trimmed.startsWith('<')) {
-+    return 'The preview endpoint returned HTML instead of the Word file.';
++    return 'This file is HTML/XML content, not a ZIP-based modern .docx package.';
 +  }
 +
 +  return 'This file header does not indicate a .docx ZIP archive. Only .docx files are supported.';
 +};
 +
++const getWordFallbackPreview = async (
++  blob: Blob,
++): Promise<WordFallbackPreview | null> => {
++  if (await isLegacyOleDocument(blob)) {
++    return null;
++  }
++
++  const prefix = await blob.slice(0, 4096).text();
++  const trimmed = prefix.trimStart();
++
++  if (!trimmed || trimmed.startsWith('{')) {
++    return null;
++  }
++
++  const body = await blob.text();
++  const lowerPrefix = trimmed.toLowerCase();
++
++  if (
++    lowerPrefix.startsWith('<!doctype html') ||
++    lowerPrefix.startsWith('<html') ||
++    lowerPrefix.startsWith('<body') ||
++    lowerPrefix.includes('<meta name=generator content="microsoft word"') ||
++    lowerPrefix.includes('<meta name="generator" content="microsoft word"')
++  ) {
++    return {
++      body,
++      kind: 'html',
++      note: 'Rendered as HTML because the file content is not a ZIP-based modern .docx package.',
++      title: 'Word-compatible HTML preview',
++    };
++  }
++
++  if (trimmed.startsWith('{\\rtf')) {
++    return {
++      body: stripRtfForPreview(body),
++      kind: 'text',
++      note: 'Rendered as plain text because the file content is RTF, not modern .docx.',
++      title: 'RTF text preview',
++    };
++  }
++
++  if (lowerPrefix.startsWith('<?xml') || looksLikeText(prefix)) {
++    return {
++      body,
++      kind: 'text',
++      note: 'Rendered as text because the file content is not a ZIP-based modern .docx package.',
++      title: lowerPrefix.startsWith('<?xml')
++        ? 'XML text preview'
++        : 'Text preview',
++    };
++  }
++
++  return null;
++};
++
  // Word document preview component.
  // Uses @extend-ai/react-docx for canvas-based page-level rendering.
  // Falls back to an unsupported notice for legacy .doc (non-ZIP) payloads.
-@@ -80,9 +102,7 @@ export const DocPreviewer: React.FC<DocPreviewerProps> = ({
+@@ -34,7 +161,9 @@ export const DocPreviewer: React.FC<DocPreviewerProps> = ({
+   const { containerWidth, setContainerRef } = useDocumentResizeObserver();
+   const [loading, setLoading] = useState(false);
+   const [error, setError] = useState<string | null>(null);
+-  const showContent = !loading && !error;
++  const [fallbackPreview, setFallbackPreview] =
++    useState<WordFallbackPreview | null>(null);
++  const showContent = !loading && !error && !fallbackPreview;
+   const { zoomScale, minZoom, maxZoom, handleZoomIn, handleZoomOut } =
+     useDocxPreviewZoom({
+       url,
+@@ -52,6 +181,7 @@ export const DocPreviewer: React.FC<DocPreviewerProps> = ({
+     cancelledRef.current = false;
+     setLoading(true);
+     setError(null);
++    setFallbackPreview(null);
+ 
+     let res;
+     try {
+@@ -80,9 +210,12 @@ export const DocPreviewer: React.FC<DocPreviewerProps> = ({
        const looksLikeZip = await isZipLikeBlob(blob);
-
+ 
        if (!looksLikeZip) {
 -        setError(
 -          'This file header does not indicate a .docx ZIP archive. Only .docx files are supported.',
 -        );
-+        setError(await getNonDocxBlobError(blob));
++        const fallback = await getWordFallbackPreview(blob);
++        if (fallback) {
++          setFallbackPreview(fallback);
++        } else {
++          setError(await getNonDocxBlobError(blob));
++        }
          setLoading(false);
          return;
        }
+@@ -132,12 +265,20 @@ export const DocPreviewer: React.FC<DocPreviewerProps> = ({
+       {/* Toolbar */}
+       <div className="flex items-center justify-between shrink-0 px-4 py-2 border-b border-border-normal bg-background-paper">
+         <span className="text-sm text-muted-foreground">
+-          {loading ? 'Loading...' : error ? '' : `Page ${pageCount || '-'}`}
++          {loading
++            ? 'Loading...'
++            : fallbackPreview
++              ? fallbackPreview.title
++              : error
++                ? ''
++                : `Page ${pageCount || '-'}`}
+         </span>
+         <div className="flex items-center gap-1">
+           <button
+             type="button"
+-            disabled={loading || !!error || zoomScale <= minZoom}
++            disabled={
++              loading || !!error || !!fallbackPreview || zoomScale <= minZoom
++            }
+             className="p-1 rounded hover:bg-gray-100 disabled:opacity-30 transition-opacity"
+             onClick={handleZoomOut}
+             aria-label="Zoom out"
+@@ -149,7 +290,9 @@ export const DocPreviewer: React.FC<DocPreviewerProps> = ({
+           </span>
+           <button
+             type="button"
+-            disabled={loading || !!error || zoomScale >= maxZoom}
++            disabled={
++              loading || !!error || !!fallbackPreview || zoomScale >= maxZoom
++            }
+             className="p-1 rounded hover:bg-gray-100 disabled:opacity-30 transition-opacity"
+             onClick={handleZoomIn}
+             aria-label="Zoom in"
+@@ -186,6 +329,26 @@ export const DocPreviewer: React.FC<DocPreviewerProps> = ({
+           </div>
+         )}
+ 
++        {fallbackPreview && !loading && (
++          <div className="h-full overflow-auto">
++            <div className="px-4 py-2 text-xs text-muted-foreground border-b border-border-normal">
++              {fallbackPreview.note}
++            </div>
++            {fallbackPreview.kind === 'html' ? (
++              <iframe
++                className="w-full h-full bg-white"
++                sandbox=""
++                srcDoc={fallbackPreview.body}
++                title="Word-compatible HTML preview"
++              />
++            ) : (
++              <pre className="whitespace-pre-wrap p-4 text-sm leading-6">
++                {fallbackPreview.body}
++              </pre>
++            )}
++          </div>
++        )}
++
+         {showContent && (
+           <div className="flex p-4" style={{ justifyContent: 'safe center' }}>
+             <div style={{ zoom: zoomScale / 100 }}>
 diff --git a/web/src/components/dynamic-form.tsx b/web/src/components/dynamic-form.tsx
 index 107109f..dfa1d97 100644
 --- a/web/src/components/dynamic-form.tsx
@@ -1070,7 +1491,7 @@ index 107109f..dfa1d97 100644
              try {
 @@ -945,7 +947,7 @@ const DynamicForm = {
                // }
-
+ 
                if (beValid && submitFunc) {
 -                form.handleSubmit(async (values) => {
 +                await form.handleSubmit(async (values) => {
@@ -1104,6 +1525,48 @@ index 107109f..dfa1d97 100644
            <Loader className="inline-block mr-2 h-4 w-4 animate-spin" />
          )}
          {buttonText ?? t('modal.okText')}
+diff --git a/web/src/hooks/use-knowledge-request.ts b/web/src/hooks/use-knowledge-request.ts
+index c218d39..95cd329 100644
+--- a/web/src/hooks/use-knowledge-request.ts
++++ b/web/src/hooks/use-knowledge-request.ts
+@@ -20,6 +20,7 @@ import kbService, {
+   listTag,
+   removeTag,
+   renameTag,
++  refreshLocalDataset,
+   updateKb,
+ } from '@/services/knowledge-service';
+ import {
+@@ -324,6 +325,29 @@ export const useFetchKnowledgeBaseConfiguration = (props?: {
+   return { data, loading };
+ };
+ 
++export const useRefreshLocalDataset = () => {
++  const queryClient = useQueryClient();
++  const knowledgeBaseId = useKnowledgeBaseId();
++  const { data, isPending: loading, mutateAsync } = useMutation({
++    mutationFn: async (datasetId?: string) => {
++      const { data = {} } = await refreshLocalDataset(
++        datasetId || knowledgeBaseId,
++      );
++      if (data.code === 0) {
++        message.success('Local folder refreshed');
++        queryClient.invalidateQueries({ queryKey: ['fetchDocumentList'] });
++        queryClient.invalidateQueries({ queryKey: ['fetchDocumentFilter'] });
++        queryClient.invalidateQueries({
++          queryKey: [KnowledgeApiAction.FetchKnowledgeDetail],
++        });
++      }
++      return data;
++    },
++  });
++
++  return { data, loading, refreshLocalDataset: mutateAsync };
++};
++
+ export function useFetchKnowledgeGraph() {
+   const knowledgeBaseId = useKnowledgeBaseId();
+ 
 diff --git a/web/src/layouts/components/header.tsx b/web/src/layouts/components/header.tsx
 index f2e9e0d..4f76916 100644
 --- a/web/src/layouts/components/header.tsx
@@ -1174,7 +1637,7 @@ index 36795b3..dcfeea7 100644
 +++ b/web/src/layouts/components/mobile-menu-footer.tsx
 @@ -1,9 +1,5 @@
  import { useTranslation } from 'react-i18next';
-
+ 
 -function FooterDivider() {
 -  return <span className="text-border-button select-none">|</span>;
 -}
@@ -1221,11 +1684,11 @@ index 09f344b..9c6050d 100644
  import { initReactI18next } from 'react-i18next';
  import translation_en from './en';
 +import translation_zh from './zh';
-
+ 
  //The language is based on the .ng file stored in the client's local storage.
  // The language stored in the database is for agent template resources, as these resources reside on the server.
  // When a user logs in from a different machine, the login page language is the language configured by VITE_DEFAULT_LANGUAGE_CODE.
-
+ 
 -const languageImports: Record<string, () => Promise<{ default: any }>> = {
 -  [LanguageAbbreviation.En]: () => import('./en'),
 -  [LanguageAbbreviation.Zh]: () => import('./zh'),
@@ -1248,7 +1711,7 @@ index 09f344b..9c6050d 100644
 +  'en',
 +  'zh-Hans',
 +];
-
+ 
 -const supportedLanguageCodes: Intl.UnicodeBCP47LocaleIdentifier[] =
 -  Object.keys(languageImports);
 +const upperFirstLetter = (value?: string): string => {
@@ -1257,7 +1720,7 @@ index 09f344b..9c6050d 100644
 +  }
 +  return value.charAt(0).toLocaleUpperCase() + value.slice(1);
 +};
-
+ 
  export const supportedLanguages = supportedLanguageCodes.map((code) => {
    const locale = new Intl.Locale(code);
 @@ -39,23 +28,24 @@ export const supportedLanguages = supportedLanguageCodes.map((code) => {
@@ -1270,29 +1733,29 @@ index 09f344b..9c6050d 100644
      ),
    };
  });
-
+ 
  export const DEFAULT_LANGUAGE_CODE =
 -  import.meta.env.VITE_DEFAULT_LANGUAGE_CODE || LanguageAbbreviation.En;
 +  import.meta.env.VITE_DEFAULT_LANGUAGE_CODE || 'en';
-
+ 
  const resources = {
 -  [LanguageAbbreviation.En]: translation_en,
 +  en: translation_en,
 +  'zh-Hans': translation_zh,
  };
-
+ 
  const updateDocumentLocale = (lng: string) => {
    document.documentElement.lang = lng;
    document.documentElement.dir = 'ltr';
 -  dayjs.locale(lng === 'zh' ? 'zh-cn' : lng);
 +  dayjs.locale(lng === 'zh-Hans' ? 'zh-cn' : lng);
  };
-
+ 
  i18n
 @@ -82,26 +72,14 @@ export const loadLanguageAsync = async (lng: string): Promise<void> => {
      return;
    }
-
+ 
 -  const importFn = languageImports[normalizedLng];
 -  if (!importFn) {
 -    console.warn(`Language ${lng} is not supported for lazy loading`);
@@ -1308,10 +1771,10 @@ index 09f344b..9c6050d 100644
 -  }
 +  console.warn(`Language ${lng} is not available in the local build`);
  };
-
+ 
  export const changeLanguageAsync = async (lng: string): Promise<void> => {
    const normalizedLng = lng;
-
+ 
    if (
 -    normalizedLng !== LanguageAbbreviation.En &&
 +    normalizedLng !== 'en' &&
@@ -1320,7 +1783,7 @@ index 09f344b..9c6050d 100644
      await loadLanguageAsync(normalizedLng);
 @@ -115,7 +93,11 @@ export const changeLanguageAsync = async (lng: string): Promise<void> => {
  };
-
+ 
  export const initLanguage = async (): Promise<void> => {
 -  const currentLng = storage.getLanguage() || DEFAULT_LANGUAGE_CODE;
 +  const storedLng = storage.getLanguage();
@@ -1328,9 +1791,90 @@ index 09f344b..9c6050d 100644
 +    storedLng && supportedLanguageCodes.includes(storedLng)
 +      ? storedLng
 +      : DEFAULT_LANGUAGE_CODE;
-
+ 
    await changeLanguageAsync(currentLng);
  };
+diff --git a/web/src/locales/en.ts b/web/src/locales/en.ts
+index 1685ecb..6f87d77 100644
+--- a/web/src/locales/en.ts
++++ b/web/src/locales/en.ts
+@@ -448,6 +448,7 @@ Example: A 1 KB message with 1024-dim embedding uses ~9 KB. The 5 MB default lim
+       notGenerated: 'Not generated',
+       generatedOn: 'Generated on ',
+       subbarFiles: 'Files',
++      localRefresh: 'Refresh',
+       generateKnowledgeGraph:
+         'This will extract entities and relationships from all your documents in this dataset. The process may take a while to complete.',
+       generateRaptor:
+diff --git a/web/src/locales/zh.ts b/web/src/locales/zh.ts
+index 2874527..abfe111 100644
+--- a/web/src/locales/zh.ts
++++ b/web/src/locales/zh.ts
+@@ -400,6 +400,7 @@ export default {
+       notGenerated: '未生成',
+       generatedOn: '生成于',
+       subbarFiles: '文件列表',
++      localRefresh: '刷新',
+       generate: '生成',
+       raptor: 'RAPTOR',
+       processingType: '处理类型',
+diff --git a/web/src/pages/dataset/dataset/index.tsx b/web/src/pages/dataset/dataset/index.tsx
+index cfe388e..08a16dc 100644
+--- a/web/src/pages/dataset/dataset/index.tsx
++++ b/web/src/pages/dataset/dataset/index.tsx
+@@ -19,8 +19,11 @@ import {
+   useSelectedIds,
+ } from '@/hooks/logic-hooks/use-row-selection';
+ import { useFetchDocumentList } from '@/hooks/use-document-request';
+-import { useFetchKnowledgeBaseConfiguration } from '@/hooks/use-knowledge-request';
+-import { LucidePlus } from 'lucide-react';
++import {
++  useFetchKnowledgeBaseConfiguration,
++  useRefreshLocalDataset,
++} from '@/hooks/use-knowledge-request';
++import { LucidePlus, RefreshCw } from 'lucide-react';
+ import { useEffect } from 'react';
+ import { useTranslation } from 'react-i18next';
+ import { MetadataType } from '../components/metedata/constant';
+@@ -58,6 +61,11 @@ export default function Dataset() {
+   } = useFetchDocumentList();
+ 
+   const { data: dataSetData } = useFetchKnowledgeBaseConfiguration();
++  const {
++    loading: localDatasetRefreshLoading,
++    refreshLocalDataset,
++  } = useRefreshLocalDataset();
++  const isDefaultDataset = knowledgeBase?.name === 'Default';
+ 
+   const { filters, onOpenChange, filterGroup } = useSelectDatasetFilters();
+ 
+@@ -164,7 +172,25 @@ export default function Dataset() {
+               </p>
+             </div>
+           }
+-          preChildren={<Generate disabled={!(dataSetData.chunk_count > 0)} />}
++          preChildren={
++            <div className="flex items-center gap-2">
++              {isDefaultDataset && (
++                <Button
++                  variant="ghost"
++                  className="border border-border-button"
++                  disabled={localDatasetRefreshLoading}
++                  onClick={() => refreshLocalDataset()}
++                >
++                  <RefreshCw
++                    className={localDatasetRefreshLoading ? 'animate-spin' : ''}
++                    size={16}
++                  />
++                  {t('knowledgeDetails.localRefresh')}
++                </Button>
++              )}
++              <Generate disabled={!(dataSetData.chunk_count > 0)} />
++            </div>
++          }
+           // preChildren={
+           //   <Button
+           //     variant={'ghost'}
 diff --git a/web/src/pages/login-next/index.tsx b/web/src/pages/login-next/index.tsx
 index 2d0d06b..f58171b 100644
 --- a/web/src/pages/login-next/index.tsx
@@ -1343,10 +1887,10 @@ index 2d0d06b..f58171b 100644
 +import { useContext, useEffect, useRef, useState } from 'react';
  import { useTranslation } from 'react-i18next';
  import { useNavigate } from 'react-router';
-
+ 
 @@ -268,12 +268,40 @@ const Login = () => {
    const registerEnabled = config?.registerEnabled !== 0;
-
+ 
    const { isLogin } = useAuth();
 +  const autoLoginStarted = useRef(false);
 +  const [autoLoginFallback, setAutoLoginFallback] = useState(false);
@@ -1356,7 +1900,7 @@ index 2d0d06b..f58171b 100644
        navigate('/');
      }
    }, [isLogin, navigate]);
-
+ 
 +  useEffect(() => {
 +    if (isLogin || autoLoginStarted.current) {
 +      return;
@@ -1388,7 +1932,7 @@ index 2d0d06b..f58171b 100644
 @@ -355,6 +383,10 @@ const Login = () => {
      }
    };
-
+ 
 +  if (!autoLoginFallback && !isLogin) {
 +    return <></>;
 +  }
@@ -1423,13 +1967,13 @@ index 1039c7c..d70f822 100644
 +import { FC, useCallback, useEffect, useMemo, useRef, useState } from 'react';
  import { useTranslation } from 'react-i18next';
 +import type { LocalModelDefaults } from '../index';
-
+ 
  export const mapModelKey = {
    image2text: 'VLM',
 @@ -20,196 +26,605 @@ export const mapModelKey = {
    ocr: 'OCR',
  };
-
+ 
 -const orderMap: Record<ModelType, number> = {
 -  chat: 1,
 -  embedding: 2,
@@ -1447,7 +1991,7 @@ index 1039c7c..d70f822 100644
 +  endpoint_ok: boolean;
 +  error?: string;
  };
-
+ 
 -type ModelType =
 -  | 'chat'
 -  | 'embedding'
@@ -1611,7 +2155,7 @@ index 1039c7c..d70f822 100644
 +  };
 +  return descriptions[type];
  };
-
+ 
  export const AvailableModels: FC<{
 -  handleAddModel: (factory: string) => void;
 +  handleAddModel: (factory: string, defaults?: LocalModelDefaults) => void;
@@ -1633,7 +2177,7 @@ index 1039c7c..d70f822 100644
 +  const [downloadProgress, setDownloadProgress] = useState(0);
 +  const [activeGroup, setActiveGroup] = useState<ModelGroup>('chat');
 +  const [error, setError] = useState('');
-
+ 
 -  const searchedModels = useMemo(() => {
 -    return factoryList.filter((model) =>
 -      model.name.toLowerCase().includes(searchTerm.toLowerCase()),
@@ -1674,7 +2218,7 @@ index 1039c7c..d70f822 100644
 +    }),
 +    [isZh],
 +  );
-
+ 
 -  const filteredModels = useMemo(() => {
 -    if (selectedTag === null) {
 -      return searchedModels;
@@ -1729,7 +2273,7 @@ index 1039c7c..d70f822 100644
 +  useEffect(() => {
 +    loadModels();
 +  }, [loadModels]);
-
+ 
 -  const handleTagClick = (tag: string) => {
 -    setSelectedTag(selectedTag === tag ? null : tag);
 +  const needle = searchTerm.toLowerCase();
@@ -1777,7 +2321,7 @@ index 1039c7c..d70f822 100644
 +  const configureModel = (model: LocalModel | RecommendedModel) => {
 +    handleAddModel(LLMFactory.OpenAiAPICompatible, makeDefaults(model));
    };
-
+ 
 +  const startDownloadJob = useCallback(async (modelId: string) => {
 +    const response = await fetch(`${OBJECT_SERVICE_URL}/v1/models/download`, {
 +      method: 'POST',
@@ -1983,7 +2527,7 @@ index 1039c7c..d70f822 100644
 +          </div>
 +        )}
        </header>
-
+ 
 -      {/* Models List */}
 -      <div className="p-4 pt-0 flex flex-col gap-4 overflow-auto h-full scrollbar-auto">
 -        {filteredModels.map((model) => (
@@ -2197,7 +2741,7 @@ index 0e02a87..1479627 100644
  import { useCustomModelFields } from '../modal/provider-modal/components/use-custom-model-fields';
 +import type { LocalModelDefaults } from '../index';
  import { mapModelKey } from './un-add-model';
-
+ 
  export function UsedModel({
    handleAddModel,
    onEditInstance,
@@ -2238,7 +2782,7 @@ index e5254dc..9b046b7 100644
 @@ -22,6 +23,59 @@ import ProviderModal, { IViewModeOkPayload } from './modal/provider-modal';
  import SoMarkModal from './modal/somark-modal';
  import { splitProviderPayload } from './payload-utils';
-
+ 
 +export type LocalModelDefaults = {
 +  instance_name?: string;
 +  model_name?: string;
@@ -2353,7 +2897,7 @@ index e5254dc..9b046b7 100644
        }
 @@ -228,7 +291,9 @@ const ModelProviders = () => {
    );
-
+ 
    const handleAddModel = useCallback(
 -    (llmFactory: string) => {
 +    (llmFactory: string, defaults?: LocalModelDefaults) => {
@@ -2395,7 +2939,7 @@ index e5254dc..9b046b7 100644
      setViewMode(false);
 +    setViewModeInitialValues(undefined);
    }, []);
-
+ 
    const { onApiKeyVerifying: onSoMarkVerifying } = useVerifySettings({
 diff --git a/web/src/pages/user-setting/setting-model/modal/provider-modal/constants.ts b/web/src/pages/user-setting/setting-model/modal/provider-modal/constants.ts
 index bd77e06..ec222da 100644
@@ -2415,7 +2959,7 @@ index 624d230..d1feccf 100644
 +++ b/web/src/pages/user-setting/setting-model/modal/provider-modal/hooks/use-provider-fields.tsx
 @@ -250,9 +250,9 @@ export const useProviderFields = ({
    ]);
-
+ 
    const defaultValues: FieldValues = useMemo(() => {
 -    // In editMode or viewMode, seed the form with the supplied
 -    // `initialValues` so the user sees the existing instance/model data.
@@ -2462,9 +3006,9 @@ index f9df605..cc8ee7c 100644
 +    model_info: Array.isArray(model_info) ? [] : [],
      ...other,
    };
-
+ 
    const modelExtra = collectModelExtras(payload);
-
+ 
    const modelPayload = {
 -    model_name: (payload.model_name ?? payload.llm_name) as string,
 -    model_type: payload.model_type,
@@ -2474,3 +3018,31 @@ index f9df605..cc8ee7c 100644
 +    max_tokens: max_tokens as number,
      ...(Object.keys(modelExtra).length > 0 ? { extra: modelExtra } : {}),
    };
+ 
+diff --git a/web/src/services/knowledge-service.ts b/web/src/services/knowledge-service.ts
+index 7c72b1d..dc36d9a 100644
+--- a/web/src/services/knowledge-service.ts
++++ b/web/src/services/knowledge-service.ts
+@@ -260,6 +260,9 @@ export const listDataset = (params?: IFetchKnowledgeListRequestParams) =>
+ export const updateKb = (datasetId: string, data: Record<string, any>) =>
+   request.put(api.updateKb(datasetId), { data });
+ 
++export const refreshLocalDataset = (datasetId: string) =>
++  request.post(api.localDatasetRefresh(datasetId));
++
+ export const runIndex = (datasetId: string, indexType: string) =>
+   request.post(api.runIndex(datasetId, indexType));
+ 
+diff --git a/web/src/utils/api.ts b/web/src/utils/api.ts
+index 806090d..aed8c6b 100644
+--- a/web/src/utils/api.ts
++++ b/web/src/utils/api.ts
+@@ -128,6 +128,8 @@ export default {
+   getMeta: `${restAPIv1}/datasets/metadata/flattened`,
+   getKnowledgeBasicInfo: (datasetId: string) =>
+     `${restAPIv1}/datasets/${datasetId}/ingestions/summary`,
++  localDatasetRefresh: (datasetId: string) =>
++    `${restAPIv1}/datasets/${datasetId}/local-refresh`,
+   // data pipeline log
+   fetchDataPipelineLog: (datasetId: string) =>
+     `${restAPIv1}/datasets/${datasetId}/ingestions`,

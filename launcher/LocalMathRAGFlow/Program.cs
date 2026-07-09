@@ -8,6 +8,7 @@ using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 using System.Windows.Forms;
 
@@ -18,6 +19,11 @@ internal static class Program
     [STAThread]
     private static void Main()
     {
+        if (LauncherInstanceCoordinator.TryForwardToExistingInstance())
+        {
+            return;
+        }
+
         ApplicationConfiguration.Initialize();
         Application.ThreadException += (_, e) => TrayContext.LogStartup("THREAD ERROR " + e.Exception);
         AppDomain.CurrentDomain.UnhandledException += (_, e) => TrayContext.LogStartup("UNHANDLED ERROR " + e.ExceptionObject);
@@ -27,11 +33,81 @@ internal static class Program
         Application.Run(new TrayContext());
     }
 }
+
+internal static class LauncherInstanceCoordinator
+{
+    public static string CurrentVersion
+    {
+        get
+        {
+            var path = Environment.ProcessPath ?? Application.ExecutablePath;
+            var info = FileVersionInfo.GetVersionInfo(path);
+            var fileVersion = info.ProductVersion;
+            if (string.IsNullOrWhiteSpace(fileVersion))
+            {
+                fileVersion = info.FileVersion;
+            }
+            if (string.IsNullOrWhiteSpace(fileVersion))
+            {
+                fileVersion = typeof(Program).Assembly.GetName().Version?.ToString() ?? "0.0.0";
+            }
+            var buildTicks = File.Exists(path) ? File.GetLastWriteTimeUtc(path).Ticks : 0;
+            return $"{fileVersion}+{buildTicks}";
+        }
+    }
+
+    public static bool TryForwardToExistingInstance()
+    {
+        try
+        {
+            using var client = new HttpClient { Timeout = TimeSpan.FromMilliseconds(700) };
+            var existingVersion = client.GetStringAsync($"{StartupStatusServer.EntryUrl}version").GetAwaiter().GetResult().Trim();
+            if (string.IsNullOrWhiteSpace(existingVersion))
+            {
+                return false;
+            }
+
+            if (string.Equals(existingVersion, CurrentVersion, StringComparison.Ordinal))
+            {
+                client.PostAsync($"{StartupStatusServer.EntryUrl}focus", null).GetAwaiter().GetResult().Dispose();
+                return true;
+            }
+
+            client.PostAsync($"{StartupStatusServer.EntryUrl}shutdown", null).GetAwaiter().GetResult().Dispose();
+            WaitForPreviousInstanceToClose();
+            return false;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static void WaitForPreviousInstanceToClose()
+    {
+        var start = DateTimeOffset.UtcNow;
+        while (DateTimeOffset.UtcNow - start < TimeSpan.FromSeconds(8))
+        {
+            try
+            {
+                using var client = new HttpClient { Timeout = TimeSpan.FromMilliseconds(300) };
+                client.GetStringAsync($"{StartupStatusServer.EntryUrl}version").GetAwaiter().GetResult();
+                Thread.Sleep(250);
+            }
+            catch
+            {
+                return;
+            }
+        }
+    }
+}
+
 internal sealed class TrayContext : ApplicationContext
 {
     private NotifyIcon? tray;
     private readonly string logFile;
     private readonly System.Windows.Forms.Timer windowStateTimer;
+    private readonly SynchronizationContext uiContext;
     private Process? browserProcess;
     private DateTimeOffset lastOpenAt = DateTimeOffset.MinValue;
 
@@ -39,6 +115,10 @@ internal sealed class TrayContext : ApplicationContext
     {
         logFile = Path.Combine(AppContext.BaseDirectory, "launcher-tray.log");
         Log("launcher tray starting");
+        uiContext = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
+        StartupStatusServer.RegisterControlHandlers(
+            () => uiContext.Post(_ => OpenWeb(), null),
+            () => uiContext.Post(_ => ShutdownLauncherOnly(), null));
         windowStateTimer = new System.Windows.Forms.Timer { Interval = 3000 };
         windowStateTimer.Tick += (_, _) => SaveCurrentBrowserWindowState();
         windowStateTimer.Start();
@@ -61,6 +141,11 @@ internal sealed class TrayContext : ApplicationContext
         {
             OpenWeb(forceStatusPage: true);
             await BackgroundStartupTask.StopServicesAsync();
+        });
+        AddTrayItem(menu, "Reset runtime policy", async (_, _) =>
+        {
+            OpenWeb(forceStatusPage: true);
+            await BackgroundStartupTask.ResetRuntimePolicyAsync();
         });
         AddSeparator(menu);
         AddTrayItem(menu, "Open dataset", (_, _) => OpenPath(Path.Combine(FindRoot(), "data", "dataset")));
@@ -214,30 +299,114 @@ internal sealed class TrayContext : ApplicationContext
             browserProcess = null;
         }
 
-        if (browserProcess is { HasExited: false })
+        var launcherDataDir = Path.Combine(FindRoot(), "data", "launcher");
+        var profileDir = Path.Combine(launcherDataDir, "browser-profile");
+        Directory.CreateDirectory(profileDir);
+        if (!forceStatusPage && TryFocusExistingBrowserWindow(state))
         {
-            browserProcess.Refresh();
-            if (browserProcess.MainWindowHandle != IntPtr.Zero)
-            {
-                ApplyBrowserWindowState(browserProcess.MainWindowHandle, state);
-                SetForegroundWindow(browserProcess.MainWindowHandle);
-                return;
-            }
+            return;
         }
 
-        var launcherDataDir = Path.Combine(FindRoot(), "data", "launcher");
-        var profileDir = Path.Combine(
-            launcherDataDir,
-            $"browser-profile-run-{Environment.ProcessId}-{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}");
-        Directory.CreateDirectory(profileDir);
         CleanupOldBrowserProfiles(launcherDataDir);
         Log($"starting browser app with profile {profileDir}");
+        var browserArgs = BuildBrowserArguments(url, profileDir, state);
         browserProcess = Process.Start(new ProcessStartInfo
         {
             FileName = browser,
-            Arguments = $"--app=\"{url}\" --user-data-dir=\"{profileDir}\" --no-first-run{(state.Maximized ? " --start-maximized" : "")}",
+            Arguments = browserArgs,
             UseShellExecute = false
         });
+    }
+
+    private bool TryFocusExistingBrowserWindow(BrowserWindowState state)
+    {
+        if (TryFocusBrowserProcessWindow(browserProcess, state, TimeSpan.FromSeconds(2)))
+        {
+            return true;
+        }
+
+        if (browserProcess is { HasExited: false })
+        {
+            Log("browser process is running without a visible window yet");
+            return true;
+        }
+
+        if (TryFindBrowserAppWindow(out var handle))
+        {
+            ApplyBrowserWindowState(handle, state);
+            SetForegroundWindow(handle);
+            Log("focused existing browser app window");
+            return true;
+        }
+
+        return false;
+    }
+
+    private bool TryFocusBrowserProcessWindow(Process? process, BrowserWindowState state, TimeSpan timeout)
+    {
+        if (process is null)
+        {
+            return false;
+        }
+
+        var start = DateTimeOffset.UtcNow;
+        while (DateTimeOffset.UtcNow - start <= timeout)
+        {
+            try
+            {
+                if (process.HasExited)
+                {
+                    return false;
+                }
+
+                process.Refresh();
+                var handle = process.MainWindowHandle;
+                if (handle == IntPtr.Zero)
+                {
+                    handle = FindTopLevelWindowForProcess(process.Id);
+                }
+                if (handle != IntPtr.Zero)
+                {
+                    ApplyBrowserWindowState(handle, state);
+                    SetForegroundWindow(handle);
+                    Log("focused tracked browser app window");
+                    return true;
+                }
+            }
+            catch
+            {
+                return false;
+            }
+            Thread.Sleep(100);
+        }
+
+        return false;
+    }
+
+    private static string BuildBrowserArguments(string url, string profileDir, BrowserWindowState state)
+    {
+        var args = new List<string>
+        {
+            $"--app={QuoteArg(url)}",
+            $"--user-data-dir={QuoteArg(profileDir)}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-sync",
+            "--disable-component-update",
+            "--disable-background-networking",
+            "--disable-notifications",
+            "--disable-features=msEdgeOnRampFRE,msEdgeSignIn,msEdgeSync,msEdgeWelcomePage,EdgeShoppingAssistant,msDiscoverChatButton"
+        };
+        if (state.Maximized)
+        {
+            args.Add("--start-maximized");
+        }
+        return string.Join(" ", args);
+    }
+
+    private static string QuoteArg(string value)
+    {
+        return "\"" + value.Replace("\"", "\\\"") + "\"";
     }
 
     private static void CleanupOldBrowserProfiles(string launcherDataDir)
@@ -323,6 +492,90 @@ internal sealed class TrayContext : ApplicationContext
         ShowWindow(handle, state.Maximized ? ShowWindowMaximized : ShowWindowRestore);
     }
 
+    private static bool TryFindBrowserAppWindow(out IntPtr handle)
+    {
+        var foundHandle = IntPtr.Zero;
+        EnumWindows((candidate, _) =>
+        {
+            if (!IsWindowVisible(candidate))
+            {
+                return true;
+            }
+
+            GetWindowThreadProcessId(candidate, out var processId);
+            if (!IsChromiumProcess(processId))
+            {
+                return true;
+            }
+
+            var title = GetWindowTitle(candidate);
+            if (!IsLocalMathRagFlowWindowTitle(title))
+            {
+                return true;
+            }
+
+            foundHandle = candidate;
+            return false;
+        }, IntPtr.Zero);
+        handle = foundHandle;
+        return handle != IntPtr.Zero;
+    }
+
+    private static IntPtr FindTopLevelWindowForProcess(int processId)
+    {
+        var handle = IntPtr.Zero;
+        EnumWindows((candidate, _) =>
+        {
+            if (!IsWindowVisible(candidate))
+            {
+                return true;
+            }
+
+            GetWindowThreadProcessId(candidate, out var candidateProcessId);
+            if (candidateProcessId != processId)
+            {
+                return true;
+            }
+
+            handle = candidate;
+            return false;
+        }, IntPtr.Zero);
+        return handle;
+    }
+
+    private static bool IsChromiumProcess(uint processId)
+    {
+        try
+        {
+            using var process = Process.GetProcessById(unchecked((int)processId));
+            return process.ProcessName.Equals("msedge", StringComparison.OrdinalIgnoreCase) ||
+                   process.ProcessName.Equals("chrome", StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static string GetWindowTitle(IntPtr handle)
+    {
+        var length = GetWindowTextLength(handle);
+        if (length <= 0)
+        {
+            return "";
+        }
+
+        var builder = new StringBuilder(length + 1);
+        GetWindowText(handle, builder, builder.Capacity);
+        return builder.ToString();
+    }
+
+    private static bool IsLocalMathRagFlowWindowTitle(string title)
+    {
+        return title.Contains("LocalMathRAGFlow", StringComparison.OrdinalIgnoreCase) ||
+               title.Contains("RAGFlow", StringComparison.OrdinalIgnoreCase);
+    }
+
     private static bool TryGetWindowPlacement(IntPtr handle, out WindowPlacement placement)
     {
         placement = new WindowPlacement { Length = Marshal.SizeOf<WindowPlacement>() };
@@ -334,6 +587,14 @@ internal sealed class TrayContext : ApplicationContext
         Log("menu exit clicked");
         OpenWeb(forceStatusPage: true);
         await BackgroundStartupTask.StopServicesAsync(exitAfterStop: true);
+        CloseBrowserProcess();
+        tray?.Dispose();
+        ExitThread();
+    }
+
+    private void ShutdownLauncherOnly()
+    {
+        Log("shutdown requested by newer launcher");
         CloseBrowserProcess();
         tray?.Dispose();
         ExitThread();
@@ -445,9 +706,26 @@ internal sealed class TrayContext : ApplicationContext
     [DllImport("user32.dll")]
     private static extern bool GetWindowPlacement(IntPtr hWnd, ref WindowPlacement lpwndpl);
 
+    [DllImport("user32.dll")]
+    private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    private static extern bool IsWindowVisible(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern int GetWindowTextLength(IntPtr hWnd);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
     private const int ShowWindowRestore = 9;
     private const int ShowWindowMaximized = 3;
     private const int ShowWindowMinimized = 2;
+
+    private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
     private readonly record struct BrowserWindowState(bool Maximized);
 
@@ -469,6 +747,14 @@ internal static class StartupStatusServer
     public static string EntryUrl => $"http://127.0.0.1:{Port}/";
     private static int started;
     private static TcpListener? listener;
+    private static Action? focusRequested;
+    private static Action? shutdownRequested;
+
+    public static void RegisterControlHandlers(Action onFocusRequested, Action onShutdownRequested)
+    {
+        focusRequested = onFocusRequested;
+        shutdownRequested = onShutdownRequested;
+    }
 
     public static void StartDetached()
     {
@@ -525,6 +811,23 @@ internal static class StartupStatusServer
         }
 
         var path = requestLine.Split(' ', StringSplitOptions.RemoveEmptyEntries).Skip(1).FirstOrDefault() ?? "/";
+        if (path.StartsWith("/version", StringComparison.OrdinalIgnoreCase))
+        {
+            await WriteResponseAsync(stream, "text/plain; charset=utf-8", LauncherInstanceCoordinator.CurrentVersion);
+            return;
+        }
+        if (path.StartsWith("/focus", StringComparison.OrdinalIgnoreCase))
+        {
+            focusRequested?.Invoke();
+            await WriteResponseAsync(stream, "application/json; charset=utf-8", "{\"ok\":true}");
+            return;
+        }
+        if (path.StartsWith("/shutdown", StringComparison.OrdinalIgnoreCase))
+        {
+            shutdownRequested?.Invoke();
+            await WriteResponseAsync(stream, "application/json; charset=utf-8", "{\"ok\":true}");
+            return;
+        }
         if (path.StartsWith("/start", StringComparison.OrdinalIgnoreCase))
         {
             BackgroundStartupTask.StartDetached();
@@ -534,6 +837,12 @@ internal static class StartupStatusServer
         if (path.StartsWith("/stop", StringComparison.OrdinalIgnoreCase))
         {
             _ = Task.Run(async () => await BackgroundStartupTask.StopServicesAsync());
+            await WriteResponseAsync(stream, "application/json; charset=utf-8", "{\"ok\":true}");
+            return;
+        }
+        if (path.StartsWith("/reset-runtime-policy", StringComparison.OrdinalIgnoreCase))
+        {
+            _ = Task.Run(async () => await BackgroundStartupTask.ResetRuntimePolicyAsync());
             await WriteResponseAsync(stream, "application/json; charset=utf-8", "{\"ok\":true}");
             return;
         }
@@ -590,7 +899,9 @@ internal static class StartupStatusServer
             updated_at = updatedAt,
             ready = state is "running",
             stopped = state is "stopped",
+            resetting = state is "resetting_policy",
             close = state is "stopped_exit",
+            language = ResolveConfiguredLanguage(root),
             web_url = $"{webUrl}/?localmathrag_reload={DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}"
         };
         return JsonSerializer.Serialize(payload);
@@ -598,9 +909,12 @@ internal static class StartupStatusServer
 
     private static string BuildLoadingHtmlPage()
     {
+        var root = FindRoot();
+        var webUrl = $"http://127.0.0.1:{GetRagflowWebPort(root)}";
+        var language = ResolveConfiguredLanguage(root);
         return """
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en" data-configured-language="__LANGUAGE__" data-web-url="__WEB_URL__">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -611,8 +925,13 @@ internal static class StartupStatusServer
     main { width: min(520px, calc(100vw - 40px)); background: #fff; border: 1px solid #d8dee4; border-radius: 14px; padding: 26px 28px; box-shadow: 0 18px 48px rgba(31,35,40,.08); }
     h1 { margin: 0 0 8px; font-size: 22px; font-weight: 650; letter-spacing: 0; }
     p { margin: 0; color: #59636e; line-height: 1.6; }
-    button { margin-top: 18px; border: 1px solid #0969da; border-radius: 8px; background: #0969da; color: #fff; font: inherit; font-weight: 600; padding: 9px 14px; cursor: pointer; }
+    .actions { margin-top: 18px; display: grid; grid-template-columns: auto auto minmax(0, 1fr); align-items: center; gap: 10px 12px; }
+    button { border: 1px solid #0969da; border-radius: 8px; background: #0969da; color: #fff; font: inherit; font-weight: 600; padding: 9px 14px; cursor: pointer; }
+    button.secondary { border-color: #d0d7de; background: #fff; color: #24292f; }
     button[hidden] { display: none; }
+    button:disabled { cursor: wait; opacity: .62; }
+    .policy-note { min-width: 0; font-size: 13px; color: #59636e; line-height: 1.45; }
+    @media (max-width: 560px) { .actions { grid-template-columns: 1fr; } .actions button { width: 100%; } }
     .bar { margin: 22px 0 14px; height: 8px; overflow: hidden; border-radius: 999px; background: #eaeef2; }
     .bar::before { content: ""; display: block; width: 42%; height: 100%; border-radius: inherit; background: #0969da; animation: move 1.2s ease-in-out infinite; }
     .meta { margin-top: 16px; font-size: 13px; color: #6e7781; }
@@ -621,22 +940,157 @@ internal static class StartupStatusServer
 </head>
 <body>
   <main>
-    <h1>LocalMathRAGFlow &#27491;&#22312;&#21551;&#21160;</h1>
-    <p id="message">&#27491;&#22312;&#26816;&#26597;&#21518;&#21488;&#26381;&#21153;&#12290;</p>
+    <h1 id="title">LocalMathRAGFlow</h1>
+    <p id="message"></p>
     <div class="bar" id="bar" aria-hidden="true"></div>
     <p class="meta" id="state">starting</p>
-    <button id="start" hidden>Start service</button>
+    <div class="actions">
+      <button id="start" hidden></button>
+      <button id="reset" class="secondary"></button>
+      <p class="policy-note" id="policy-note"></p>
+    </div>
   </main>
   <script>
+    const translations = {
+      en: {
+        startingTitle: 'LocalMathRAGFlow is starting',
+        stoppingTitle: 'LocalMathRAGFlow is stopping',
+        stoppedTitle: 'LocalMathRAGFlow is stopped',
+        resettingTitle: 'LocalMathRAGFlow is resetting',
+        startButton: 'Start service',
+        resetButton: 'Reset runtime policy',
+        policyNote: 'Local model calls use dynamic scheduling. The app generates a configuration from previous runtime results. If hardware changed or startup is stuck, use reset to clean resources and generate a fresh configuration.',
+        confirmReset: 'Reset runtime policy, stop model containers, and reconfigure services now?',
+        statusUnavailable: 'Waiting for the launcher status service.',
+        statusUnavailableProbe: 'Waiting for the launcher status service. Checking whether RAGFlow is already available.',
+        statusUnavailableStopped: 'The launcher status service is unavailable and RAGFlow is not responding. Background services appear to be stopped.',
+        checking_service: 'Checking whether RAGFlow Web is already running.',
+        checking_docker: 'Checking Docker availability.',
+        starting_docker: 'Starting Docker Desktop.',
+        starting_compose: 'Starting Docker Compose services.',
+        waiting_web: 'Waiting for RAGFlow Web.',
+        running: 'RAGFlow Web is ready.',
+        web_warming: 'Containers are running; RAGFlow Web may still be warming up.',
+        stopped: 'Background services stopped.',
+        stopped_exit: 'Background services stopped.',
+        stopping: 'Stopping Docker Compose services.',
+        resetting_policy: 'Resetting runtime policy and cleaning model runtime resources.',
+        docker_missing: 'Docker CLI was not found. Install Docker Desktop and restart LocalMathRAGFlow.',
+        docker_timeout: 'Docker Desktop did not become ready within 5 minutes.',
+        ragflow_missing: 'RAGFlow source is missing; user confirmation is required before downloading.',
+        compose_failed: 'Docker Compose startup failed.',
+        error: 'Startup failed.',
+      },
+      'zh-Hans': {
+        startingTitle: 'LocalMathRAGFlow \u6b63\u5728\u542f\u52a8',
+        stoppingTitle: 'LocalMathRAGFlow \u6b63\u5728\u505c\u6b62',
+        stoppedTitle: 'LocalMathRAGFlow \u5df2\u505c\u6b62',
+        resettingTitle: 'LocalMathRAGFlow \u6b63\u5728\u91cd\u7f6e',
+        startButton: '\u542f\u52a8\u670d\u52a1',
+        resetButton: '\u91cd\u7f6e\u8fd0\u884c\u7b56\u7565',
+        policyNote: '\u672c\u5730\u6a21\u578b\u8c03\u7528\u91c7\u7528\u52a8\u6001\u8c03\u5ea6\uff0c\u6839\u636e\u5386\u53f2\u8fd0\u884c\u7ed3\u679c\u751f\u6210\u914d\u7f6e\u65b9\u6848\u3002\u914d\u7f6e\u53d8\u5316\u6216\u542f\u52a8\u5361\u4f4f\u65f6\uff0c\u53ef\u4ee5\u6309\u91cd\u7f6e\u6309\u94ae\u6e05\u7406\u8d44\u6e90\u5e76\u91cd\u65b0\u751f\u6210\u914d\u7f6e\u3002',
+        confirmReset: '\u73b0\u5728\u91cd\u7f6e\u8fd0\u884c\u7b56\u7565\u3001\u505c\u6b62\u6a21\u578b\u5bb9\u5668\u5e76\u91cd\u65b0\u914d\u7f6e\u670d\u52a1\uff1f',
+        statusUnavailable: '\u6b63\u5728\u7b49\u5f85\u542f\u52a8\u5668\u72b6\u6001\u670d\u52a1\u3002',
+        statusUnavailableProbe: '\u6b63\u5728\u7b49\u5f85\u542f\u52a8\u5668\u72b6\u6001\u670d\u52a1\uff0c\u540c\u65f6\u68c0\u67e5 RAGFlow \u662f\u5426\u5df2\u53ef\u7528\u3002',
+        statusUnavailableStopped: '\u542f\u52a8\u5668\u72b6\u6001\u670d\u52a1\u4e0d\u53ef\u7528\uff0cRAGFlow \u4e5f\u672a\u54cd\u5e94\u3002\u540e\u53f0\u670d\u52a1\u53ef\u80fd\u5df2\u505c\u6b62\u3002',
+        checking_service: '\u6b63\u5728\u68c0\u67e5 RAGFlow Web \u662f\u5426\u5df2\u8fd0\u884c\u3002',
+        checking_docker: '\u6b63\u5728\u68c0\u67e5 Docker \u53ef\u7528\u6027\u3002',
+        starting_docker: '\u6b63\u5728\u542f\u52a8 Docker Desktop\u3002',
+        starting_compose: '\u6b63\u5728\u542f\u52a8 Docker Compose \u670d\u52a1\u3002',
+        waiting_web: '\u6b63\u5728\u7b49\u5f85 RAGFlow Web\u3002',
+        running: 'RAGFlow Web \u5df2\u5c31\u7eea\u3002',
+        web_warming: '\u5bb9\u5668\u5df2\u8fd0\u884c\uff0cRAGFlow Web \u53ef\u80fd\u4ecd\u5728\u9884\u70ed\u3002',
+        stopped: '\u540e\u53f0\u670d\u52a1\u5df2\u505c\u6b62\u3002',
+        stopped_exit: '\u540e\u53f0\u670d\u52a1\u5df2\u505c\u6b62\u3002',
+        stopping: '\u6b63\u5728\u505c\u6b62 Docker Compose \u670d\u52a1\u3002',
+        resetting_policy: '\u6b63\u5728\u91cd\u7f6e\u8fd0\u884c\u7b56\u7565\u5e76\u6e05\u7406\u6a21\u578b\u8fd0\u884c\u8d44\u6e90\u3002',
+        docker_missing: '\u672a\u627e\u5230 Docker CLI\u3002\u8bf7\u5b89\u88c5 Docker Desktop \u540e\u91cd\u542f LocalMathRAGFlow\u3002',
+        docker_timeout: 'Docker Desktop \u5728 5 \u5206\u949f\u5185\u672a\u5c31\u7eea\u3002',
+        ragflow_missing: 'RAGFlow \u6e90\u7801\u7f3a\u5931\uff1b\u9700\u8981\u7528\u6237\u786e\u8ba4\u540e\u624d\u80fd\u4e0b\u8f7d\u3002',
+        compose_failed: 'Docker Compose \u542f\u52a8\u5931\u8d25\u3002',
+        error: '\u542f\u52a8\u5931\u8d25\u3002',
+      },
+    };
     const startButton = document.getElementById('start');
-    const title = document.querySelector('h1');
+    const resetButton = document.getElementById('reset');
+    const title = document.getElementById('title');
+    const message = document.getElementById('message');
+    const stateText = document.getElementById('state');
+    const policyNote = document.getElementById('policy-note');
     const bar = document.getElementById('bar');
+    const configuredWebUrl = document.documentElement.dataset.webUrl || 'http://127.0.0.1/';
+    let currentLanguage = normalizeLanguage(
+      localStorage.getItem('lng') ||
+      document.documentElement.dataset.configuredLanguage ||
+      navigator.language ||
+      'en'
+    );
+    let statusFailures = 0;
+
+    function normalizeLanguage(value) {
+      const lng = String(value || '').toLowerCase();
+      if (lng.startsWith('zh')) return 'zh-Hans';
+      return 'en';
+    }
+    function tr(key) {
+      return (translations[currentLanguage] && translations[currentLanguage][key]) || translations.en[key] || key;
+    }
+    function applyLanguage(lng) {
+      currentLanguage = normalizeLanguage(lng || currentLanguage);
+      document.documentElement.lang = currentLanguage === 'zh-Hans' ? 'zh-CN' : 'en';
+      startButton.textContent = tr('startButton');
+      resetButton.textContent = tr('resetButton');
+      policyNote.textContent = tr('policyNote');
+      if (!stateText.textContent || stateText.textContent === 'starting') {
+        title.textContent = tr('startingTitle');
+        message.textContent = tr('checking_service');
+      }
+    }
+    function localizedMessage(data) {
+      if (translations[currentLanguage] && translations[currentLanguage][data.state]) {
+        return tr(data.state);
+      }
+      return data.message || tr('checking_service');
+    }
+    function renderStatusUnavailableStopped() {
+      title.textContent = tr('stoppedTitle');
+      message.textContent = tr('statusUnavailableStopped');
+      stateText.textContent = 'stopped';
+      bar.classList.add('stopped');
+      startButton.hidden = true;
+      resetButton.disabled = true;
+    }
+    async function probeRagflowWhenStatusIsUnavailable() {
+      statusFailures += 1;
+      message.textContent = statusFailures >= 2 ? tr('statusUnavailableProbe') : tr('statusUnavailable');
+      if (statusFailures < 2) return;
+      try {
+        await fetch(configuredWebUrl, { mode: 'no-cors', cache: 'no-store' });
+        window.location.replace(configuredWebUrl);
+      } catch (e) {
+      }
+      if (statusFailures >= 5) {
+        renderStatusUnavailableStopped();
+        if (statusFailures >= 6) window.close();
+      }
+    }
+    applyLanguage(currentLanguage);
     startButton.addEventListener('click', async () => {
       startButton.hidden = true;
       bar.classList.remove('stopped');
-      title.textContent = 'LocalMathRAGFlow \u6b63\u5728\u542f\u52a8';
-      document.getElementById('message').textContent = '\u6b63\u5728\u542f\u52a8\u540e\u53f0\u670d\u52a1\u3002';
+      title.textContent = tr('startingTitle');
+      message.textContent = tr('starting_compose');
       await fetch('/start', { method: 'POST' });
+      tick();
+    });
+    resetButton.addEventListener('click', async () => {
+      if (!confirm(tr('confirmReset'))) return;
+      resetButton.disabled = true;
+      startButton.hidden = true;
+      bar.classList.remove('stopped');
+      title.textContent = tr('resettingTitle');
+      message.textContent = tr('resetting_policy');
+      await fetch('/reset-runtime-policy', { method: 'POST' });
       tick();
     });
     async function tick() {
@@ -645,31 +1099,98 @@ internal static class StartupStatusServer
         const res = await fetch('/status', { cache: 'no-store' });
         data = await res.json();
       } catch (e) {
-        document.getElementById('message').textContent = '\u6b63\u5728\u7b49\u5f85\u542f\u52a8\u5668\u72b6\u6001\u670d\u52a1\u3002';
+        await probeRagflowWhenStatusIsUnavailable();
         return;
       }
+      statusFailures = 0;
+      applyLanguage(data.language);
       if (data.state === 'stopping') {
-        title.textContent = 'LocalMathRAGFlow \u6b63\u5728\u505c\u6b62';
+        title.textContent = tr('stoppingTitle');
+        bar.classList.remove('stopped');
+      } else if (data.resetting) {
+        title.textContent = tr('resettingTitle');
         bar.classList.remove('stopped');
       } else if (data.stopped) {
-        title.textContent = 'LocalMathRAGFlow \u5df2\u505c\u6b62';
+        title.textContent = tr('stoppedTitle');
         bar.classList.add('stopped');
       } else {
-        title.textContent = 'LocalMathRAGFlow \u6b63\u5728\u542f\u52a8';
+        title.textContent = tr('startingTitle');
         bar.classList.remove('stopped');
       }
-      document.getElementById('message').textContent = data.message || '\u6b63\u5728\u542f\u52a8\u540e\u53f0\u670d\u52a1\u3002';
-      document.getElementById('state').textContent = data.state || 'starting';
+      message.textContent = localizedMessage(data);
+      stateText.textContent = data.state || 'starting';
       startButton.hidden = !data.stopped || data.state === 'stopping';
+      resetButton.disabled = data.resetting || data.state === 'stopping';
       if (data.close) window.close();
       if (data.ready && data.web_url) window.location.replace(data.web_url);
     }
     tick();
-    setInterval(tick, 1200);
+    setInterval(() => {
+      if (statusFailures < 6) tick();
+    }, 1200);
   </script>
 </body>
 </html>
-""";
+""".Replace("__LANGUAGE__", HtmlAttributeEncode(language))
+            .Replace("__WEB_URL__", HtmlAttributeEncode($"{webUrl}/?localmathrag_reload={DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}"));
+    }
+
+    private static string HtmlAttributeEncode(string value)
+    {
+        return WebUtility.HtmlEncode(value).Replace("'", "&#39;");
+    }
+
+    private static string ResolveConfiguredLanguage(string root)
+    {
+        var candidates = new[]
+        {
+            Environment.GetEnvironmentVariable("LOCALMATHRAG_LANGUAGE"),
+            Environment.GetEnvironmentVariable("VITE_DEFAULT_LANGUAGE_CODE"),
+            ReadEnvValue(Path.Combine(root, "third_party", "ragflow", "web", ".env"), "VITE_DEFAULT_LANGUAGE_CODE"),
+            ReadEnvValue(Path.Combine(root, "third_party", "ragflow", "web", ".env.production"), "VITE_DEFAULT_LANGUAGE_CODE"),
+        };
+        foreach (var candidate in candidates)
+        {
+            var normalized = NormalizeLanguage(candidate);
+            if (!string.IsNullOrWhiteSpace(normalized))
+            {
+                return normalized;
+            }
+        }
+        return "en";
+    }
+
+    private static string? ReadEnvValue(string path, string key)
+    {
+        if (!File.Exists(path))
+        {
+            return null;
+        }
+        foreach (var rawLine in File.ReadLines(path))
+        {
+            var line = rawLine.Trim();
+            if (line.Length == 0 || line.StartsWith("#", StringComparison.Ordinal))
+            {
+                continue;
+            }
+            if (!line.StartsWith(key + "=", StringComparison.Ordinal))
+            {
+                continue;
+            }
+            var value = line.Split('=', 2)[1].Split('#', 2)[0].Trim();
+            return value.Trim('\'', '"');
+        }
+        return null;
+    }
+
+    private static string? NormalizeLanguage(string? language)
+    {
+        if (string.IsNullOrWhiteSpace(language))
+        {
+            return null;
+        }
+        var normalized = language.Trim();
+        return normalized.StartsWith("zh", StringComparison.OrdinalIgnoreCase) ? "zh-Hans" : "en";
     }
 
     private static string FindRoot()
@@ -716,6 +1237,7 @@ internal static class BackgroundStartupTask
     private static CancellationTokenSource? runCts;
     private static Task? runTask;
     private static int stopRequested;
+    private static int dockerDesktopStartedByLauncher;
 
     public static void StartDetached()
     {
@@ -776,6 +1298,86 @@ internal static class BackgroundStartupTask
             root,
             CancellationToken.None);
         WriteStatus(exitCode == 0 ? (exitAfterStop ? "stopped_exit" : "stopped") : "stop_failed", exitCode == 0 ? "Background services stopped." : $"dev-down.ps1 exited with code {exitCode}.");
+        if (exitCode == 0 && exitAfterStop)
+        {
+            await ReleaseDockerResourcesOnExitAsync(root);
+        }
+    }
+
+    public static async Task ResetRuntimePolicyAsync()
+    {
+        CancellationTokenSource? cts;
+        Task? previousTask;
+        lock (RunLock)
+        {
+            cts = runCts;
+            previousTask = runTask;
+        }
+
+        Interlocked.Exchange(ref stopRequested, 1);
+        cts?.Cancel();
+        if (previousTask is not null)
+        {
+            try
+            {
+                await previousTask;
+            }
+            catch
+            {
+            }
+        }
+
+        var root = FindRoot();
+        WriteStatus("resetting_policy", "Resetting runtime policy and cleaning model runtime resources.");
+        var downScript = Path.Combine(root, "scripts", "dev-down.ps1");
+        if (File.Exists(downScript))
+        {
+            var stopExitCode = await RunProcessAsync(
+                "powershell",
+                $"-NoProfile -ExecutionPolicy Bypass -File \"{downScript}\"",
+                root,
+                CancellationToken.None);
+            if (stopExitCode != 0)
+            {
+                WriteStatus("resetting_policy", $"dev-down.ps1 exited with code {stopExitCode}; resetting policy anyway.");
+            }
+        }
+
+        ResetRuntimeConfigPolicy(root);
+        WriteStatus("resetting_policy", "Runtime policy reset; reconfiguring services.");
+        Interlocked.Exchange(ref stopRequested, 0);
+        StartDetached();
+    }
+
+    private static void ResetRuntimeConfigPolicy(string root)
+    {
+        var configPath = Path.Combine(root, "data", "cache", "runtime-config.json");
+        Directory.CreateDirectory(Path.GetDirectoryName(configPath) ?? root);
+        JsonObject config;
+        if (File.Exists(configPath))
+        {
+            try
+            {
+                config = JsonNode.Parse(File.ReadAllText(configPath, Encoding.UTF8)) as JsonObject ?? new JsonObject();
+            }
+            catch
+            {
+                config = new JsonObject();
+            }
+        }
+        else
+        {
+            config = new JsonObject();
+        }
+
+        config.Remove("scheduler");
+        config.Remove("rerank");
+        config["version"] = 1;
+        config["updated_at"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        File.WriteAllText(
+            configPath,
+            config.ToJsonString(new JsonSerializerOptions { WriteIndented = true }),
+            Encoding.UTF8);
     }
 
     private static async Task RunAsync(CancellationToken token)
@@ -800,7 +1402,10 @@ internal static class BackgroundStartupTask
         if (!await DockerReadyAsync(token))
         {
             WriteStatus("starting_docker", "Starting Docker Desktop.");
-            StartDockerDesktop();
+            if (StartDockerDesktop())
+            {
+                Interlocked.Exchange(ref dockerDesktopStartedByLauncher, 1);
+            }
             if (!await WaitForDockerAsync(TimeSpan.FromMinutes(5), token))
             {
                 WriteStatus("docker_timeout", "Docker Desktop did not become ready within 5 minutes.");
@@ -959,7 +1564,7 @@ internal static class BackgroundStartupTask
         }
     }
 
-    private static void StartDockerDesktop()
+    private static bool StartDockerDesktop()
     {
         var candidates = new[]
         {
@@ -969,7 +1574,7 @@ internal static class BackgroundStartupTask
         var path = candidates.FirstOrDefault(File.Exists);
         if (path is null)
         {
-            return;
+            return false;
         }
         Process.Start(new ProcessStartInfo
         {
@@ -977,6 +1582,83 @@ internal static class BackgroundStartupTask
             UseShellExecute = true,
             WindowStyle = ProcessWindowStyle.Hidden
         });
+        return true;
+    }
+
+    private static async Task ReleaseDockerResourcesOnExitAsync(string root)
+    {
+        if (!ShouldReleaseDockerWslOnExit() ||
+            Interlocked.CompareExchange(ref dockerDesktopStartedByLauncher, 0, 0) == 0)
+        {
+            return;
+        }
+
+        if (await HasRunningDockerContainersAsync(root))
+        {
+            Log("Skipping Docker Desktop shutdown because other containers are still running.");
+            return;
+        }
+
+        await ShutdownDockerDesktopAsync(root);
+        await ShutdownWslAsync(root);
+    }
+
+    private static bool ShouldReleaseDockerWslOnExit()
+    {
+        var value = Environment.GetEnvironmentVariable("LOCALMATHRAG_RELEASE_DOCKER_WSL_ON_EXIT");
+        return value is null || value.Equals("1", StringComparison.OrdinalIgnoreCase) ||
+            value.Equals("true", StringComparison.OrdinalIgnoreCase) ||
+            value.Equals("yes", StringComparison.OrdinalIgnoreCase) ||
+            value.Equals("on", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static async Task<bool> HasRunningDockerContainersAsync(string root)
+    {
+        try
+        {
+            var (exitCode, output) = await RunProcessCaptureAsync("docker", "ps --quiet", root, TimeSpan.FromSeconds(10));
+            return exitCode == 0 && !string.IsNullOrWhiteSpace(output);
+        }
+        catch (Exception ex)
+        {
+            Log("Docker container check failed before shutdown: " + ex.Message);
+            return true;
+        }
+    }
+
+    private static async Task ShutdownDockerDesktopAsync(string root)
+    {
+        var candidates = new[]
+        {
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Docker", "Docker", "DockerCli.exe"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Docker", "DockerCli.exe")
+        };
+        var dockerCli = candidates.FirstOrDefault(File.Exists);
+        if (dockerCli is null)
+        {
+            return;
+        }
+
+        try
+        {
+            await RunProcessCaptureAsync(dockerCli, "-Shutdown", root, TimeSpan.FromSeconds(30));
+        }
+        catch (OperationCanceledException)
+        {
+            Log("Docker Desktop shutdown command timed out.");
+        }
+    }
+
+    private static async Task ShutdownWslAsync(string root)
+    {
+        try
+        {
+            await RunProcessCaptureAsync("wsl.exe", "--shutdown", root, TimeSpan.FromSeconds(15));
+        }
+        catch (OperationCanceledException)
+        {
+            Log("WSL shutdown command timed out.");
+        }
     }
 
     private static async Task<int> RunProcessAsync(string fileName, string arguments, string workingDirectory, CancellationToken token)
@@ -1017,6 +1699,55 @@ internal static class BackgroundStartupTask
         await process.WaitForExitAsync(token);
         Log($"< exit {process.ExitCode}");
         return process.ExitCode;
+    }
+
+    private static async Task<(int ExitCode, string Output)> RunProcessCaptureAsync(string fileName, string arguments, string workingDirectory, TimeSpan timeout)
+    {
+        Log($"> {fileName} {arguments}");
+        using var process = Process.Start(new ProcessStartInfo
+        {
+            FileName = fileName,
+            Arguments = arguments,
+            WorkingDirectory = workingDirectory,
+            CreateNoWindow = true,
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        });
+        if (process is null)
+        {
+            return (-1, string.Empty);
+        }
+
+        var output = new StringBuilder();
+        process.OutputDataReceived += (_, e) =>
+        {
+            if (e.Data is not null)
+            {
+                output.AppendLine(e.Data);
+                Log(e.Data);
+            }
+        };
+        process.ErrorDataReceived += (_, e) => { if (e.Data is not null) Log(e.Data); };
+        process.BeginOutputReadLine();
+        process.BeginErrorReadLine();
+        using var cts = new CancellationTokenSource(timeout);
+        using var registration = cts.Token.Register(() =>
+        {
+            try
+            {
+                if (!process.HasExited)
+                {
+                    process.Kill(entireProcessTree: true);
+                }
+            }
+            catch
+            {
+            }
+        });
+        await process.WaitForExitAsync(cts.Token);
+        Log($"< exit {process.ExitCode}");
+        return (process.ExitCode, output.ToString());
     }
 
     private static void OpenUrl(string url)

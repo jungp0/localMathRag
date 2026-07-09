@@ -3,6 +3,7 @@ param(
     [string]$RagflowUrl = "http://127.0.0.1",
     [string]$LlmUrl = "http://127.0.0.1:8080/v1",
     [int]$VisionTimeoutSeconds = 20,
+    [int]$MaxActiveRuntime = 2,
     [switch]$IncludeVlm,
     [switch]$NoCleanup
 )
@@ -32,7 +33,7 @@ function Assert-True {
 function Get-OptionalRunning {
     param([object]$Status)
     $running = @()
-    foreach ($kind in @("embedding", "rerank", "vision", "asr", "tts")) {
+    foreach ($kind in @("chat", "embedding", "rerank", "vision", "asr", "tts")) {
         $entry = $Status.endpoint_statuses.PSObject.Properties[$kind].Value
         if ($entry -and $entry.container_running) {
             $running += $kind
@@ -45,11 +46,14 @@ function Assert-Balanced {
     param([string]$Label)
     $status = Invoke-Json -Method GET -Url "$ObjectServiceUrl/v1/models/status" -TimeoutSec 10
     $running = Get-OptionalRunning -Status $status
-    Assert-True ($running.Count -le 1) "$Label`: optional runtime balancer violation: $($running -join ', ')"
+    Assert-True ($running.Count -le $MaxActiveRuntime) "$Label`: optional runtime balancer violation: $($running -join ', ')"
+    Assert-True (-not (($running -contains "embedding") -and ($running -contains "rerank"))) "$Label`: embedding should preempt rerank: $($running -join ', ')"
     return @{
         label = $Label
         running_optional = $running
+        max_active_runtime = $MaxActiveRuntime
         endpoint_statuses = $status.endpoint_statuses
+        runtime_degradations = $status.runtime_degradations
     }
 }
 

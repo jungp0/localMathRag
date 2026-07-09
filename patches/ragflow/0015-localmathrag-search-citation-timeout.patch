@@ -1,0 +1,78 @@
+diff --git a/api/db/services/dialog_service.py b/api/db/services/dialog_service.py
+--- a/api/db/services/dialog_service.py
++++ b/api/db/services/dialog_service.py
+@@ -217,7 +217,28 @@ async def _localmathrag_stream_summary_with_timeout(stream_iter):
+     finally:
+         await _localmathrag_close_async_iter(iterator)
+ 
+ 
++def _localmathrag_search_citation_timeout_seconds():
++    return _localmathrag_float_env("LOCALMATHRAG_SEARCH_CITATION_TIMEOUT_SECONDS", 20.0, 1.0)
++
++
++def _localmathrag_fast_reference(kbinfos, max_chunks=12):
++    refs = deepcopy(kbinfos)
++    chunks = refs.get("chunks", [])
++    if not isinstance(chunks, list):
++        refs["chunks"] = []
++        return refs
++    refs["chunks"] = chunks[:max_chunks]
++    for chunk in refs["chunks"]:
++        if isinstance(chunk, dict) and chunk.get("vector"):
++            del chunk["vector"]
++    try:
++        refs["chunks"] = chunks_format(refs)
++    except Exception:  # noqa: BLE001 - fallback reference must never block final answer
++        logging.debug("Failed to format fast citation fallback reference", exc_info=True)
++    return refs
++
++
+ def _chunk_kb_id_for_doc(row_dict, kb_ids, doc_id):
+     if len(kb_ids or []) == 1:
+         return kb_ids[0]
+@@ -1999,8 +2021,13 @@ async def async_ask(question, kb_ids, tenant_id, chat_llm_name=None, search_confi
+     yield {
+         "answer": "",
+         "reference": {},
+         "final": False,
+-        "progress": _localmathrag_search_progress("citations", 90, "Preparing citations"),
++        "progress": _localmathrag_search_progress(
++            "citations",
++            90,
++            "Preparing citations",
++            citation_timeout_seconds=_localmathrag_search_citation_timeout_seconds(),
++        ),
+     }
+     if not summary_completed and last_error:
+         full_answer = (
+@@ -2010,7 +2038,29 @@ async def async_ask(question, kb_ids, tenant_id, chat_llm_name=None, search_confi
+             "\u4ee5\u4e0b\u4fdd\u7559\u68c0\u7d22\u7ed3\u679c\u4f9b\u53c2\u8003\u3002"
+             f"\u539f\u56e0\uff1a{last_error}"
+         )
+-    final = await decorate_answer(_extract_visible_answer(full_answer))
++    visible_answer = _extract_visible_answer(full_answer)
++    try:
++        final = await asyncio.wait_for(
++            decorate_answer(visible_answer),
++            timeout=_localmathrag_search_citation_timeout_seconds(),
++        )
++    except asyncio.TimeoutError:
++        logging.warning(
++            "LocalMathRAG search citation preparation timed out after %.0fs; returning answer with lightweight references",
++            _localmathrag_search_citation_timeout_seconds(),
++        )
++        final = {
++            "answer": visible_answer,
++            "reference": _localmathrag_fast_reference(kbinfos),
++            "citation_warning": "citation preparation timed out; returned answer with lightweight references",
++        }
++    except Exception as exc:  # noqa: BLE001 - citation failures should not drop a completed answer
++        logging.warning("LocalMathRAG search citation preparation failed; returning answer without inline citations: %s", exc)
++        final = {
++            "answer": visible_answer,
++            "reference": _localmathrag_fast_reference(kbinfos),
++            "citation_warning": f"citation preparation failed: {exc}",
++        }
+     final["final"] = True
+     if not summary_completed and last_error:
+         final["answer_reset"] = True

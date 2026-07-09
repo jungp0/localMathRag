@@ -18,6 +18,7 @@ __pycache__/
 *.sqlite-wal
 
 node_modules/
+.pnpm-store/
 bin/
 obj/
 build/

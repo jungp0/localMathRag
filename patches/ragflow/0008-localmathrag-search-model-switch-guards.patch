@@ -1,0 +1,50 @@
+diff --git a/api/apps/restful_apis/bot_api.py b/api/apps/restful_apis/bot_api.py
+--- a/api/apps/restful_apis/bot_api.py
++++ b/api/apps/restful_apis/bot_api.py
+@@ -338,0 +339,12 @@ async def ask_about_embedded(tenant_id=None):
++    if search_config and search_config.get("summary") is False:
++        async def disabled_stream():
++            yield "data:" + json.dumps({"code": 0, "message": "", "data": {"answer": "", "reference": {}, "final": True}}, ensure_ascii=False) + "\n\n"
++            yield "data:" + json.dumps({"code": 0, "message": "", "data": True}, ensure_ascii=False) + "\n\n"
++
++        resp = Response(disabled_stream(), mimetype="text/event-stream")
++        resp.headers.add_header("Cache-control", "no-cache")
++        resp.headers.add_header("Connection", "keep-alive")
++        resp.headers.add_header("X-Accel-Buffering", "no")
++        resp.headers.add_header("Content-Type", "text/event-stream; charset=utf-8")
++        return resp
++
+@@ -524,0 +525,2 @@ async def related_questions_embedded(tenant_id=None):
++    if search_config and search_config.get("related_search") is False:
++        return get_json_result(data=[])
+@@ -588,1 +588,5 @@ async def mindmap(tenant_id=None):
+-    mind_map =await gen_mindmap(req["question"], req["kb_ids"], tenant_id, search_app.get("search_config", {}))
++    search_config = search_app.get("search_config", {}) if search_app else {}
++    if search_config and search_config.get("query_mindmap") is False:
++        return get_json_result(data={})
++
++    mind_map =await gen_mindmap(req["question"], req["kb_ids"], tenant_id, search_config)
+diff --git a/api/apps/restful_apis/chat_api.py b/api/apps/restful_apis/chat_api.py
+--- a/api/apps/restful_apis/chat_api.py
++++ b/api/apps/restful_apis/chat_api.py
+@@ -1101,0 +1102,2 @@ async def mindmap():
++    if search_config and search_config.get("query_mindmap") is False:
++        return get_json_result(data={})
+@@ -1124,0 +1125,2 @@ async def recommendation():
++    if search_config and search_config.get("related_search") is False:
++        return get_json_result(data=[])
+diff --git a/api/apps/restful_apis/search_api.py b/api/apps/restful_apis/search_api.py
+--- a/api/apps/restful_apis/search_api.py
++++ b/api/apps/restful_apis/search_api.py
+@@ -213,0 +214,11 @@ async def completion(search_id):
++    if search_config and search_config.get("summary") is False:
++        async def disabled_stream():
++            yield "data:" + json.dumps({"code": 0, "message": "", "data": {"answer": "", "reference": {}, "final": True}}, ensure_ascii=False) + "\n\n"
++            yield "data:" + json.dumps({"code": 0, "message": "", "data": True}, ensure_ascii=False) + "\n\n"
++
++        resp = Response(disabled_stream(), mimetype="text/event-stream")
++        resp.headers.add_header("Cache-control", "no-cache")
++        resp.headers.add_header("Connection", "keep-alive")
++        resp.headers.add_header("X-Accel-Buffering", "no")
++        resp.headers.add_header("Content-Type", "text/event-stream; charset=utf-8")
++        return resp
