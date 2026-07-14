@@ -27,16 +27,20 @@ def patched_file_text(patch: str) -> str:
     return "\n".join(lines)
 
 
+def ragflow_source_available(relative_path: str) -> bool:
+    return (ROOT / "third_party" / "ragflow" / relative_path).exists() and not PATCH_ONLY
+
+
 def read_ragflow_source_or_patch(relative_path: str, patch: str) -> str:
     source_path = ROOT / "third_party" / "ragflow" / relative_path
-    if source_path.exists() and not PATCH_ONLY:
+    if ragflow_source_available(relative_path):
         return read_text(source_path)
     return patched_file_text(patch)
 
 
 def read_ragflow_source_or_patches(relative_path: str, patches: list[str]) -> str:
     source_path = ROOT / "third_party" / "ragflow" / relative_path
-    if source_path.exists() and not PATCH_ONLY:
+    if ragflow_source_available(relative_path):
         return read_text(source_path)
     return "\n".join(patched_file_text(patch) for patch in patches)
 
@@ -1123,7 +1127,7 @@ def test_auxiliary_indexes_are_queued_below_document_parsing_and_release_on_canc
     assert "release_auxiliary_index_lease(auxiliary_lease)" in executor
     assert "lease_heartbeat.cancel()" in executor
     assert "await asyncio.gather(lease_heartbeat, return_exceptions=True)" in executor
-    if PATCH_ONLY:
+    if not ragflow_source_available("rag/svr/task_executor.py"):
         task_type_insert = deferred_retry_patch.index('+    task_type = msg.get("task_type", "")')
         canceled_context = deferred_retry_patch.index("     if task:")
         auxiliary_context = deferred_retry_patch.index("     if task_type in AUXILIARY_INDEX_TASK_TYPES:")
@@ -1324,7 +1328,7 @@ def test_ragflow_math_ocr_default_setting_ui_contract() -> None:
     assert "Formula OCR" in patch
     assert "ocr_id" in patch
     assert "ocr_id" in system_setting
-    if not PATCH_ONLY:
+    if ragflow_source_available("web/src/pages/user-setting/setting-model/components/system-setting.tsx"):
         assert "ModelTreeSelect" in system_setting
     assert "math-ocr-default-setting" not in system_setting
     assert "/v1/math-ocr/config" not in system_setting
