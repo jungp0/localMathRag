@@ -1,0 +1,128 @@
+diff --git a/deepdoc/parser/figure_parser.py b/deepdoc/parser/figure_parser.py
+--- a/deepdoc/parser/figure_parser.py
++++ b/deepdoc/parser/figure_parser.py
+@@ -15,6 +15,7 @@
+ #
+ from concurrent.futures import ThreadPoolExecutor, as_completed
+ import base64
++import hashlib
+ import json
+ import logging
+ import os
+@@ -144,34 +145,60 @@ def _enhance_docx_chunks_with_math_ocr(chunks, idx_lst, callback=None):
+     if callback:
+         callback(0.69, "Local Math OCR enabled. Parsing Word formula images...")
+     candidate_indices = sorted(formula_indices) if formula_indices else idx_lst
++    image_cache = {}
++    total_images = sum(
++        len(getattr(chunks[idx].get("image"), "_blobs", []) or []) or 1
++        for idx in candidate_indices
++        if 0 <= idx < len(chunks)
++    )
++    processed_images = 0
+     for idx in candidate_indices:
+         try:
+             ck = chunks[idx]
+         except Exception:
+             continue
+-        img = None
+-        close_after = False
++        images = ()
+         try:
+-            img, close_after = open_image_for_processing(ck.get("image"), allow_bytes=True)
+-            if not isinstance(img, Image.Image):
+-                continue
++            chunk_image = ck.get("image")
++            if isinstance(chunk_image, LazyImage):
++                images = chunk_image.iter_pil_images()
++            else:
++                img, close_after = open_image_for_processing(chunk_image, allow_bytes=True)
++                if isinstance(img, Image.Image):
++                    images = ((img, close_after),)
+             context_text = " ".join(
+                 text
+                 for text in (ck.get("context_above"), ck.get("text"), ck.get("context_below"))
+                 if text
+             )
+-            latex = _math_ocr_image(img, context_text=context_text)
+-            if latex:
+-                ck["_docx_formula_latex"] = latex
++            latex_items = []
++            for image_item in images:
++                if isinstance(image_item, tuple):
++                    img, close_after = image_item
++                else:
++                    img, close_after = image_item, True
++                try:
++                    encoded = _image_to_png_base64(img)
++                    cache_key = hashlib.sha256(encoded.encode("ascii")).digest()
++                    if cache_key not in image_cache:
++                        try:
++                            image_cache[cache_key] = _math_ocr_image(img, context_text=context_text)
++                        except Exception as exc:
++                            logging.warning("Math OCR skipped for one Word formula image: %s", exc)
++                            image_cache[cache_key] = ""
++                    latex_items.append(image_cache[cache_key])
++                finally:
++                    if close_after:
++                        img.close()
++                processed_images += 1
++                if callback and total_images > 1:
++                    progress = 0.69 + 0.08 * processed_images / total_images
++                    callback(progress, f"Local Math OCR: {processed_images}/{total_images} formula images")
++            if latex_items:
++                ck["_docx_formula_latex_items"] = latex_items
+                 formula_indices.add(idx)
+         except Exception as e:
+             logging.warning("Math OCR skipped for one Word image: %s", e)
+-        finally:
+-            if close_after and isinstance(img, Image.Image):
+-                try:
+-                    img.close()
+-                except Exception:
+-                    pass
+     return formula_indices
+ 
+ 
+@@ -186,19 +213,30 @@ def _merge_chunk_image(target, source):
+ 
+ 
+ def _formula_chunk_text(chunk):
++    latex_items = chunk.get("_docx_formula_latex_items") or []
++    if latex_items:
++        source_name = _formula_source_name(chunk)
++        return "\n".join(
++            f"$$\n{latex}\n$$" if latex else f"[{source_name} formula image]"
++            for latex in latex_items
++        )
+     latex = (chunk.get("_docx_formula_latex") or "").strip()
+     if latex:
+         return f"$$\n{latex}\n$$"
++    source_name = _formula_source_name(chunk)
++    return f"[{source_name} formula image]"
++
++
++def _formula_source_name(chunk):
+     sources = chunk.get("_docx_formula_sources") or []
+     names = [source.get("prog_id") for source in sources if isinstance(source, dict) and source.get("prog_id")]
+-    source_name = ", ".join(dict.fromkeys(names)) or "Equation Editor"
+-    return f"[{source_name} formula image]"
++    return ", ".join(dict.fromkeys(names)) or "Equation Editor"
+ 
+ 
+ def _coalesce_docx_formula_chunks(chunks, formula_indices):
+     if not formula_indices:
+         for chunk in chunks:
+-            for key in ("_docx_paragraph_id", "_docx_anchor_text", "_docx_formula_sources", "_docx_formula_latex"):
++            for key in ("_docx_paragraph_id", "_docx_anchor_text", "_docx_formula_sources", "_docx_formula_latex", "_docx_formula_latex_items"):
+                 chunk.pop(key, None)
+         return [idx for idx, chunk in enumerate(chunks) if chunk.get("ck_type") == "image" and chunk.get("image") is not None]
+ 
+@@ -247,7 +285,7 @@ def _coalesce_docx_formula_chunks(chunks, formula_indices):
+ 
+     chunks[:] = [chunk for idx, chunk in enumerate(chunks) if idx not in remove_indices]
+     for chunk in chunks:
+-        for key in ("_docx_paragraph_id", "_docx_anchor_text", "_docx_formula_sources", "_docx_formula_latex"):
++        for key in ("_docx_paragraph_id", "_docx_anchor_text", "_docx_formula_sources", "_docx_formula_latex", "_docx_formula_latex_items"):
+             chunk.pop(key, None)
+     return [idx for idx, chunk in enumerate(chunks) if chunk.get("ck_type") == "image" and chunk.get("image") is not None]

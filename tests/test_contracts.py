@@ -1,7 +1,9 @@
 ﻿from __future__ import annotations
 
 import json
+import importlib.util
 import os
+import re
 from pathlib import Path
 
 
@@ -10,6 +12,32 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8-sig")
+
+
+def patched_file_text(patch: str) -> str:
+    lines: list[str] = []
+    for line in patch.splitlines():
+        if line.startswith(("--- ", "+++ ", "@@")):
+            continue
+        if line.startswith("-"):
+            continue
+        if line.startswith(("+", " ")):
+            lines.append(line[1:])
+    return "\n".join(lines)
+
+
+def read_ragflow_source_or_patch(relative_path: str, patch: str) -> str:
+    source_path = ROOT / "third_party" / "ragflow" / relative_path
+    if source_path.exists():
+        return read_text(source_path)
+    return patched_file_text(patch)
+
+
+def read_ragflow_source_or_patches(relative_path: str, patches: list[str]) -> str:
+    source_path = ROOT / "third_party" / "ragflow" / relative_path
+    if source_path.exists():
+        return read_text(source_path)
+    return "\n".join(patched_file_text(patch) for patch in patches)
 
 
 def test_json_schemas_are_valid() -> None:
@@ -154,6 +182,32 @@ def test_ragflow_default_dataset_manual_refresh_contract() -> None:
     assert "ChatService" not in service
 
 
+def test_ragflow_dataset_upload_ignores_temporary_files_contract() -> None:
+    patch = read_text(ROOT / "patches" / "ragflow" / "0042-localmathrag-ignore-temporary-dataset-files.patch")
+    dockerfile = read_text(ROOT / "docker" / "Dockerfile.ragflow-local")
+    dockerignore = read_text(ROOT / ".dockerignore")
+
+    assert "def is_temporary_file(filename) -> bool:" in patch
+    assert '"$$" in basename' in patch
+    assert 'basename.startswith("~$")' in patch
+    assert 'normalized.startswith(".~lock.")' in patch
+    assert '".tmp"' in patch and '".part"' in patch and '".swp"' in patch
+    assert '".dwl"' in patch and '".sv$"' in patch
+    assert 'TEMPORARY_FILE_NAMES = frozenset({".ds_store", "desktop.ini", "thumbs.db"})' in patch
+    assert "if is_temporary_file(file_obj.filename):" in patch
+    assert "if child.is_file() and is_temporary_file(child_rel):" in patch
+    assert "if is_temporary_file(rel):" in patch
+    assert "temporary_previous_entries" in patch
+    assert 'deleted["status"] = "deleted"' in patch
+    assert 'if filename_type(previous_path) == "other":' in patch
+    assert "export const isTemporaryUploadFile" in patch
+    assert "!isTemporaryUploadFile(file)" in patch
+    assert "if not upload_file_objs:" in patch
+    assert "return get_result(data=[])" in patch
+    assert "COPY third_party/ragflow/api/utils/file_utils.py /ragflow/api/utils/file_utils.py" in dockerfile
+    assert "!third_party/ragflow/api/utils/file_utils.py" in dockerignore
+
+
 def test_ragflow_search_summary_has_output_budget() -> None:
     patch = read_text(ROOT / "patches" / "ragflow" / "0004-localmathrag-search-summary-token-budget.patch")
     dynamic_patch = read_text(ROOT / "patches" / "ragflow" / "0014-localmathrag-dynamic-search-token-budget.patch")
@@ -188,8 +242,8 @@ def test_ragflow_sse_requests_abort_on_unmount() -> None:
 
 def test_ragflow_rerank_disable_request_overrides_saved_config() -> None:
     patch = read_text(ROOT / "patches" / "ragflow" / "0007-localmathrag-rerank-disable-override.patch")
-    dataset_service = read_text(ROOT / "third_party" / "ragflow" / "api" / "apps" / "services" / "dataset_api_service.py")
-    bot_api = read_text(ROOT / "third_party" / "ragflow" / "api" / "apps" / "restful_apis" / "bot_api.py")
+    dataset_service = read_ragflow_source_or_patch("api/apps/services/dataset_api_service.py", patch)
+    bot_api = read_ragflow_source_or_patch("api/apps/restful_apis/bot_api.py", patch)
     assert 'req["rerank_id"] if "rerank_id" in req else search_config.get("rerank_id")' in patch
     assert 'if "rerank_id" not in req:' in patch
     assert dataset_service.count('req["rerank_id"] if "rerank_id" in req else search_config.get("rerank_id")') >= 2
@@ -200,9 +254,10 @@ def test_ragflow_rerank_disable_request_overrides_saved_config() -> None:
 
 def test_ragflow_search_model_switches_have_backend_guards() -> None:
     patch = read_text(ROOT / "patches" / "ragflow" / "0008-localmathrag-search-model-switch-guards.patch")
-    bot_api = read_text(ROOT / "third_party" / "ragflow" / "api" / "apps" / "restful_apis" / "bot_api.py")
-    chat_api = read_text(ROOT / "third_party" / "ragflow" / "api" / "apps" / "restful_apis" / "chat_api.py")
-    search_api = read_text(ROOT / "third_party" / "ragflow" / "api" / "apps" / "restful_apis" / "search_api.py")
+    aux_patch = read_text(ROOT / "patches" / "ragflow" / "0019-localmathrag-search-auxiliary-after-answer.patch")
+    bot_api = read_ragflow_source_or_patch("api/apps/restful_apis/bot_api.py", patch)
+    chat_api = read_ragflow_source_or_patch("api/apps/restful_apis/chat_api.py", patch)
+    search_api = read_ragflow_source_or_patch("api/apps/restful_apis/search_api.py", patch)
     dockerfile = read_text(ROOT / "docker" / "Dockerfile.ragflow-local")
     dockerignore = read_text(ROOT / ".dockerignore")
 
@@ -215,6 +270,23 @@ def test_ragflow_search_model_switches_have_backend_guards() -> None:
     assert 'search_config.get("related_search") is False' in chat_api
     assert 'search_config.get("query_mindmap") is False' in bot_api
     assert 'search_config.get("query_mindmap") is False' in chat_api
+    assert "LOCALMATHRAG_SEARCH_AUX_TIMEOUT_SECONDS" in aux_patch
+    assert "LocalMathRAG related-search auxiliary failed; returning empty result" in aux_patch
+    assert "LocalMathRAG mindmap auxiliary failed; returning empty result" in aux_patch
+    assert "_localmathrag_related_gen_conf" in aux_patch
+    assert "_localmathrag_parse_related_questions" in aux_patch
+    assert "_localmathrag_related_fallback_questions" in aux_patch
+    assert 'gen_conf.setdefault("max_tokens", 384)' in aux_patch
+    assert 'gen_conf.setdefault("max_completion_tokens", gen_conf["max_tokens"])' in aux_patch
+    assert 'gen_conf.setdefault("enable_thinking", False)' in aux_patch
+    assert "asyncio.wait_for(" in aux_patch
+    assert "LocalMathRAG related-search produced no parseable questions" in aux_patch
+    assert "/no_think" in aux_patch
+    assert "Return 5 numbered questions only." in aux_patch
+    assert "Return 5 numbered questions. Do not return an empty answer." in aux_patch
+    assert "需要关注哪些典型故障场景" in aux_patch
+    assert "json.loads(text)" in aux_patch
+    assert "re.split(r\"(?<=[?？])\\s+\", text)" in aux_patch
     assert "COPY third_party/ragflow/api/apps/restful_apis/search_api.py" in dockerfile
     assert "COPY third_party/ragflow/api/apps/restful_apis/chat_api.py" in dockerfile
     assert "!third_party/ragflow/api/apps/restful_apis/search_api.py" in dockerignore
@@ -238,14 +310,20 @@ def test_ragflow_runtime_warning_surface_contract() -> None:
 
 def test_ragflow_search_progress_and_fast_summary_contract() -> None:
     patch = read_text(ROOT / "patches" / "ragflow" / "0010-localmathrag-search-progress-and-fast-summary.patch")
-    dialog_service = read_text(ROOT / "third_party" / "ragflow" / "api" / "db" / "services" / "dialog_service.py")
-    logic_hooks = read_text(ROOT / "third_party" / "ragflow" / "web" / "src" / "hooks" / "logic-hooks.ts")
-    chat_types = read_text(ROOT / "third_party" / "ragflow" / "web" / "src" / "interfaces" / "database" / "chat.ts")
-    search_view = read_text(ROOT / "third_party" / "ragflow" / "web" / "src" / "pages" / "next-search" / "search-view.tsx")
+    dynamic_patch = read_text(ROOT / "patches" / "ragflow" / "0014-localmathrag-dynamic-search-token-budget.patch")
+    citation_no_model_patch = read_text(ROOT / "patches" / "ragflow" / "0018-localmathrag-search-citation-no-model-test.patch")
+    aux_patch = read_text(ROOT / "patches" / "ragflow" / "0019-localmathrag-search-auxiliary-after-answer.patch")
+    dialog_service = read_ragflow_source_or_patches(
+        "api/db/services/dialog_service.py",
+        [patch, dynamic_patch, citation_no_model_patch, aux_patch],
+    )
+    logic_hooks = read_ragflow_source_or_patch("web/src/hooks/logic-hooks.ts", patch)
+    search_hooks = read_ragflow_source_or_patch("web/src/pages/next-search/hooks.ts", aux_patch)
+    chat_types = read_ragflow_source_or_patch("web/src/interfaces/database/chat.ts", patch)
+    search_view = read_ragflow_source_or_patch("web/src/pages/next-search/search-view.tsx", patch)
     compose = read_text(ROOT / "docker" / "docker-compose.localmathrag.yml")
 
     assert "_localmathrag_search_progress" in patch
-    dynamic_patch = read_text(ROOT / "patches" / "ragflow" / "0014-localmathrag-dynamic-search-token-budget.patch")
     assert "default_answer_token_budget = min(1024" in dynamic_patch
     assert "default_knowledge_token_budget = min(4096" in dynamic_patch
     assert "LOCALMATHRAG_SEARCH_DYNAMIC_TOKEN_BUDGET" in dynamic_patch
@@ -258,6 +336,14 @@ def test_ragflow_search_progress_and_fast_summary_contract() -> None:
     assert '"citations" if citation_use_model else "references"' in dialog_service
     assert '"Preparing citations" if citation_use_model else "Preparing references"' in dialog_service
     assert "progress: d.progress ?? prev.progress" in logic_hooks
+    assert "pendingRelatedQuestion" in search_hooks
+    assert "pendingSearchParams" in search_hooks
+    assert "canFetch" in search_hooks
+    assert "setPendingRelatedQuestion(q)" in search_hooks
+    assert "fetchRelatedQuestions(pendingRelatedQuestion)" in search_hooks
+    assert "_mindmap_sections" in dialog_service
+    assert "LOCALMATHRAG_SEARCH_MINDMAP_MAX_CHUNKS" in dialog_service
+    assert "LOCALMATHRAG_SEARCH_MINDMAP_MAX_CHARS" in dialog_service
     assert "interface ISearchProgress" in chat_types
     assert "progress?: ISearchProgress" in chat_types
     assert "searchProgress.message || searchProgress.stage" in search_view
@@ -265,15 +351,66 @@ def test_ragflow_search_progress_and_fast_summary_contract() -> None:
     assert "LOCALMATHRAG_SEARCH_DYNAMIC_TOKEN_BUDGET: ${LOCALMATHRAG_SEARCH_DYNAMIC_TOKEN_BUDGET:-1}" in compose
     assert "LOCALMATHRAG_SEARCH_ANSWER_TOKEN_BUDGET_MAX: ${LOCALMATHRAG_SEARCH_ANSWER_TOKEN_BUDGET_MAX:-8192}" in compose
     assert "LOCALMATHRAG_SEARCH_KNOWLEDGE_TOKEN_BUDGET_MAX: ${LOCALMATHRAG_SEARCH_KNOWLEDGE_TOKEN_BUDGET_MAX:-16384}" in compose
+    assert "LOCALMATHRAG_SEARCH_AUX_TIMEOUT_SECONDS: ${LOCALMATHRAG_SEARCH_AUX_TIMEOUT_SECONDS:-30}" in compose
+    assert "LOCALMATHRAG_SEARCH_MINDMAP_MAX_CHUNKS: ${LOCALMATHRAG_SEARCH_MINDMAP_MAX_CHUNKS:-6}" in compose
+    assert "LOCALMATHRAG_SEARCH_MINDMAP_MAX_CHARS: ${LOCALMATHRAG_SEARCH_MINDMAP_MAX_CHARS:-12000}" in compose
+
+
+def test_ragflow_search_metadata_filter_timeout_contract() -> None:
+    patch = read_text(ROOT / "patches" / "ragflow" / "0020-localmathrag-search-metadata-filter-timeout.patch")
+    metadata_utils = read_ragflow_source_or_patch("common/metadata_utils.py", patch)
+    compose = read_text(ROOT / "docker" / "docker-compose.localmathrag.yml")
+    dockerfile = read_text(ROOT / "docker" / "Dockerfile.ragflow-local")
+    dockerignore = read_text(ROOT / ".dockerignore")
+
+    assert "LOCALMATHRAG_SEARCH_METADATA_FILTER_TIMEOUT_SECONDS" in patch
+    assert "_localmathrag_metadata_filter_timeout_seconds" in metadata_utils
+    assert "asyncio.wait_for(" in metadata_utils
+    assert "LocalMathRAG metadata filter skipped: no metadata keys available" in metadata_utils
+    assert "LocalMathRAG metadata filter generation timed out" in metadata_utils
+    assert "continuing without metadata filter" in metadata_utils
+    assert "chat model is unavailable" in metadata_utils
+    assert "filters and filters.get(\"conditions\")" in metadata_utils
+    assert "LOCALMATHRAG_SEARCH_METADATA_FILTER_TIMEOUT_SECONDS: ${LOCALMATHRAG_SEARCH_METADATA_FILTER_TIMEOUT_SECONDS:-8}" in compose
+    assert "COPY third_party/ragflow/common/metadata_utils.py" in dockerfile
+    assert "!third_party/ragflow/common/metadata_utils.py" in dockerignore
+
+
+def test_ragflow_search_export_markdown_contract() -> None:
+    patch = read_text(ROOT / "patches" / "ragflow" / "0021-localmathrag-search-export-markdown.patch")
+    search_view = read_ragflow_source_or_patch("web/src/pages/next-search/search-view.tsx", patch)
+
+    assert "buildSearchExportMarkdown" in search_view
+    assert "copyTextToClipboard" in search_view
+    assert "downloadFileFromBlob" in search_view
+    assert "Clipboard" in search_view
+    assert "Download" in search_view
+    assert "## AI Summary" in search_view
+    assert "## Content List" in search_view
+    assert "document_metadata" in search_view
+    assert "content_with_weight" in search_view
+    assert "text/markdown;charset=utf-8" in search_view
+    assert "Copied search results" in search_view
+    assert "canShowMindMap" in search_view
+    assert "absolute top-16 translate-y-2 right-10 z-30 flex items-center gap-3" in search_view
+    assert "size-9 rounded-full p-0" in search_view
+    assert "Download Markdown" in search_view
 
 
 def test_ragflow_search_summary_runtime_retry_contract() -> None:
     patch = read_text(ROOT / "patches" / "ragflow" / "0012-localmathrag-search-summary-timeout-retry.patch")
     citation_patch = read_text(ROOT / "patches" / "ragflow" / "0015-localmathrag-search-citation-timeout.patch")
+    citation_embedding_patch = read_text(ROOT / "patches" / "ragflow" / "0016-localmathrag-citation-strong-embedding.patch")
     citation_render_patch = read_text(ROOT / "patches" / "ragflow" / "0017-localmathrag-search-citation-render.patch")
     citation_no_model_patch = read_text(ROOT / "patches" / "ragflow" / "0018-localmathrag-search-citation-no-model-test.patch")
-    dialog_service = read_text(ROOT / "third_party" / "ragflow" / "api" / "db" / "services" / "dialog_service.py")
-    logic_hooks = read_text(ROOT / "third_party" / "ragflow" / "web" / "src" / "hooks" / "logic-hooks.ts")
+    dialog_service = read_ragflow_source_or_patches(
+        "api/db/services/dialog_service.py",
+        [patch, citation_patch, citation_embedding_patch, citation_render_patch, citation_no_model_patch],
+    )
+    logic_hooks = read_ragflow_source_or_patches(
+        "web/src/hooks/logic-hooks.ts",
+        [patch, citation_patch, citation_render_patch, citation_no_model_patch],
+    )
     compose = read_text(ROOT / "docker" / "docker-compose.localmathrag.yml")
     dev_up = read_text(ROOT / "scripts" / "dev-up.ps1")
 
@@ -288,7 +425,6 @@ def test_ragflow_search_summary_runtime_retry_contract() -> None:
     assert "citation_warning" in citation_patch
     assert "asyncio.wait_for(" in citation_patch
     assert "LOCALMATHRAG_SEARCH_CITATION_TIMEOUT_SECONDS" in citation_patch
-    citation_embedding_patch = read_text(ROOT / "patches" / "ragflow" / "0016-localmathrag-citation-strong-embedding.patch")
     assert "localmathrag_embedding_purpose" in citation_embedding_patch
     assert "localmathrag_strong_embedding" in citation_embedding_patch
     assert 'localmathrag_embedding_purpose("citation")' in dialog_service
@@ -315,50 +451,833 @@ def test_ragflow_search_summary_runtime_retry_contract() -> None:
 
 def test_ragflow_runtime_model_switch_contract() -> None:
     patch = read_text(ROOT / "patches" / "ragflow" / "0011-localmathrag-runtime-model-switch.patch")
-    service = read_text(ROOT / "third_party" / "ragflow" / "api" / "apps" / "services" / "models_api_service.py")
+    service = read_ragflow_source_or_patch("api/apps/services/models_api_service.py", patch)
     dockerfile = read_text(ROOT / "docker" / "Dockerfile.ragflow-local")
     dockerignore = read_text(ROOT / ".dockerignore")
     assert "LOCALMATHRAG_RUNTIME_SWITCH_URL" in patch
     assert "/v1/runtime/switch-model" in patch
     assert "_switch_local_runtime_model_if_needed" in patch
     assert '"start": kind in {"chat", "rerank"}' in patch
-    assert "TenantService.update_by_id(tenant_id, {field_name: default_model})" in service
+    assert "Local runtime model switch failed" in patch
+    assert "switch_result = _switch_local_runtime_model_if_needed(" in service
+    update_call = "TenantService.update_by_id(tenant_id, {field_name: default_model})"
+    if update_call not in service:
+        update_call = "TenantService.update_by_id(tenant_id, updates)"
+    assert update_call in service
+    assert service.find("switch_result = _switch_local_runtime_model_if_needed(") < service.find(update_call)
     assert "_switch_local_runtime_model_if_needed(" in service
     assert "COPY third_party/ragflow/api/apps/services/models_api_service.py" in dockerfile
     assert "!third_party/ragflow/api/apps/services/models_api_service.py" in dockerignore
 
 
+def test_local_model_configuration_uses_provider_facing_name() -> None:
+    patch = read_text(ROOT / "patches" / "ragflow" / "0027-localmathrag-unify-local-model-identifiers.patch")
+    source = read_ragflow_source_or_patch(
+        "web/src/pages/user-setting/setting-model/components/un-add-model.tsx", patch
+    )
+    assert "Persist the same provider-facing identifier for every model type." in patch
+    assert "model_name: model.name," in patch
+    assert "model_name: model.runtime_model_name || model.name," not in source
+
+
+def test_model_labels_include_provider_without_changing_model_identity() -> None:
+    label = read_ragflow_source_or_patch(
+        "web/src/components/llm-select/llm-label.tsx",
+        read_text(ROOT / "patches" / "ragflow" / "0031-localmathrag-model-display-provider.patch"),
+    )
+    tree = read_ragflow_source_or_patch(
+        "web/src/components/model-tree-select.tsx",
+        read_text(ROOT / "patches" / "ragflow" / "0031-localmathrag-model-display-provider.patch"),
+    )
+    assert "providerName !== 'OpenAI-API-Compatible'" in label
+    assert "m.provider_name === 'OpenAI-API-Compatible'" in tree
+    assert "model_name: modelName" in tree
+
+
+def test_model_switch_has_visible_progress_feedback() -> None:
+    setting = read_ragflow_source_or_patch(
+        "web/src/pages/user-setting/setting-model/components/system-setting.tsx",
+        read_text(ROOT / "patches" / "ragflow" / "0033-localmathrag-model-switch-progress-feedback.patch"),
+    )
+    assert "loading: isSwitching" in setting
+    assert "disabled={isSwitching}" in setting
+    assert "role=\"status\"" in setting
+    assert "switchingElapsed" in setting
+    assert "setInterval(updateElapsed, 1000)" in setting
+    request = read_ragflow_source_or_patch(
+        "web/src/hooks/use-llm-request.tsx",
+        read_text(ROOT / "patches" / "ragflow" / "0033-localmathrag-model-switch-progress-feedback.patch"),
+    )
+    assert "onError: () =>" in request
+    assert "切换模型失败" in request
+    assert "duration: 12" in request
+
+
+def test_model_switch_runtime_error_is_sanitized() -> None:
+    service = read_ragflow_source_or_patch(
+        "api/apps/services/models_api_service.py",
+        read_text(ROOT / "patches" / "ragflow" / "0035-localmathrag-model-switch-readable-error.patch"),
+    )
+    assert 're.sub(r"^[\\x00-\\x1f\\ufffd]+", "", reason)' in service
+
+
 def test_ragflow_docx_formula_image_chunks_contract() -> None:
     patch = read_text(ROOT / "patches" / "ragflow" / "0013-localmathrag-docx-formula-image-chunks.patch")
-    naive = read_text(ROOT / "third_party" / "ragflow" / "rag" / "app" / "naive.py")
-    figure_parser = read_text(ROOT / "third_party" / "ragflow" / "deepdoc" / "parser" / "figure_parser.py")
+    naive = read_ragflow_source_or_patch("rag/app/naive.py", patch)
+    figure_parser = read_ragflow_source_or_patch("deepdoc/parser/figure_parser.py", patch)
     dockerfile = read_text(ROOT / "docker" / "Dockerfile.ragflow-local")
 
     assert "WORD_INLINE_IMAGE_PLACEHOLDER" in patch
     assert "WORD_EQUATION_PREFIX" in patch
     assert ".//m:oMath | .//m:oMathPara" in patch
+    assert "__image_blobs_from_relation_ids" in patch
+    assert "LazyImage.merge(drawing_image, vml_image)" in patch
     assert "__paragraph_text_with_math_placeholders" in patch
     assert "__image_placeholder" in patch
+    assert "__cell_text" in patch
+    assert 'line = "" if line is None else str(line)' in patch
+    assert "self.__clean(m) for m in metadata if self.__clean(m)" in patch
     assert "last_image_text" in patch
     assert "self.__image_placeholder(p, text)" in patch
+    assert "cell_text = escape(self.__cell_text(c))" in patch
     assert '(chunks[idx].get(\'text\') or \'\').rstrip() + "\\n" + description' in patch
     assert "WORD_INLINE_IMAGE_PLACEHOLDER" in naive
+    assert 'line = "" if line is None else str(line)' in naive
     assert ".//m:oMath | .//m:oMathPara" in naive
+    assert "__local_name(element) != \"imagedata\"" in naive
     assert "last_image_text or self.WORD_INLINE_IMAGE_PLACEHOLDER" in naive
     assert "self.__image_placeholder(p, text)" in naive
+    assert "cell_text = escape(self.__cell_text(c))" in naive
     assert "(chunks[idx].get('text') or '').rstrip() + \"\\n\" + description" in figure_parser
     assert "COPY third_party/ragflow/rag/app/naive.py" in dockerfile
     assert "COPY third_party/ragflow/deepdoc/parser/figure_parser.py" in dockerfile
+    assert "COPY third_party/ragflow/rag/nlp/__init__.py" in dockerfile
+
+
+def test_ragflow_vision_enhancement_is_opt_in_for_parsing() -> None:
+    patch = read_text(ROOT / "patches" / "ragflow" / "0022-localmathrag-vision-enhancement-opt-in.patch")
+    figure_parser = read_ragflow_source_or_patch("deepdoc/parser/figure_parser.py", patch)
+
+    assert "LOCALMATHRAG_ENABLE_VISION_ENHANCEMENT" in patch
+    assert "Visual model enhancement disabled; preserving image chunks without VLM." in patch
+    assert "if not chunks or not idx_lst:" in patch
+    assert "if not figures_data:" in patch
+    assert "return tbls" in patch
+    assert figure_parser.find("get_tenant_default_model_by_type") < figure_parser.find("_ensure_vision_runtime(callback)")
+    assert "LOCALMATHRAG_ENABLE_VISION_ENHANCEMENT" in figure_parser
+    assert "if not chunks or not idx_lst:" in figure_parser
+
+
+def test_vlm_model_uses_its_selected_capabilities_without_syncing_defaults() -> None:
+    service = read_text(ROOT / "services" / "object_service" / "main.py")
+    model_service = read_ragflow_source_or_patch(
+        "api/apps/services/models_api_service.py",
+        read_text(ROOT / "patches" / "ragflow" / "0030-localmathrag-model-capability-validation.patch"),
+    )
+    un_add_model = read_ragflow_source_or_patch(
+        "web/src/pages/user-setting/setting-model/components/un-add-model.tsx",
+        read_text(ROOT / "patches" / "ragflow" / "0028-localmathrag-shared-vlm-runtime.patch"),
+    )
+
+    assert '"model_type": ["chat", "vision"]' in service
+    assert 'if "chat" in model_type and any(item in model_type for item in {"vision", "ocr"}):' in service
+    assert 'if target["model_type"] not in model_types:' in service
+    assert 'updated = _replace_cmd_value(cmd, "--model", container_model_path)' in service
+    assert "def _local_runtime_kind_from_endpoint" in model_service
+    assert "_runtime_kind_for_model_type" in model_service
+    assert "_runtime_roles_for_selection" in model_service
+    assert "Model capability validation failed" in read_ragflow_source_or_patch(
+        "api/apps/services/provider_api_service.py",
+        read_text(ROOT / "patches" / "ragflow" / "0030-localmathrag-model-capability-validation.patch"),
+    )
+    assert "_display_model_name" in model_service
+    assert "Older LocalMathRAG installations" not in model_service
+    assert 'TenantService.update_by_id(tenant_id, {field_name: default_model})' in model_service
+    assert "model.model_type?.some((type) => type === 'vision' || type === 'image2text')" in un_add_model
+    assert "model_type: modelTypes.length ? modelTypes : ragflowTypeByGroup[primaryType]" in un_add_model
+
+
+def test_vlm_startup_errors_return_before_the_ready_timeout() -> None:
+    service = read_text(ROOT / "services" / "object_service" / "main.py")
+    compose = read_text(ROOT / "docker" / "docker-compose.localmathrag.yml")
+    assert 'if last_progress.get("phase") == "error":' in service
+    assert 'last_status["runtime_startup_failed"] = True' in service
+    assert "def _runtime_not_ready_reason" in service
+    assert "Free memory on device" in service
+    assert 'os.environ.get("LOCALMATHRAG_VLM_MAX_MODEL_LEN", "8192")' in service
+    assert "--max-model-len" in compose
+    assert "LOCALMATHRAG_VLM_MAX_MODEL_LEN:-8192" in compose
+
+
+def test_shared_runtime_policy_is_derived_from_model_bindings() -> None:
+    model_service = read_ragflow_source_or_patch(
+        "api/apps/services/models_api_service.py",
+        read_text(ROOT / "patches" / "ragflow" / "0034-localmathrag-role-derived-runtime-scheduling.patch"),
+    )
+    service = read_text(ROOT / "services" / "object_service" / "main.py")
+    assert "MODEL_TYPE_TO_RUNTIME_ROLE" in model_service
+    assert "_runtime_roles_for_selection" in model_service
+    assert '"roles": roles' in model_service
+    assert '"replacing_roles"' in model_service
+    assert "isinstance(required, (int, float)) and required > 0" in model_service
+    assert "RUNTIME_ROLE_PRIORITY" in service
+    assert "def _target_runtime_roles" in service
+    assert "def _runtime_preemption_order(target" in service
+    assert "roles & replacing_roles" in service
+    assert "high priority embedding request reserved resources" not in service
+
+
+def test_model_capabilities_are_selected_then_verified_by_the_system() -> None:
+    provider_service = read_ragflow_source_or_patch(
+        "api/apps/services/provider_api_service.py",
+        read_text(ROOT / "patches" / "ragflow" / "0030-localmathrag-model-capability-validation.patch"),
+    )
+    model_service = read_ragflow_source_or_patch(
+        "api/apps/services/models_api_service.py",
+        read_text(ROOT / "patches" / "ragflow" / "0030-localmathrag-model-capability-validation.patch"),
+    )
+    modal_utils = read_ragflow_source_or_patch(
+        "web/src/pages/user-setting/setting-model/modal/provider-modal/field-config/utils.ts",
+        read_text(ROOT / "patches" / "ragflow" / "0030-localmathrag-model-capability-validation.patch"),
+    )
+    local_fields = read_ragflow_source_or_patch(
+        "web/src/pages/user-setting/setting-model/modal/provider-modal/field-config/local-llm-configs.ts",
+        read_text(ROOT / "patches" / "ragflow" / "0030-localmathrag-model-capability-validation.patch"),
+    )
+
+    assert "requested_types" in provider_service
+    assert "passed_types" in provider_service
+    assert "Model capability validation failed" in provider_service
+    assert "get_by_provider_id_and_instance_id_and_model_type_and_model_name" in provider_service
+    assert "applyChatToImage2Text" not in modal_utils
+    assert "values.vision" not in modal_utils
+    assert "name: 'vision'" not in local_fields
+    assert "name: 'is_tools'" not in local_fields
+    assert "_display_model_name" in model_service
+    assert "Existing installations may have stored a local model as /models/*.gguf." in model_service
+
+
+def test_ragflow_docx_math_ocr_is_optional_for_word_images() -> None:
+    patch = read_text(ROOT / "patches" / "ragflow" / "0023-localmathrag-math-ocr-docx-chunks.patch")
+    context_patch = read_text(ROOT / "patches" / "ragflow" / "0036-localmathrag-docx-formula-context.patch")
+    figure_parser = read_ragflow_source_or_patch("deepdoc/parser/figure_parser.py", patch + "\n" + context_patch)
+    compose = read_text(ROOT / "docker" / "docker-compose.localmathrag.yml")
+
+    assert "LOCALMATHRAG_ENABLE_MATH_OCR" in patch
+    assert "LOCALMATHRAG_MATH_OCR_URL" in patch
+    assert "LOCALMATHRAG_MATH_OCR_STATUS_URL" in patch
+    assert "LOCALMATHRAG_MATH_OCR_TIMEOUT_SECONDS" in patch
+    assert "LOCALMATHRAG_MATH_OCR_STATUS_TIMEOUT_SECONDS" in patch
+    assert "_math_ocr_service_ready" in patch
+    assert 'os.environ.get("LOCALMATHRAG_MATH_OCR_URL") or f"{OBJECT_SERVICE_URL}/v1/math-ocr"' in patch
+    assert "def _math_ocr_enabled() -> bool:" in patch
+    assert 'normalized in {"auto", ""}' in patch
+    assert "urllib.request.urlopen(req, timeout=MATH_OCR_TIMEOUT_SECONDS)" in patch
+    assert "_first_math_ocr_text" in patch
+    assert "[Math OCR LaTeX:" in patch
+    assert "_enhance_docx_chunks_with_math_ocr(chunks, idx_lst, callback)" in patch
+    assert "open_image_for_processing(ck.get(\"image\"), allow_bytes=True)" in patch
+    assert "LOCALMATHRAG_ENABLE_MATH_OCR" in figure_parser
+    assert "LOCALMATHRAG_MATH_OCR_URL" in figure_parser
+    assert "LOCALMATHRAG_MATH_OCR_STATUS_URL" in figure_parser
+    assert "LOCALMATHRAG_MATH_OCR_TIMEOUT_SECONDS" in figure_parser
+    assert "formula_indices = _enhance_docx_chunks_with_math_ocr(chunks, idx_lst, callback)" in figure_parser
+    assert "idx_lst = _coalesce_docx_formula_chunks(chunks, formula_indices)" in figure_parser
+    assert "LOCALMATHRAG_ENABLE_MATH_OCR: ${LOCALMATHRAG_ENABLE_MATH_OCR:-auto}" in compose
+    assert "LOCALMATHRAG_MATH_OCR_URL: ${LOCALMATHRAG_MATH_OCR_URL:-}" in compose
+    assert "LOCALMATHRAG_MATH_OCR_TIMEOUT_SECONDS: ${LOCALMATHRAG_MATH_OCR_TIMEOUT_SECONDS:-10}" in compose
+
+
+def test_ragflow_docx_equation_editor_formulas_keep_paragraph_context() -> None:
+    patch = read_text(ROOT / "patches" / "ragflow" / "0036-localmathrag-docx-formula-context.patch")
+    naive = read_ragflow_source_or_patch("rag/app/naive.py", patch)
+    nlp = read_ragflow_source_or_patch("rag/nlp/__init__.py", patch)
+    figure_parser = read_ragflow_source_or_patch("deepdoc/parser/figure_parser.py", patch)
+
+    assert "def __equation_editor_sources" in naive
+    assert 'self.__local_name(element) != "OLEObject"' in naive
+    assert 'normalized.startswith("equation.")' in naive
+    assert '"_docx_paragraph_id": paragraph_id' in naive
+    assert '"_docx_anchor_text": self.__clean(anchor_text)' in naive
+    assert 'metadata["_docx_formula_sources"] = equation_sources' in naive
+    assert "line.get(\"metadata\") or {}" in naive
+    assert "section[3] if len(section) > 3" in nlp
+    assert '"_docx_paragraph_ids"' in nlp
+    assert 'merged[prev_text_ck]["text"] = f"{left}\\n{right}"' in nlp
+    assert "for idx in (sorted(formula_indices) if formula_indices else idx_lst)" in figure_parser
+    assert "def _coalesce_docx_formula_chunks" in figure_parser
+    assert "from rag.utils.lazy_image import LazyImage," in figure_parser
+    assert 'paragraph_id in chunk.get("_docx_paragraph_ids", [])' in figure_parser
+    assert 'return f"$$\\n{latex}\\n$$"' in figure_parser
+    assert "_merge_chunk_image(anchor, formula_chunk)" in figure_parser
+
+
+def test_ragflow_equation_editor_wmf_previews_are_rasterized_locally() -> None:
+    patch = read_text(ROOT / "patches" / "ragflow" / "0037-localmathrag-wmf-equation-rasterization.patch")
+    lazy_image = read_ragflow_source_or_patch("rag/utils/lazy_image.py", patch)
+    dockerfile = read_text(ROOT / "docker" / "Dockerfile.ragflow-local")
+    dockerignore = read_text(ROOT / ".dockerignore")
+    compose = read_text(ROOT / "docker" / "docker-compose.localmathrag.yml")
+    dev_up = read_text(ROOT / "scripts" / "dev-up.ps1")
+
+    assert 'WMF_PLACEABLE_MAGIC = b"\\xd7\\xcd\\xc6\\x9a"' in lazy_image
+    assert 'shutil.which("wmf2gd")' in lazy_image
+    assert '"--wmf-sys-fonts"' in lazy_image
+    assert 'LOCALMATHRAG_MATH_FONT_DIR' in lazy_image
+    assert 'LOCALMATHRAG_WMF_TIMEOUT_SECONDS' in lazy_image
+    assert "subprocess.TimeoutExpired" in lazy_image
+    assert "def _crop_formula_canvas" in lazy_image
+    assert "ImageChops.difference" in lazy_image
+    assert "def iter_pil_images" in lazy_image
+    assert "libwmf-bin" in dockerfile
+    assert "COPY third_party/ragflow/rag/utils/lazy_image.py" in dockerfile
+    assert "!third_party/ragflow/rag/utils/lazy_image.py" in dockerignore
+    assert "data/fonts/math:/usr/local/share/fonts/localmathrag:ro" in compose
+    assert "LOCALMATHRAG_MATH_FONT_DIR: /usr/local/share/fonts/localmathrag" in compose
+    assert "function Sync-MathFormulaFonts" in dev_up
+    assert '"MTEXTRA.TTF"' in dev_up
+    assert '"symbol.ttf"' in dev_up
+
+
+def test_ragflow_formula_ocr_processes_equations_individually() -> None:
+    patch = read_text(ROOT / "patches" / "ragflow" / "0038-localmathrag-per-formula-ocr.patch")
+    figure_parser = read_ragflow_source_or_patch("deepdoc/parser/figure_parser.py", patch)
+
+    assert "chunk_image.iter_pil_images()" in figure_parser
+    assert "image_cache = {}" in figure_parser
+    assert 'hashlib.sha256(encoded.encode("ascii")).digest()' in figure_parser
+    assert 'ck["_docx_formula_latex_items"] = latex_items' in figure_parser
+    assert 'Local Math OCR: {processed_images}/{total_images} formula images' in figure_parser
+    assert 'chunk.get("_docx_formula_latex_items") or []' in figure_parser
+    assert 'f"$$\\n{latex}\\n$$" if latex else' in figure_parser
+
+
+def test_rapid_formula_ocr_does_not_publish_unreliable_equation_editor_latex() -> None:
+    patch = read_text(ROOT / "patches" / "ragflow" / "0039-localmathrag-equation-editor-ocr-quality-gate.patch")
+    figure_parser = read_ragflow_source_or_patch("deepdoc/parser/figure_parser.py", patch)
+
+    assert "_MATH_OCR_STATUS = {}" in figure_parser
+    assert "def _math_ocr_backend_name" in figure_parser
+    assert "def _rapid_equation_editor_ocr_allowed" in figure_parser
+    assert 'LOCALMATHRAG_ALLOW_RAPID_EQUATION_EDITOR_OCR' in figure_parser
+    assert '_math_ocr_backend_name() == "rapid_latex_ocr"' in figure_parser
+    assert 'str(source.get("prog_id") or "").lower().startswith("equation.")' in figure_parser
+    assert "preserving formula images and context" in figure_parser
+
+
+def test_equation_native_mtef_is_preferred_over_formula_ocr() -> None:
+    patch = read_text(ROOT / "patches" / "ragflow" / "0040-localmathrag-equation-native-mtef.patch")
+    naive = read_ragflow_source_or_patch("rag/app/naive.py", patch)
+    figure_parser = read_ragflow_source_or_patch("deepdoc/parser/figure_parser.py", patch)
+    dockerfile = read_text(ROOT / "docker" / "Dockerfile.ragflow-local")
+    parser_root = ROOT / "services" / "mtef_parser"
+
+    assert (parser_root / "LICENSE").is_file()
+    assert (parser_root / "localmathrag-mtef-linux-amd64").is_file()
+    assert (parser_root / "localmathrag-mtef-linux-amd64").stat().st_size > 1_000_000
+    parser_readme = read_text(parser_root / "README.md")
+    assert "16d536beaf41e0d88b0963a59e55c36de54e4fba" in parser_readme
+    assert "75add02ceb32a9dbfaf46f1a9b80f75ca7cf63fe58f22972ff780881cd3135dc" in parser_readme
+    assert "COPY services/mtef_parser/localmathrag-mtef-linux-amd64" in dockerfile
+    assert "LOCALMATHRAG_MTEF_PARSER=/usr/local/bin/localmathrag-mtef" in dockerfile
+    assert "self._equation_native_cache = {}" in naive
+    assert "def __equation_native_latex" in naive
+    assert 'input=ole_blob' in naive
+    assert 'source["native_latex"] = native_latex' in naive
+    assert "and not native_complete" in naive
+    assert "native_relationship_ids = set()" in naive
+    assert 'pieces.append(f"\\n$$\\n{native_latex}\\n$$\\n")' in naive
+    assert 'metadata["_docx_native_formulas_inline"] = all(' in naive
+    assert 'chunks[idx]["_docx_formula_latex_items"] = latex_items' in figure_parser
+    assert "if idx not in native_indices" in figure_parser
+    assert "Equation Native formulas locally (MTEF)" in figure_parser
+    assert 'native_formulas_inline = bool(formula_chunk.get("_docx_native_formulas_inline"))' in figure_parser
+
+
+def test_formula_only_word_layout_tables_keep_text_context() -> None:
+    patch = read_text(ROOT / "patches" / "ragflow" / "0041-localmathrag-formula-table-context.patch")
+    naive = read_ragflow_source_or_patch("rag/app/naive.py", patch)
+
+    assert "def _coalesce_docx_formula_tables" in naive
+    assert 'chunk.get("ck_type") == "table"' in naive
+    assert 'chunk.get("image") is None' in naive
+    assert 're.sub(r"\\$\\$.*?\\$\\$", "", text, flags=re.DOTALL)' in naive
+    assert 'unescape(re.sub(r"<[^>]+>", "", outside_formula))' in naive
+    assert 'anchor = next((item for item in reversed(merged) if item.get("ck_type") == "text"), None)' in naive
+    assert "chunks = _coalesce_docx_formula_tables(chunks)" in naive
+
+
+def test_chunk_formula_images_use_bounded_contain_previews() -> None:
+    patch = read_text(ROOT / "patches" / "ragflow" / "0053-localmathrag-bounded-chunk-image-preview.patch")
+    chunk_card = read_ragflow_source_or_patch(
+        "web/src/pages/chunk/parsed-result/add-knowledge/components/knowledge-chunk/components/chunk-card/index.tsx",
+        patch,
+    )
+    dataflow_card = read_ragflow_source_or_patch(
+        "web/src/pages/dataflow-result/components/chunk-card/index.tsx",
+        patch,
+    )
+
+    for component in (chunk_card, dataflow_card):
+        assert "flex max-h-80 max-w-56 shrink-0 items-center justify-center overflow-hidden" in component
+        assert 'className="!h-auto !w-auto max-h-80 max-w-56 object-contain"' in component
+        assert "max-h-[70vh] max-w-[70vw] object-contain" in component
+        assert "const narrowThumbnailMaxHeight = 192" in component
+        assert "const narrowThumbnailAspectRatio = 0.5" in component
+        assert "aspectRatio < narrowThumbnailAspectRatio" in component
+        assert "maxHeight: imageMaxHeight" in component
+        assert "maxWidth: thumbnailMaxWidth" in component
+        assert "handleThumbnailLoad(currentTarget)" in component
+        assert "size-28" not in component
+    assert "!w-28 object-contain" not in chunk_card
+    assert "max-w-[72vw] overflow-hidden bg-white p-2" in chunk_card
+
+
+def test_parallel_document_toc_is_bounded_and_optional() -> None:
+    patch = read_text(ROOT / "patches" / "ragflow" / "0042-localmathrag-bounded-toc-ingestion.patch")
+    generator = read_ragflow_source_or_patch("rag/prompts/generator.py", patch)
+    executor = read_ragflow_source_or_patch("rag/svr/task_executor.py", patch)
+    handler = read_ragflow_source_or_patch("rag/svr/task_executor_refactor/task_handler.py", patch)
+    limiter = read_ragflow_source_or_patch("rag/svr/task_executor_limiter.py", patch)
+    compose = read_text(ROOT / "docker" / "docker-compose.localmathrag.yml")
+    dockerfile = read_text(ROOT / "docker" / "Dockerfile.ragflow-local")
+
+    assert "LOCALMATHRAG_TOC_MAX_OUTPUT_TOKENS" in generator
+    assert '"max_tokens": TOC_MAX_OUTPUT_TOKENS' in generator
+    assert "TOC_MAX_CONCURRENT_REQUESTS" in generator
+    assert "TOC_REQUEST_TIMEOUT_SECONDS" in generator
+    assert "request_limiter = asyncio.Semaphore" in generator
+    assert "toc_limiter = LoopLocalSemaphore(MAX_CONCURRENT_TOC)" in limiter
+    assert "async def build_TOC_guarded" in executor
+    assert "async def _build_toc_guarded" in handler
+    assert "TOC generation skipped because another document is using the local LLM." in executor
+    assert "TOC generation skipped because another document is using the local LLM." in handler
+    assert 'os.environ.get("LOCALMATHRAG_TOC_TIMEOUT_SECONDS", "60")' in executor
+    assert 'os.environ.get("LOCALMATHRAG_TOC_TIMEOUT_SECONDS", "60")' in handler
+    assert "document indexing is complete" in executor
+    assert "document indexing is complete" in handler
+    assert compose.count("LOCALMATHRAG_MAX_CONCURRENT_TOC: ${LOCALMATHRAG_MAX_CONCURRENT_TOC:-1}") == 2
+    assert compose.count("LOCALMATHRAG_TOC_TIMEOUT_SECONDS: ${LOCALMATHRAG_TOC_TIMEOUT_SECONDS:-60}") == 2
+    assert "COPY third_party/ragflow/rag/prompts/generator.py" in dockerfile
+    assert "COPY third_party/ragflow/rag/svr/task_executor_limiter.py" in dockerfile
+    assert "COPY third_party/ragflow/rag/svr/task_executor_refactor/task_handler.py" in dockerfile
+
+
+def test_expired_executor_pending_tasks_are_requeued() -> None:
+    patch = read_text(ROOT / "patches" / "ragflow" / "0043-localmathrag-requeue-expired-executor-tasks.patch")
+    executor = read_ragflow_source_or_patch("rag/svr/task_executor.py", patch)
+
+    assert "def requeue_expired_worker_tasks" in executor
+    assert "xpending_range(" in executor
+    assert 'consumer_name = item.get("consumer")' in executor
+    assert "if consumer_name == worker_name" in executor
+    assert "target_queue = queue_name_for_task(message, worker_task_type)" in executor
+    assert "pipeline.xadd(target_queue, payload)" in executor
+    assert "pipeline.xack(queue_name, SVR_CONSUMER_GROUP_NAME, message_id)" in executor
+    assert "pipeline.xdel(queue_name, message_id)" in executor
+    assert "def requeue_orphaned_pending_tasks" in executor
+    assert "xinfo_consumers(queue_name, SVR_CONSUMER_GROUP_NAME)" in executor
+    pending_check = executor.index('if int(consumer.get("pending", 0) or 0) <= 0')
+    inspected_add = executor.index("inspected.add(worker_name)", pending_check)
+    assert pending_check < inspected_add
+    assert "worker_name in active_workers" in executor
+    assert "WORKER_HEARTBEAT_TIMEOUT * 1000" in executor
+    assert "requeue_orphaned_pending_tasks(set(task_executors))" in executor
+    assert "requeued = requeue_expired_worker_tasks(worker_name)" in executor
+    assert "Requeued %d pending tasks from expired worker %s" in executor
+
+
+def test_toc_runs_in_a_durable_background_queue() -> None:
+    patch = read_text(ROOT / "patches" / "ragflow" / "0044-localmathrag-durable-toc-queue.patch")
+    queue_module = read_ragflow_source_or_patch("rag/svr/localmathrag_toc_queue.py", patch)
+    executor = read_ragflow_source_or_patch("rag/svr/task_executor.py", patch)
+    handler = read_ragflow_source_or_patch("rag/svr/task_executor_refactor/task_handler.py", patch)
+    compose = read_text(ROOT / "docker" / "docker-compose.localmathrag.yml")
+    dockerfile = read_text(ROOT / "docker" / "Dockerfile.ragflow-local")
+
+    assert 'TOC_QUEUE_NAME = "localmathrag.toc"' in queue_module
+    assert 'TOC_CONSUMER_GROUP = "localmathrag_toc_workers"' in queue_module
+    assert "def enqueue_toc_task" in queue_module
+    assert "async def toc_queue_worker" in queue_module
+    assert "xpending_range(TOC_QUEUE_NAME" in queue_module
+    assert "pipeline.xadd(TOC_QUEUE_NAME" in queue_module
+    assert "pipeline.xdel(TOC_QUEUE_NAME, message_id)" in queue_module
+    assert "requested_ids = set(job.get(\"chunk_ids\") or [])" in queue_module
+    assert "settings.retriever.chunk_list" in queue_module
+    assert "TOC_MAX_RETRIES" in queue_module
+    assert "TOC_QUEUE_TIMEOUT_SECONDS" in queue_module
+    assert "TOC_RECOVERY_INTERVAL_SECONDS" in queue_module
+    assert "time.monotonic() - last_recovery" in queue_module
+    assert "if acknowledge:" in queue_module
+    assert "REDIS_CONN.REDIS.xdel(TOC_QUEUE_NAME, redis_message.get_msg_id())" in queue_module
+    assert "enqueue_toc_task(" in handler
+    assert "TOC queued for background generation." in handler
+    assert "self._build_toc_guarded(ctx, chunks" not in handler
+    assert "toc_queue_worker(f\"{CONSUMER_NAME}_toc\")" in executor
+    assert "toc_worker_task.cancel()" in executor
+    assert "build_TOC_guarded(task, chunks" not in executor
+    assert compose.count("LOCALMATHRAG_TOC_QUEUE_MAX_RETRIES: ${LOCALMATHRAG_TOC_QUEUE_MAX_RETRIES:-2}") == 2
+    assert compose.count("LOCALMATHRAG_TOC_QUEUE_TIMEOUT_SECONDS: ${LOCALMATHRAG_TOC_QUEUE_TIMEOUT_SECONDS:-300}") == 2
+    assert "COPY third_party/ragflow/rag/svr/localmathrag_toc_queue.py" in dockerfile
+
+
+def test_toc_prefers_local_document_structure_without_llm() -> None:
+    patch = read_text(ROOT / "patches" / "ragflow" / "0045-localmathrag-local-structure-toc.patch")
+    quality_patches = [
+        patch,
+        read_text(ROOT / "patches" / "ragflow" / "0046-localmathrag-rendered-toc-resolution.patch"),
+        read_text(ROOT / "patches" / "ragflow" / "0047-localmathrag-toc-body-mapping.patch"),
+        read_text(ROOT / "patches" / "ragflow" / "0048-localmathrag-drop-partial-toc-fragments.patch"),
+    ]
+    builder = read_ragflow_source_or_patches("rag/svr/localmathrag_toc_builder.py", quality_patches)
+    queue_module = read_ragflow_source_or_patches(
+        "rag/svr/localmathrag_toc_queue.py",
+        [read_text(ROOT / "patches" / "ragflow" / "0044-localmathrag-durable-toc-queue.patch"), patch],
+    )
+    naive = read_ragflow_source_or_patches(
+        "rag/app/naive.py",
+        [read_text(ROOT / "patches" / "ragflow" / "0001-localmathrag-offline-ui.patch"), patch],
+    )
+    generator = read_ragflow_source_or_patches(
+        "rag/prompts/generator.py",
+        [read_text(ROOT / "patches" / "ragflow" / "0042-localmathrag-bounded-toc-ingestion.patch"), patch],
+    )
+    compose = read_text(ROOT / "docker" / "docker-compose.localmathrag.yml")
+    dockerfile = read_text(ROOT / "docker" / "Dockerfile.ragflow-local")
+    dockerignore = read_text(ROOT / ".dockerignore")
+
+    assert "def build_local_toc" in builder
+    assert "_NUMBERED_PATTERNS" in builder
+    assert "_outline_candidates" in builder
+    assert "_caption_candidates" in builder
+    assert "_resolve_rendered_toc" in builder
+    assert "_strip_trailing_page_number" in builder
+    assert "_drop_unresolved_toc_fragments" in builder
+    assert "_FORMULA_BLOCK_RE" in builder
+    assert "from rag.svr.localmathrag_toc_builder import build_local_toc" in queue_module
+    assert 'TOC_USE_LLM_LEVELS = _env_enabled("LOCALMATHRAG_TOC_USE_LLM_LEVELS", False)' in queue_module
+    assert 'TOC_LLM_FALLBACK = _env_enabled("LOCALMATHRAG_TOC_LLM_FALLBACK", False)' in queue_module
+    assert "if not TOC_LLM_FALLBACK:" in queue_module
+    assert "Built local TOC" in queue_module
+    assert "section_end = max(current + 1, min(following, len(docs)))" in queue_module
+    assert "def __heading_level" in naive
+    assert 'res[0]["__outline__"] = docx_parser.outlines' in naive
+    assert 'LOCALMATHRAG_TOC_MAX_OUTPUT_TOKENS", "256"' in generator
+    assert compose.count("LOCALMATHRAG_TOC_USE_LLM_LEVELS: ${LOCALMATHRAG_TOC_USE_LLM_LEVELS:-false}") == 2
+    assert compose.count("LOCALMATHRAG_TOC_LLM_FALLBACK: ${LOCALMATHRAG_TOC_LLM_FALLBACK:-false}") == 2
+    assert compose.count("LOCALMATHRAG_TOC_LOCAL_MAX_ENTRIES: ${LOCALMATHRAG_TOC_LOCAL_MAX_ENTRIES:-256}") == 2
+    assert "COPY third_party/ragflow/rag/svr/localmathrag_toc_builder.py" in dockerfile
+    assert "!third_party/ragflow/rag/svr/localmathrag_toc_builder.py" in dockerignore
+
+    source_path = ROOT / "third_party" / "ragflow" / "rag" / "svr" / "localmathrag_toc_builder.py"
+    if source_path.exists():
+        spec = importlib.util.spec_from_file_location("localmathrag_toc_builder_contract", source_path)
+        assert spec and spec.loader
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        chunks = [
+            "\u7cfb\u7edf\u529f\u80fd\u63cf\u8ff0\n\u7b97\u6cd5\u8bbe\u8ba1\n\u8fd9\u662f\u6b63\u6587\u3002",
+            "1\uff09\u8054\u90a6\u6ee4\u6ce2\u5668\u5de5\u4f5c\u6d41\u7a0b\n\u2460\u4fe1\u606f\u5206\u914d\n\u8be5\u8fc7\u7a0b\u4e3b\u8981\u4efb\u52a1\u662f\u5206\u914d\u4fe1\u606f\u3002",
+            "$$\\hat X_k=P_k$$\nb)\u6a21\u578b\u6761\u4ef6\u6ee4\u6ce2\nc)\u6a21\u578b\u6982\u7387\u66f4\u65b0",
+            "\u5bf9\u4e8e\u5404\u4e2a\u6a21\u578b\uff0c\u8ba1\u7b97\u6a21\u578b\u6982\u7387\nd)\u4f30\u8ba1\u878d\u5408",
+        ]
+        toc = module.build_local_toc(chunks)
+        titles = [item["title"] for item in toc]
+        assert "\u7b97\u6cd5\u8bbe\u8ba1" in titles
+        assert "1\uff09\u8054\u90a6\u6ee4\u6ce2\u5668\u5de5\u4f5c\u6d41\u7a0b" in titles
+        assert "b)\u6a21\u578b\u6761\u4ef6\u6ee4\u6ce2" in titles
+        assert "c)\u6a21\u578b\u6982\u7387\u66f4\u65b0" in titles
+        assert "d)\u4f30\u8ba1\u878d\u5408" in titles
+        assert all("hat X" not in title for title in titles)
+        outlined = module.build_local_toc(
+            chunks,
+            [
+                {"title": "\u7cfb\u7edf\u529f\u80fd\u63cf\u8ff0", "depth": 0},
+                {"title": "\u7b97\u6cd5\u8bbe\u8ba1", "depth": 1},
+            ],
+        )
+        assert outlined[0] == {"level": "1", "title": "\u7cfb\u7edf\u529f\u80fd\u63cf\u8ff0", "chunk_id": "0"}
+        assert outlined[1] == {"level": "2", "title": "\u7b97\u6cd5\u8bbe\u8ba1", "chunk_id": "0"}
+
+        rendered_toc = module.build_local_toc(
+            [
+                "\u76ee\u5f55\n1 \u76ee\u7684\u548c\u8303\u56f4 10\n1.1 \u76ee\u7684 10\n1.2 \u8303\u56f4 11\n"
+                "2 \u7cfb\u7edf\u8bbe\u8ba1 12\n2.1 \u529f\u80fd\u63cf\u8ff0 12\n2.2 \u63a5\u53e3\u8bbe\u8ba1 14\n"
+                "3 \u9a8c\u8bc1 20\n3.1 \u6d4b\u8bd5\u65b9\u6cd5 21",
+                "\uff081\uff09\u5982\u679c\u8bbe\u5907\u6ee1\u8db3\u6761\u4ef6\uff0c\u5219\u7ee7\u7eed\u6267\u884c\u8be5\u6d41\u7a0b\u3002",
+                "1 \u76ee\u7684\u548c\u8303\u56f4\n1.1 \u76ee\u7684\n\u6b63\u6587\u3002\n1.2 \u8303\u56f4",
+                "2 \u7cfb\u7edf\u8bbe\u8ba1\n2.1 \u529f\u80fd\u63cf\u8ff0\n2.2 \u63a5\u53e3\u8bbe\u8ba1",
+                "3 \u9a8c\u8bc1\n3.1 \u6d4b\u8bd5\u65b9\u6cd5",
+            ]
+        )
+        assert len(rendered_toc) == 8
+        assert rendered_toc[0] == {"level": "1", "title": "1\u76ee\u7684\u548c\u8303\u56f4", "chunk_id": "2"}
+        assert rendered_toc[-1]["chunk_id"] == "4"
+        assert all(not re.search(r"\s\d+$", item["title"]) for item in rendered_toc)
+        assert all(item["chunk_id"] != "0" for item in rendered_toc)
+        assert all("\u5982\u679c\u8bbe\u5907" not in item["title"] for item in rendered_toc)
+
+        partial_toc = module.build_local_toc(
+            [
+                "\u591a\u6e90\u878d\u5408\u7b97\u6cd5\u8bbe\u8ba1\u65b9\u6848\n\u76ee \u5f55\n6.5.8\t\u5b89\u5168\u4f4d\u7f6e\u9632\u62a4\t16\n\u76ee\u7684\n\u6b63\u6587\u3002",
+                "\u8303\u56f4\n\u7b97\u6cd5\u8bbe\u8ba1",
+            ]
+        )
+        assert all("6.5.8" not in item["title"] for item in partial_toc)
+
+
+def test_auxiliary_indexes_are_queued_below_document_parsing_and_release_on_cancel() -> None:
+    patch = read_text(ROOT / "patches" / "ragflow" / "0049-localmathrag-prioritized-auxiliary-index-queue.patch")
+    cancellation_patch = read_text(ROOT / "patches" / "ragflow" / "0050-localmathrag-auxiliary-lease-cancellation.patch")
+    migration_patch = read_text(ROOT / "patches" / "ragflow" / "0051-localmathrag-migrate-legacy-parse-queue.patch")
+    recovery_patch = read_text(ROOT / "patches" / "ragflow" / "0052-localmathrag-fix-orphan-consumer-scan.patch")
+    deferred_retry_patch = read_text(ROOT / "patches" / "ragflow" / "0054-localmathrag-deferred-auxiliary-retry.patch")
+    stale_cleanup_patch = read_text(ROOT / "patches" / "ragflow" / "0055-localmathrag-clear-stale-auxiliary-tasks.patch")
+    scoped_cleanup_patch = read_text(ROOT / "patches" / "ragflow" / "0062-localmathrag-scope-auxiliary-cleanup-by-task-type.patch")
+    patches = [patch, cancellation_patch, migration_patch, recovery_patch, deferred_retry_patch, stale_cleanup_patch, scoped_cleanup_patch]
+    priority_queue = read_ragflow_source_or_patches("rag/svr/localmathrag_priority_queue.py", patches)
+    task_service = read_ragflow_source_or_patches("api/db/services/task_service.py", [patch, deferred_retry_patch])
+    document_service = read_ragflow_source_or_patch("api/db/services/document_service.py", patch)
+    executor = read_ragflow_source_or_patches("rag/svr/task_executor.py", patches)
+    dataset_service = read_ragflow_source_or_patches(
+        "api/apps/services/dataset_api_service.py", [stale_cleanup_patch, scoped_cleanup_patch]
+    )
+    task_api = read_ragflow_source_or_patch("api/apps/restful_apis/task_api.py", stale_cleanup_patch)
+    compose = read_text(ROOT / "docker" / "docker-compose.localmathrag.yml")
+    dockerfile = read_text(ROOT / "docker" / "Dockerfile.ragflow-local")
+    dockerignore = read_text(ROOT / ".dockerignore")
+
+    assert "DOCUMENT_PARSE_PRIORITY = 1" in priority_queue
+    assert "AUXILIARY_INDEX_PRIORITY = 0" in priority_queue
+    assert 'frozenset({"graphrag", "raptor", "mindmap"})' in priority_queue
+    assert "def document_parse_queue_busy" in priority_queue
+    assert "def queue_name_for_task" in priority_queue
+    assert 'group.get("lag", 0)' in priority_queue
+    assert 'group.get("pending", 0)' in priority_queue
+    assert "def acquire_auxiliary_index_lease" in priority_queue
+    assert "def refresh_auxiliary_index_lease" in priority_queue
+    assert "def release_auxiliary_index_lease" in priority_queue
+    assert "def remove_stale_auxiliary_index_messages" in priority_queue
+    assert "task_types: set[str] | None = None" in priority_queue
+    assert "if task_types and message_task_type not in task_types:" in priority_queue
+    assert "is_pending = normalized_message_id in pending_ids" in priority_queue
+    assert "is_queued = _stream_id_tuple(normalized_message_id) > _stream_id_tuple(last_delivered_id)" in priority_queue
+    assert 'pipeline.set(f"{message_task_id}-cancel", "x")' in priority_queue
+    assert "pipeline.xack(queue_name, SVR_CONSUMER_GROUP_NAME, message_id)" in priority_queue
+    assert "pipeline.xdel(queue_name, message_id)" in priority_queue
+    assert "priority = DOCUMENT_PARSE_PRIORITY" in task_service
+    assert "increment_retry=True" in task_service
+    assert "if not increment_retry:" in task_service
+    assert "priority = AUXILIARY_INDEX_PRIORITY" in document_service
+    assert '"priority": priority' in document_service
+    assert "document_parse_queue_busy(TASK_TYPE)" in executor
+    assert "acquire_auxiliary_index_lease(task[\"id\"])" in executor
+    assert "increment_retry = task_type not in AUXILIARY_INDEX_TASK_TYPES" in executor
+    assert "increment_retry=increment_retry" in executor
+    assert 'admitted_task = TaskService.get_task(msg["id"], msg.get("doc_ids", []))' in executor
+    assert "Deferred %s task %s because %s" in executor
+    assert "release_auxiliary_index_lease(auxiliary_lease)" in executor
+    assert "lease_heartbeat.cancel()" in executor
+    assert "await asyncio.gather(lease_heartbeat, return_exceptions=True)" in executor
+    canceled_check = executor.index("if not task or canceled:")
+    lease_acquire = executor.index('acquire_auxiliary_index_lease(task["id"])')
+    admitted_attempt = executor.index('admitted_task = TaskService.get_task(msg["id"], msg.get("doc_ids", []))')
+    lease_release = executor.index("release_auxiliary_index_lease(auxiliary_lease)")
+    message_ack = executor.index("redis_msg.ack()", lease_release)
+    assert canceled_check < lease_acquire < admitted_attempt < lease_release < message_ack
+    assert "stale_task_ids = remove_stale_auxiliary_index_messages(" in dataset_service
+    assert "doc_ids=set(document_ids)" in dataset_service
+    assert "task_types={task_type}" in dataset_service
+    assert "TaskService.delete_by_id(stale_task_id)" in dataset_service
+    assert 'REDIS_CONN.set(f"{existing_task_id}-cancel", "x")' in dataset_service
+    assert "TaskService.delete_by_id(existing_task_id)" in dataset_service
+    assert "A {display_name} Task is already running" not in dataset_service
+    assert "def release_stale_auxiliary_index_locks" in priority_queue
+    assert "REDIS_CONN.delete_if_equal(" in priority_queue
+    assert 'f"batch_merge:{task_id}"' in priority_queue
+    assert "release_stale_auxiliary_index_locks(existing_task_id, dataset_id" in dataset_service
+    assert "release_stale_auxiliary_index_locks(task_id, dataset_id" in dataset_service
+    assert "remove_stale_auxiliary_index_messages(task_ids={task_id})" in dataset_service
+    assert "remove_stale_auxiliary_index_messages(task_ids={task_id})" in task_api
+    assert compose.count("LOCALMATHRAG_AUX_INDEX_LOCK_TTL_SECONDS: ${LOCALMATHRAG_AUX_INDEX_LOCK_TTL_SECONDS:-86400}") == 2
+    assert compose.count("MAX_CONCURRENT_CHATS: ${LOCALMATHRAG_MAX_CONCURRENT_CHATS:-1}") == 2
+    assert compose.count("MAX_CONCURRENT_PROCESS_AND_EXTRACT_CHUNK: ${LOCALMATHRAG_MAX_CONCURRENT_PROCESS_AND_EXTRACT_CHUNK:-1}") == 2
+    assert "COPY third_party/ragflow/api/db/services/document_service.py" in dockerfile
+    assert "COPY third_party/ragflow/rag/svr/localmathrag_priority_queue.py" in dockerfile
+    assert "!third_party/ragflow/api/db/services/document_service.py" in dockerignore
+    assert "!third_party/ragflow/rag/svr/localmathrag_priority_queue.py" in dockerignore
+    assert "COPY third_party/ragflow/api/apps/restful_apis/task_api.py" in dockerfile
+    assert "!third_party/ragflow/api/apps/restful_apis/task_api.py" in dockerignore
+
+
+def test_graphrag_adaptive_execution_contract() -> None:
+    patch = read_text(ROOT / "patches" / "ragflow" / "0056-localmathrag-adaptive-graphrag-execution.patch")
+    adaptive = read_ragflow_source_or_patch("rag/graphrag/adaptive.py", patch)
+    index = read_ragflow_source_or_patch("rag/graphrag/general/index.py", patch)
+    extractor = read_ragflow_source_or_patch("rag/graphrag/general/extractor.py", patch)
+    light_extractor = read_ragflow_source_or_patch("rag/graphrag/light/graph_extractor.py", patch)
+    task_executor = read_ragflow_source_or_patch("rag/svr/task_executor.py", patch)
+    compose = read_text(ROOT / "docker" / "docker-compose.localmathrag.yml")
+    dev_up = read_text(ROOT / "scripts" / "dev-up.ps1")
+    resource_plan = read_text(ROOT / "scripts" / "localmathrag-resource-plan.ps1")
+    dockerfile = read_text(ROOT / "docker" / "Dockerfile.ragflow-local")
+    dockerignore = read_text(ROOT / ".dockerignore")
+
+    assert "resolve_execution_plan" in adaptive
+    assert "math.ceil(chat_slots / chunk_slots)" in adaptive
+    assert "AdaptiveActivityWatchdog" in adaptive
+    assert "LOCALMATHRAG_MODEL_PARALLEL_SLOTS" in adaptive
+    assert "activity_watchdog_factory" in index
+    assert "load_chunk_checkpoints" in index
+    assert "save_chunk_checkpoint" in index
+    assert "clear_chunk_checkpoints" in index
+    assert '"subgraph_checkpoint"' in index
+    assert "DEFAULT_GRAPHRAG_MERGE_TIMEOUT_SECONDS = 0" in index
+    assert "activity_watchdog_setter=set_active_merge_watchdog" in index
+    assert "@timeout(60 * 3)\nasync def merge_subgraph" not in index
+    assert "DEFAULT_GRAPHRAG_RESOLUTION_TIMEOUT_SECONDS = 0" in index
+    assert "DEFAULT_GRAPHRAG_COMMUNITY_TIMEOUT_SECONDS = 0" in index
+    assert "activity_watchdog_setter=set_active_resolution_watchdog" in index
+    assert "activity_watchdog_setter=set_active_community_watchdog" in index
+    assert "@timeout(60 * 30, 1)" not in index
+    assert "len(chunks) * build_subgraph_timeout_per_chunk_seconds" not in index
+    assert "checkpoint_results" in extractor
+    assert "missing_indices" in extractor
+    assert "glean_count = 0" in light_extractor
+    assert "Knowledge Graph partially completed" in task_executor
+    assert '"chunk_checkpoint": True' in task_executor
+    assert compose.count("LOCALMATHRAG_GRAPHRAG_MAX_PARALLEL_DOCS: ${LOCALMATHRAG_GRAPHRAG_MAX_PARALLEL_DOCS:-auto}") == 2
+    assert compose.count("LOCALMATHRAG_GRAPHRAG_CHUNK_CHECKPOINT: ${LOCALMATHRAG_GRAPHRAG_CHUNK_CHECKPOINT:-true}") == 2
+    assert "Resolve-LlamaParallelSlots" in resource_plan
+    assert "Resolve-GraphRagAdaptivePlan" in resource_plan
+    assert "model-context-capacity" in dev_up
+    assert "no-local-model-safe-default" in dev_up
+    assert "Adaptive GraphRAG plan" in dev_up
+    assert "COPY third_party/ragflow/rag/graphrag/adaptive.py" in dockerfile
+    assert "!third_party/ragflow/rag/graphrag/adaptive.py" in dockerignore
+
+
+def test_raptor_resumable_execution_contract() -> None:
+    patch = read_text(ROOT / "patches" / "ragflow" / "0061-localmathrag-resumable-raptor.patch")
+    raptor = read_ragflow_source_or_patch("rag/raptor.py", patch)
+    service = read_ragflow_source_or_patch(
+        "rag/svr/task_executor_refactor/raptor_service.py", patch
+    )
+    handler = read_ragflow_source_or_patch(
+        "rag/svr/task_executor_refactor/task_handler.py", patch
+    )
+    chunk_service = read_ragflow_source_or_patch(
+        "rag/svr/task_executor_refactor/chunk_service.py", patch
+    )
+    task_executor = read_ragflow_source_or_patch("rag/svr/task_executor.py", patch)
+    generate = read_ragflow_source_or_patch(
+        "web/src/pages/dataset/dataset/generate-button/generate.tsx", patch
+    )
+    hook = read_ragflow_source_or_patch(
+        "web/src/pages/dataset/dataset/generate-button/hook.ts", patch
+    )
+    dockerfile = read_text(ROOT / "docker" / "Dockerfile.ragflow-local")
+    dockerignore = read_text(ROOT / ".dockerignore")
+
+    assert "if n_clusters >= len(reduced_embeddings):" in raptor
+    assert "RAPTOR forced a reducing layer" in raptor
+    assert "AdaptiveActivityWatchdog" in raptor
+    assert "LOCALMATHRAG_RAPTOR_MIN_INACTIVITY_SECONDS" in raptor
+    assert "LOCALMATHRAG_RAPTOR_MAX_INACTIVITY_SECONDS" in raptor
+    assert "@timeout(60 * 20)" not in raptor
+    assert "@timeout(3600)" not in service
+    assert "checkpoint_cb" in service
+    assert "checkpoint persisted" in service
+    assert "report_progress=False" in handler
+    assert 'task_type not in {"graphrag", "raptor", "mindmap"}' in handler
+    assert "task_type not in AUXILIARY_INDEX_TASK_TYPES" in task_executor
+    assert "wipe: false" in hook
+    assert "knowledgeDetails.completed" in generate
+    assert "status === generateStatus.completed" in generate
+    assert "report_progress: bool = True" in chunk_service
+    assert "COPY third_party/ragflow/rag/raptor.py" in dockerfile
+    assert "COPY third_party/ragflow/rag/svr/task_executor_refactor/raptor_service.py" in dockerfile
+    assert "COPY third_party/ragflow/rag/svr/task_executor_refactor/chunk_service.py" in dockerfile
+    assert "!third_party/ragflow/rag/raptor.py" in dockerignore
+    assert "!third_party/ragflow/rag/svr/task_executor_refactor/raptor_service.py" in dockerignore
+    assert "!third_party/ragflow/rag/svr/task_executor_refactor/chunk_service.py" in dockerignore
+
+
+def test_ragflow_math_ocr_recommended_install_ui_contract() -> None:
+    patch = read_text(ROOT / "patches" / "ragflow" / "0024-localmathrag-math-ocr-recommended-install-ui.patch")
+    dropdown_patch = read_text(ROOT / "patches" / "ragflow" / "0032-localmathrag-math-ocr-dropdown-ui.patch")
+    auto_register_patch = read_text(
+        ROOT / "patches" / "ragflow" / "0035-localmathrag-math-ocr-auto-register.patch"
+    )
+    un_add_model = read_ragflow_source_or_patch(
+        "web/src/pages/user-setting/setting-model/components/un-add-model.tsx",
+        dropdown_patch + "\n" + auto_register_patch,
+    )
+    model_settings = read_ragflow_source_or_patch(
+        "web/src/pages/user-setting/setting-model/index.tsx", auto_register_patch
+    )
+
+    assert "math_ocr: 'Math OCR'" in patch
+    assert "| 'math_ocr'" in patch
+    assert "'math_ocr'," in patch
+    assert "Formula OCR" in patch
+    assert "公式 OCR" in patch
+    assert "mathOcrComplete" in patch
+    assert "h-8 shrink-0" in patch
+    assert "math_ocr: 'Math OCR'" in un_add_model
+    assert "Formula OCR" in un_add_model
+    assert "mathOcrComplete" in un_add_model
+    assert "handleAddModel(LLMFactory.OpenAiAPICompatible, makeDefaults(model));" in un_add_model
+    assert "math-ocr-config-card" not in un_add_model
+    assert "/v1/math-ocr/config" not in un_add_model
+    assert "MathOcrStatus" not in un_add_model
+    assert "ensureMathOcrAvailable" in auto_register_patch
+    assert "math-ocr-auto-registered" in auto_register_patch
+    assert "ensureLocalModel(makeDefaults(mathOcrModel))" in auto_register_patch
+    assert "ensureLocalModel" in un_add_model
+    assert "ensureLocalModel" in model_settings
+
+
+def test_ragflow_math_ocr_default_setting_ui_contract() -> None:
+    patch = read_text(ROOT / "patches" / "ragflow" / "0032-localmathrag-math-ocr-dropdown-ui.patch")
+    system_setting = read_ragflow_source_or_patch(
+        "web/src/pages/user-setting/setting-model/components/system-setting.tsx", patch
+    )
+    model_tree_select = read_ragflow_source_or_patch(
+        "web/src/components/model-tree-select.tsx", patch
+    )
+    llm_constants = read_ragflow_source_or_patch("web/src/constants/llm.ts", patch)
+
+    assert "Formula OCR" in patch
+    assert "ocr_id" in patch
+    assert "ocr_id" in system_setting
+    assert "ModelTreeSelect" in system_setting
+    assert "math-ocr-default-setting" not in system_setting
+    assert "/v1/math-ocr/config" not in system_setting
+    assert "ocr_id: ['ocr']" in model_tree_select
+    assert "ocr: 'ocr_id'" in llm_constants
+    assert "ocr_id: 'ocr'" in llm_constants
 
 
 def test_object_service_imports() -> None:
     service = ROOT / "services" / "object_service" / "main.py"
     text = read_text(service)
+    compose = read_text(ROOT / "docker" / "docker-compose.localmathrag.yml")
+    dockerfile = read_text(ROOT / "services" / "object_service" / "Dockerfile")
+    runner = read_text(ROOT / "services" / "object_service" / "localmathrag_math_ocr.py")
     assert "FastAPI" in text
     assert "/v1/objects/normalize" in text
     assert "/v1/models/local" in text
     assert "/v1/models/recommended" in text
     assert "/v1/models/download" in text
+    assert "local-formula-ocr-adapter" in text
+    assert "RapidLaTeX OCR (ONNX CPU)" in text
+    assert "math_ocr_config" in text
+    assert "_install_math_ocr_config" in text
+    assert "MathOcrConfigRequest" in text
+    assert "_persist_manual_math_ocr_config" in text
+    assert "/v1/math-ocr/config" in text
+    assert "math_ocr_command_template" in text
     assert "/v1/models/status" in text
     assert "/v1/dataset/status" in text
     assert "/v1/dataset/files" in text
@@ -372,12 +1291,40 @@ def test_object_service_imports() -> None:
     assert "/v1/runtime/switch-model" in text
     assert "/v1/embeddings" in text
     assert "/v1/rerank" in text
+    assert "/v1/math-ocr" in text
+    assert "/v1/math-ocr/status" in text
     assert "EmbeddingRequest" in text
     assert "RerankRequest" in text
+    assert "MathOcrRequest" in text
     assert "RuntimeEnsureRequest" in text
     assert "RuntimeSwitchModelRequest" in text
+    assert "LOCALMATHRAG_MATH_OCR_COMMAND" in text
+    assert "_decode_math_ocr_image" in text
+    assert "_math_ocr_command_parts" in text
+    assert "_persist_math_ocr_runtime_config" in text
+    assert "_math_ocr_runtime_config" in text
+    assert "_math_ocr_status_payload" in text
+    assert "_is_math_ocr_model" in text
+    assert "runtime_config=runtime_config" in text
+    assert "subprocess.run(" in text
+    assert "NamedTemporaryFile" in text
     assert "_switch_runtime_model" in text
+    assert "LOCALMATHRAG_MATH_OCR_COMMAND: ${LOCALMATHRAG_MATH_OCR_COMMAND:-}" in compose
+    assert "LOCALMATHRAG_MATH_OCR_TIMEOUT_SECONDS: ${LOCALMATHRAG_MATH_OCR_TIMEOUT_SECONDS:-10}" in compose
+    assert "COPY services/object_service/localmathrag_math_ocr.py" in dockerfile
+    assert "rapid_latex_ocr" in runner
+    assert "MODEL_FILES" in runner
+    assert "model_files_status" in runner
+    assert "backend_status" in runner
+    assert "from rapid_latex_ocr import LaTeXOCR" in runner
+    assert "rapid_latex_ocr==0.0.9" in dockerfile
+    assert "opencv-python-headless" in dockerfile
+    assert '"math_ocr_files"' in text
+    assert "_download_url_to_file(str(url), target, job_id)" in text
+    assert 'cache_key = hashlib.sha256(b"rapid_latex_ocr:0.0.9\\0" + image_bytes).hexdigest()' in text
+    assert 'cached["runtime"]["cache_hit"] = True' in text
     assert "_find_local_model_for_runtime" in text
+    assert "requested_keys & _model_switch_keys(payload)" in text
     assert "_runtime_command_for_model" in text
     assert "_runtime_env_for_model" in text
     assert "LOCALMATHRAG_GGUF_MODEL" in text
@@ -399,6 +1346,10 @@ def test_object_service_imports() -> None:
     assert "_balance_optional_runtimes" in text
     assert "_stop_optional_runtime_for_degrade" in text
     assert "_runtime_resource_status" in text
+    assert "_runtime_model_min_memory_gb" in text
+    assert '"min_available_memory_gb": 5.0' not in text
+    assert '"min_available_memory_gb": 10.0' not in text
+    assert '"model_min_available_memory_gb": None' in text
     assert "LOCALMATHRAG_RUNTIME_MIN_AVAILABLE_MEMORY_GB" in text
     assert "RUNTIME_CONFIG_FILE" in text
     assert "LOCALMATHRAG_RUNTIME_CONFIG_FILE" in text
@@ -417,8 +1368,10 @@ def test_object_service_imports() -> None:
     assert "CHAT_REQUEST_TIMEOUT_SECONDS" in text
     assert "_proxy_openai_generation" in text
     assert "_runtime_chat_model_name" in text
+    assert "_runtime_embedding_model_name" in text
     assert "_generation_body_for_chat_runtime" in text
     assert 'normalized["model"] = _runtime_chat_model_name()' in text
+    assert 'payload["model"] = _runtime_embedding_model_name()' in text
     assert "CHAT_CONTEXT_SIZE" in text
     assert "CHAT_CONTEXT_CLAMP_ENABLED" in text
     assert "_fit_generation_payload_to_chat_context" in text
@@ -503,9 +1456,22 @@ def test_object_service_imports() -> None:
     assert "no_cold_start_in_request" in text
     assert "recent_task_counts" in text
     assert "active_requests" in text
+    assert "active_quality_requests" in text
+    assert "RUNTIME_ACTIVE_QUALITY_REQUESTS" in text
+    assert '_active_quality_runtime_request_count("embedding") > 0' in text
+    assert 'candidate["kind"] == "embedding"' in text
+    assert '"action": "quality_embedding_direct_load"' in text
+    assert '"action": "quality_embedding_direct_load_failed"' in text
+    assert '"action": "quality_embedding_exclusive_retry"' in text
+    assert '"required document embedding reclaimed chat resources after direct load failed"' in text
+    assert "enforce_stall_timeout: bool = True" in text
+    assert "enforce_stall_timeout=False" in text
+    assert '"fallback": False' in text
     assert "EMBEDDING_DOCUMENT_REQUEST_MIN_INPUTS" in text
     assert "EMBEDDING_DOCUMENT_REQUEST_MIN_TOKENS" in text
     assert "EMBEDDING_DOCUMENT_READY_TIMEOUT_SECONDS" in text
+    assert "EMBEDDING_DOCUMENT_REQUEST_TIMEOUT_SECONDS" in text
+    assert "EMBEDDING_DOCUMENT_DIRECT_LOAD_TIMEOUT_SECONDS" in text
     assert "EMBEDDING_CITATION_READY_TIMEOUT_SECONDS" in text
     assert "EMBEDDING_DOCUMENT_PREEMPT_CHAT" in text
     assert "localmathrag_embedding_purpose" in text
@@ -523,7 +1489,7 @@ def test_object_service_imports() -> None:
     assert "quality_embedding_priority_reset" in text
     assert "quality_embedding_resource_override" in text
     assert "quality_override_reason" in text
-    assert "high priority embedding request reserved resources" in text
+    assert "high priority embedding request reserved resources" not in text
     assert "bypass_cached_failure=quality_request" in text
     assert "bypass_runtime_disabled=quality_request" in text
     assert "prefer_quality=quality_request" in text
@@ -540,7 +1506,8 @@ def test_object_service_imports() -> None:
     assert "_runtime_startup_scheduler" in text
     assert "_prewarm_runtime" in text
     assert "_runtime_preemption_order" in text
-    assert 'return ["rerank", "chat", "vision", "asr", "tts"]' in text
+    assert "RUNTIME_ROLE_PRIORITY" in text
+    assert "roles & replacing_roles" in text
     assert "_prepare_runtime_start" in text
     assert "balance_actions = _balance_optional_runtimes(target)" in text
     assert "runtime_degradation" in text
@@ -617,6 +1584,7 @@ def test_windows_launcher_exists() -> None:
     assert "ApplicationIcon" in project_text
     assert "CopyToPublishDirectory" in project_text
     assert "ExcludeFromSingleFile" in project_text
+    assert 'PackageReference Include="Microsoft.Web.WebView2"' in project_text
     program_text = read_text(program)
     dev_up_text = read_text(ROOT / "scripts" / "dev-up.ps1")
     dev_down_text = read_text(ROOT / "scripts" / "dev-down.ps1")
@@ -682,10 +1650,21 @@ def test_windows_launcher_exists() -> None:
     assert "exitAfterStop: true" in program_text
     assert "forceStatusPage: true" in program_text
     assert "OpenWeb(bool forceStatusPage = false)" in program_text
+    assert "LocalMathWebForm" in program_text
+    assert "WebView2" in program_text
+    assert "CoreWebView2Environment.CreateAsync" in program_text
+    assert 'Path.Combine(FindRoot(), "data", "launcher", "webview2-profile")' in program_text
+    assert "webViewFallbackActive" in program_text
+    assert "OpenBrowserFallback" in program_text
     assert "CloseBrowserProcess()" in program_text
     assert 'Path.Combine(launcherDataDir, "browser-profile")' in program_text
     assert "TryFocusExistingBrowserWindow(state)" in program_text
     assert "TryFindBrowserAppWindow" in program_text
+    assert "TryApplyBrowserWindowIcon(browserProcess" in program_text
+    assert "ApplyBrowserWindowIcon(handle)" in program_text
+    assert "WmSetIcon" in program_text
+    assert "IconSmall" in program_text
+    assert "IconBig" in program_text
     assert "EnumWindows" in program_text
     assert "focused existing browser app window" in program_text
     assert "browser-profile-run-" in program_text
@@ -757,6 +1736,7 @@ def test_windows_launcher_exists() -> None:
     assert "LOCALMATHRAG_EMBEDDING_MODEL" in dev_up_text
     assert "LOCALMATHRAG_RERANK_MODEL" in dev_up_text
     assert "LOCALMATHRAG_VLM_MODEL" in dev_up_text
+    assert '$VlmCandidates = @("Qwen3-VL-4B-Instruct", "Qwen3-VL-8B-Instruct")' in dev_up_text
     assert "LOCALMATHRAG_ASR_MODEL" in dev_up_text
     assert "LOCALMATHRAG_TTS_MODEL" in dev_up_text
     assert '"eager"' in dev_up_text
@@ -858,6 +1838,10 @@ def test_windows_launcher_exists() -> None:
     build_launcher_text = read_text(build_script)
     assert '"data\\dataset"' in build_launcher_text
     assert '"data\\cache"' in build_launcher_text
+    assert 'throw "Launcher publish failed with exit code $LASTEXITCODE."' in build_launcher_text
+    assert 'Test-Path -LiteralPath $LauncherExe' in build_launcher_text
+    assert 'Directory -Filter "__pycache__"' in build_launcher_text
+    assert '-Include "*.pyc", "*.pyo"' in build_launcher_text
     assert "Test-LazyRuntime" in dev_up_text
     assert 'Reset-LazyRuntimeContainer "localmathrag-embedding"' in dev_up_text
     assert "Reset-RerankLazyRuntimeContainer" in dev_up_text
@@ -920,6 +1904,7 @@ def test_ragflow_patch_workflow_exists() -> None:
     assert "!third_party/ragflow/rag/llm/embedding_model.py" in dockerignore
     assert "!third_party/ragflow/rag/llm/rerank_model.py" in dockerignore
     assert "!third_party/ragflow/rag/nlp/" in dockerignore
+    assert "!third_party/ragflow/rag/nlp/__init__.py" in dockerignore
     assert "!third_party/ragflow/rag/nlp/search.py" in dockerignore
     assert "client.models.list()" in patch_text
     assert "_defer_local_non_chat_check" in patch_text
@@ -963,6 +1948,7 @@ def test_docker_compose_mounts_ragflow_backend_overrides() -> None:
     assert "COPY third_party/ragflow/rag/llm/chat_model.py" in dockerfile_text
     assert "COPY third_party/ragflow/rag/llm/embedding_model.py" in dockerfile_text
     assert "COPY third_party/ragflow/rag/llm/rerank_model.py" in dockerfile_text
+    assert "COPY third_party/ragflow/rag/nlp/__init__.py" in dockerfile_text
     assert "COPY third_party/ragflow/rag/nlp/search.py" in dockerfile_text
     assert "COPY third_party/ragflow/rag/svr/task_executor.py" in dockerfile_text
     assert "COPY third_party/ragflow/web/dist" in dockerfile_text
@@ -1010,6 +1996,8 @@ def test_docker_compose_mounts_ragflow_backend_overrides() -> None:
     assert "LOCALMATHRAG_EMBEDDING_DOCUMENT_REQUEST_MIN_INPUTS: ${LOCALMATHRAG_EMBEDDING_DOCUMENT_REQUEST_MIN_INPUTS:-8}" in compose
     assert "LOCALMATHRAG_EMBEDDING_DOCUMENT_REQUEST_MIN_TOKENS: ${LOCALMATHRAG_EMBEDDING_DOCUMENT_REQUEST_MIN_TOKENS:-2048}" in compose
     assert "LOCALMATHRAG_EMBEDDING_DOCUMENT_READY_TIMEOUT_SECONDS: ${LOCALMATHRAG_EMBEDDING_DOCUMENT_READY_TIMEOUT_SECONDS:-480}" in compose
+    assert "LOCALMATHRAG_EMBEDDING_DOCUMENT_REQUEST_TIMEOUT_SECONDS: ${LOCALMATHRAG_EMBEDDING_DOCUMENT_REQUEST_TIMEOUT_SECONDS:-300}" in compose
+    assert "LOCALMATHRAG_EMBEDDING_DOCUMENT_DIRECT_LOAD_TIMEOUT_SECONDS: ${LOCALMATHRAG_EMBEDDING_DOCUMENT_DIRECT_LOAD_TIMEOUT_SECONDS:-120}" in compose
     assert "LOCALMATHRAG_EMBEDDING_DOCUMENT_PREEMPT_CHAT: ${LOCALMATHRAG_EMBEDDING_DOCUMENT_PREEMPT_CHAT:-1}" in compose
     assert "LOCALMATHRAG_RERANK_BACKGROUND_PREWARM: ${LOCALMATHRAG_RERANK_BACKGROUND_PREWARM:-1}" in compose
     assert "LOCALMATHRAG_RUNTIME_NO_COLD_START_IN_REQUEST: ${LOCALMATHRAG_RUNTIME_NO_COLD_START_IN_REQUEST:-1}" in compose
@@ -1044,7 +2032,7 @@ def test_docker_compose_mounts_ragflow_backend_overrides() -> None:
     assert "LOCALMATHRAG_OPTIONAL_RUNTIME_START_MAX_FAILURES: ${LOCALMATHRAG_OPTIONAL_RUNTIME_START_MAX_FAILURES:-2}" in compose
     assert "LOCALMATHRAG_OPTIONAL_RUNTIME_DEGRADE_STOP_TIMEOUT_SECONDS: ${LOCALMATHRAG_OPTIONAL_RUNTIME_DEGRADE_STOP_TIMEOUT_SECONDS:-1}" in compose
     assert "LOCALMATHRAG_OPTIONAL_RUNTIME_STOP_ON_READY_TIMEOUT: ${LOCALMATHRAG_OPTIONAL_RUNTIME_STOP_ON_READY_TIMEOUT:-0}" in compose
-    assert "LOCALMATHRAG_VISION_MIN_AVAILABLE_MEMORY_GB: ${LOCALMATHRAG_VISION_MIN_AVAILABLE_MEMORY_GB:-10}" in compose
+    assert "LOCALMATHRAG_VISION_MIN_AVAILABLE_MEMORY_GB: ${LOCALMATHRAG_VISION_MIN_AVAILABLE_MEMORY_GB:-0}" in compose
     assert "LOCALMATHRAG_EMBEDDING_RUNTIME_BASE_URL: http://localmathrag-embedding:8080/v1" in compose
     assert "LOCALMATHRAG_RERANK_RUNTIME_BASE_URL: http://localmathrag-rerank:8080/v1" in compose
     assert "LOCALMATHRAG_LLAMA_CONTAINER" in compose
@@ -1064,7 +2052,8 @@ def test_docker_compose_mounts_ragflow_backend_overrides() -> None:
     assert "/models/${LOCALMATHRAG_RERANK_MODEL:-bge-reranker-v2-m3}" in compose
     assert "${LOCALMATHRAG_TEI_TOKENIZATION_WORKERS:-2}" in compose
     assert "${LOCALMATHRAG_TEI_MAX_CONCURRENT_REQUESTS:-64}" in compose
-    assert "${LOCALMATHRAG_TEI_MAX_CLIENT_BATCH_SIZE:-8}" in compose
+    assert "LOCALMATHRAG_EMBEDDING_MODEL: ${LOCALMATHRAG_EMBEDDING_MODEL:-bge-m3}" in compose
+    assert compose.count("${LOCALMATHRAG_TEI_EMBEDDING_MAX_CLIENT_BATCH_SIZE:-16}") == 2
     assert "${LOCALMATHRAG_RERANK_MAX_CLIENT_BATCH_SIZE:-32}" in compose
     assert compose.count('restart: "no"') >= 6
     assert "embedding-cuda" in compose
@@ -1105,6 +2094,7 @@ def main() -> None:
     test_no_unpruned_bom_scan()
     test_ragflow_embedding_switch_error_explains_rebuild_vectors()
     test_ragflow_default_dataset_manual_refresh_contract()
+    test_ragflow_dataset_upload_ignores_temporary_files_contract()
     test_ragflow_search_summary_has_output_budget()
     test_ragflow_rerank_fallback_contract()
     test_ragflow_sse_requests_abort_on_unmount()
@@ -1113,7 +2103,32 @@ def main() -> None:
     test_ragflow_runtime_warning_surface_contract()
     test_ragflow_search_summary_runtime_retry_contract()
     test_ragflow_runtime_model_switch_contract()
+    test_local_model_configuration_uses_provider_facing_name()
+    test_model_labels_include_provider_without_changing_model_identity()
+    test_model_switch_has_visible_progress_feedback()
+    test_model_switch_runtime_error_is_sanitized()
+    test_model_capabilities_are_selected_then_verified_by_the_system()
     test_ragflow_docx_formula_image_chunks_contract()
+    test_ragflow_vision_enhancement_is_opt_in_for_parsing()
+    test_vlm_model_uses_its_selected_capabilities_without_syncing_defaults()
+    test_vlm_startup_errors_return_before_the_ready_timeout()
+    test_shared_runtime_policy_is_derived_from_model_bindings()
+    test_ragflow_docx_math_ocr_is_optional_for_word_images()
+    test_ragflow_docx_equation_editor_formulas_keep_paragraph_context()
+    test_ragflow_equation_editor_wmf_previews_are_rasterized_locally()
+    test_ragflow_formula_ocr_processes_equations_individually()
+    test_rapid_formula_ocr_does_not_publish_unreliable_equation_editor_latex()
+    test_equation_native_mtef_is_preferred_over_formula_ocr()
+    test_formula_only_word_layout_tables_keep_text_context()
+    test_parallel_document_toc_is_bounded_and_optional()
+    test_expired_executor_pending_tasks_are_requeued()
+    test_toc_runs_in_a_durable_background_queue()
+    test_toc_prefers_local_document_structure_without_llm()
+    test_auxiliary_indexes_are_queued_below_document_parsing_and_release_on_cancel()
+    test_graphrag_adaptive_execution_contract()
+    test_raptor_resumable_execution_contract()
+    test_ragflow_math_ocr_recommended_install_ui_contract()
+    test_ragflow_math_ocr_default_setting_ui_contract()
     test_object_service_imports()
     test_windows_launcher_exists()
     test_ragflow_patch_workflow_exists()

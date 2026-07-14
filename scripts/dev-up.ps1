@@ -1,4 +1,4 @@
-param(
+﻿param(
     [ValidateSet("cpu", "gpu")]
     [string]$Device = "cpu",
 
@@ -14,10 +14,46 @@ $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $RagflowDocker = Join-Path $Root "third_party\ragflow\docker"
 $Override = Join-Path $Root "docker\docker-compose.localmathrag.yml"
 $RuntimeConfigFile = Join-Path $Root "data\cache\runtime-config.json"
+$MathFontDir = Join-Path $Root "data\fonts\math"
+. (Join-Path $PSScriptRoot "localmathrag-resource-plan.ps1")
 
 if (!(Test-Path $RagflowDocker)) {
     throw "RAGFlow source is missing. Run .\scripts\bootstrap-ragflow.ps1 first."
 }
+
+function Sync-MathFormulaFonts {
+    New-Item -ItemType Directory -Force $MathFontDir | Out-Null
+    if ([string]::IsNullOrWhiteSpace($env:WINDIR)) {
+        return
+    }
+
+    $windowsFontDir = Join-Path $env:WINDIR "Fonts"
+    if (!(Test-Path $windowsFontDir)) {
+        return
+    }
+
+    $fontNames = @(
+        "MTEXTRA.TTF",
+        "symbol.ttf",
+        "times.ttf",
+        "timesbd.ttf",
+        "timesbi.ttf",
+        "timesi.ttf",
+        "cambria.ttc",
+        "cambriab.ttf",
+        "cambriai.ttf",
+        "cambriaz.ttf"
+    )
+    foreach ($fontName in $fontNames) {
+        $source = Join-Path $windowsFontDir $fontName
+        $target = Join-Path $MathFontDir $fontName
+        if ((Test-Path $source) -and !(Test-Path $target)) {
+            Copy-Item -LiteralPath $source -Destination $target
+        }
+    }
+}
+
+Sync-MathFormulaFonts
 
 $env:LOCALMATHRAG_ROOT = $Root.Path
 $env:DOC_ENGINE = $DocEngine
@@ -495,9 +531,6 @@ if (-not $env:LOCALMATHRAG_CTX_SIZE) {
     $env:LOCALMATHRAG_CTX_SIZE_SOURCE = "dynamic-llm-priority"
 }
 Set-SearchTokenBudgetsFromContext
-if (-not $env:LOCALMATHRAG_LLAMA_PARALLEL) {
-    $env:LOCALMATHRAG_LLAMA_PARALLEL = "1"
-}
 if (-not $env:LOCALMATHRAG_HOST_FINGERPRINT) {
     $env:LOCALMATHRAG_HOST_FINGERPRINT = Get-HostFingerprint
 }
@@ -539,9 +572,10 @@ if ($env:LOCALMATHRAG_RERANK_MODEL -and -not $env:LOCALMATHRAG_RERANK_MAX_BATCH_
     $env:LOCALMATHRAG_RERANK_MAX_BATCH_TOKENS = [string](Resolve-RerankMaxBatchTokens)
     $env:LOCALMATHRAG_RERANK_MAX_BATCH_TOKENS_SOURCE = "dynamic"
 }
-$VlmPath = Join-Path $ModelDir "Qwen3-VL-4B-Instruct"
-if (Test-Path $VlmPath) {
-    $env:LOCALMATHRAG_VLM_MODEL = "Qwen3-VL-4B-Instruct"
+$VlmCandidates = @("Qwen3-VL-4B-Instruct", "Qwen3-VL-8B-Instruct")
+$VlmModel = $VlmCandidates | Where-Object { Test-Path (Join-Path $ModelDir $_) } | Select-Object -First 1
+if ($VlmModel) {
+    $env:LOCALMATHRAG_VLM_MODEL = $VlmModel
 }
 $AsrPath = Join-Path $ModelDir "whisper-large-v3-turbo"
 if (Test-Path $AsrPath) {
@@ -569,6 +603,49 @@ elseif ($Llama -eq "cuda") {
     $env:LOCALMATHRAG_LLAMA_CONTAINER = "docker-localmathrag-llama-cpp-cuda-1"
     $env:LOCALMATHRAG_LLAMA_COMPOSE_SERVICE = "localmathrag-llama-cpp-cuda"
 }
+
+$modelSizeGb = if ($DefaultModel) { [double]$DefaultModel.Length / 1GB } else { 0.0 }
+$gpuInfoForPlan = Get-GpuMemoryInfo
+$gpuTotalGbForPlan = if ($null -eq $gpuInfoForPlan) { 0.0 } else { [double]$gpuInfoForPlan.TotalGb }
+$availableRamGbForPlan = Get-AvailableMemoryGb
+if ($null -eq $availableRamGbForPlan) {
+    $availableRamGbForPlan = Get-TotalMemoryGb
+}
+if ($null -eq $availableRamGbForPlan) {
+    $availableRamGbForPlan = 0.0
+}
+if (-not $env:LOCALMATHRAG_LLAMA_PARALLEL -and -not $DefaultModel) {
+    $env:LOCALMATHRAG_LLAMA_PARALLEL = "1"
+    $env:LOCALMATHRAG_LLAMA_PARALLEL_SOURCE = "no-local-model-safe-default"
+}
+elseif (-not $env:LOCALMATHRAG_LLAMA_PARALLEL) {
+    $env:LOCALMATHRAG_LLAMA_PARALLEL = [string](Resolve-LlamaParallelSlots `
+        -GpuTotalGb $gpuTotalGbForPlan `
+        -AvailableRamGb ([double]$availableRamGbForPlan) `
+        -ModelSizeGb $modelSizeGb `
+        -ContextSize (Get-EnvInt "LOCALMATHRAG_CTX_SIZE" 8192) `
+        -LogicalProcessors ([Environment]::ProcessorCount) `
+        -UseCuda ($Llama -eq "cuda") `
+        -ModelMemoryOverhead (Get-EnvDouble "LOCALMATHRAG_LLAMA_MODEL_MEMORY_OVERHEAD" 1.08) `
+        -GpuReserveGb (Get-EnvDouble "LOCALMATHRAG_LLAMA_GPU_RESERVE_GB" 0.75) `
+        -RamReserveGb (Get-EnvDouble "LOCALMATHRAG_LLAMA_RAM_RESERVE_GB" 4.0) `
+        -ContextMemoryGbPer1K (Get-EnvDouble "LOCALMATHRAG_CTX_GPU_MEMORY_GB_PER_1K" 0.18) `
+        -CpuThreadsPerSlot (Get-EnvInt "LOCALMATHRAG_LLAMA_CPU_THREADS_PER_SLOT" 4) `
+        -MaximumSlots (Get-EnvInt "LOCALMATHRAG_LLAMA_PARALLEL_MAX" 0))
+    $env:LOCALMATHRAG_LLAMA_PARALLEL_SOURCE = "model-context-capacity"
+}
+$graphRagPlan = Resolve-GraphRagAdaptivePlan `
+    -ParallelSlots (Get-EnvInt "LOCALMATHRAG_LLAMA_PARALLEL" 1) `
+    -MaximumGleanings (Get-EnvInt "LOCALMATHRAG_GRAPHRAG_MAX_GLEANINGS_MAX" 2)
+Set-EnvDefault "LOCALMATHRAG_MODEL_PARALLEL_SLOTS" $graphRagPlan.ChatSlots "llama-capacity"
+Set-EnvDefault "LOCALMATHRAG_MAX_CONCURRENT_CHATS" $graphRagPlan.ChatSlots "llama-capacity"
+Set-EnvDefault "LOCALMATHRAG_MAX_CONCURRENT_PROCESS_AND_EXTRACT_CHUNK" $graphRagPlan.ChunkSlotsPerDocument "llama-capacity"
+Set-EnvDefault "LOCALMATHRAG_GRAPHRAG_MAX_PARALLEL_DOCS" "auto" "chat-chunk-capacity"
+Set-EnvDefault "LOCALMATHRAG_GRAPHRAG_MAX_GLEANINGS" $graphRagPlan.MaxGleanings "llama-capacity"
+Write-Host (
+    "Adaptive GraphRAG plan: llama_parallel={0}, chat_slots={1}, chunk_slots_per_document={2}, document_slots={3}, max_gleanings={4}" -f `
+    $env:LOCALMATHRAG_LLAMA_PARALLEL, $graphRagPlan.ChatSlots, $graphRagPlan.ChunkSlotsPerDocument, $graphRagPlan.DocumentSlots, $graphRagPlan.MaxGleanings
+)
 
 function Test-DisabledProfile {
     param([string]$Value)

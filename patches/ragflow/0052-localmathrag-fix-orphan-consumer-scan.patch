@@ -1,0 +1,20 @@
+diff --git a/rag/svr/task_executor.py b/rag/svr/task_executor.py
+index f5c5d20..c5eca40 100644
+--- a/rag/svr/task_executor.py
++++ b/rag/svr/task_executor.py
+@@ -1930,11 +1930,13 @@ def requeue_orphaned_pending_tasks(active_workers: set[str]) -> int:
+             worker_name = consumer.get("name")
+             if isinstance(worker_name, bytes):
+                 worker_name = worker_name.decode("utf-8", errors="replace")
+-            if not worker_name or worker_name in inspected or worker_name in active_workers:
++            if not worker_name or worker_name in active_workers:
+                 continue
+-            inspected.add(worker_name)
+             if int(consumer.get("pending", 0) or 0) <= 0 or int(consumer.get("idle", 0) or 0) < idle_threshold_ms:
+                 continue
++            if worker_name in inspected:
++                continue
++            inspected.add(worker_name)
+             moved = requeue_expired_worker_tasks(worker_name)
+             requeued += moved
+             if moved:

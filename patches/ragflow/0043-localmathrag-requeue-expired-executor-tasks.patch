@@ -1,0 +1,104 @@
+diff --git a/rag/svr/task_executor.py b/rag/svr/task_executor.py
+--- a/rag/svr/task_executor.py
++++ b/rag/svr/task_executor.py
+@@ -1795,6 +1795,46 @@ async def get_server_ip() -> str:
+         return "Unknown"
+ 
+ 
++def requeue_expired_worker_tasks(worker_name: str) -> int:
++    """Move a dead executor's pending stream messages back to the ready queue."""
++    parts = worker_name.split("_")
++    worker_task_type = parts[2] if len(parts) > 3 and parts[:2] == ["task", "executor"] else TASK_TYPE
++    requeued = 0
++    for queue_name in settings.get_svr_queue_names(worker_task_type):
++        while True:
++            try:
++                pending = REDIS_CONN.REDIS.xpending_range(
++                    queue_name,
++                    SVR_CONSUMER_GROUP_NAME,
++                    "-",
++                    "+",
++                    10000,
++                )
++            except Exception as e:
++                logging.warning("Failed to inspect pending tasks for expired worker %s on %s: %s", worker_name, queue_name, e)
++                break
++            worker_pending = []
++            for item in pending:
++                consumer_name = item.get("consumer")
++                if isinstance(consumer_name, bytes):
++                    consumer_name = consumer_name.decode("utf-8", errors="replace")
++                if consumer_name == worker_name:
++                    worker_pending.append(item)
++            if not worker_pending:
++                break
++            moved = 0
++            for item in worker_pending:
++                message_id = item.get("message_id")
++                try:
++                    entries = REDIS_CONN.REDIS.xrange(queue_name, message_id, message_id)
++                    if entries:
++                        pipeline = REDIS_CONN.REDIS.pipeline(transaction=True)
++                        pipeline.xadd(queue_name, entries[0][1])
++                        pipeline.xack(queue_name, SVR_CONSUMER_GROUP_NAME, message_id)
++                        pipeline.execute()
++                        moved += 1
++                except Exception as e:
++                    logging.warning("Failed to requeue task %s from expired worker %s: %s", message_id, worker_name, e)
++            requeued += moved
++            if moved == 0:
++                break
++    return requeued
++
++
++def requeue_orphaned_pending_tasks(active_workers: set[str]) -> int:
++    """Recover pending messages whose consumer is no longer a registered executor."""
++    requeued = 0
++    idle_threshold_ms = WORKER_HEARTBEAT_TIMEOUT * 1000
++    queue_names = settings.get_svr_queue_names(TASK_TYPE)
++    inspected = set()
++    for queue_name in queue_names:
++        try:
++            consumers = REDIS_CONN.REDIS.xinfo_consumers(queue_name, SVR_CONSUMER_GROUP_NAME)
++        except Exception as e:
++            logging.warning("Failed to inspect stream consumers on %s: %s", queue_name, e)
++            continue
++        for consumer in consumers:
++            worker_name = consumer.get("name")
++            if isinstance(worker_name, bytes):
++                worker_name = worker_name.decode("utf-8", errors="replace")
++            if not worker_name or worker_name in inspected or worker_name in active_workers:
++                continue
++            inspected.add(worker_name)
++            if int(consumer.get("pending", 0) or 0) <= 0 or int(consumer.get("idle", 0) or 0) < idle_threshold_ms:
++                continue
++            moved = requeue_expired_worker_tasks(worker_name)
++            requeued += moved
++            if moved:
++                logging.info("Requeued %d orphaned pending tasks from %s", moved, worker_name)
++            for stream_name in queue_names:
++                try:
++                    REDIS_CONN.REDIS.xgroup_delconsumer(stream_name, SVR_CONSUMER_GROUP_NAME, worker_name)
++                except Exception:
++                    pass
++    return requeued
++
++
+ async def report_status():
+     """
+     Periodically reports the executor's heartbeat
+@@ -1844,6 +1916,7 @@ async def report_status():
++                requeue_orphaned_pending_tasks(set(task_executors))
+                 for worker_name in task_executors:
+                     if worker_name == CONSUMER_NAME:
+                         continue
+@@ -1852,6 +1925,9 @@ async def report_status():
+                         continue
+ 
+                     if not last_heartbeat or now_ts - last_heartbeat[0][1] > WORKER_HEARTBEAT_TIMEOUT:
++                        requeued = requeue_expired_worker_tasks(worker_name)
++                        if requeued:
++                            logging.info("Requeued %d pending tasks from expired worker %s", requeued, worker_name)
+                         logging.info(f"{worker_name} expired, removed")
+                         REDIS_CONN.srem("TASKEXE", worker_name)
+                         REDIS_CONN.delete(worker_name)

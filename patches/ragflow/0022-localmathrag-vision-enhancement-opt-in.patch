@@ -1,0 +1,55 @@
+diff --git a/deepdoc/parser/figure_parser.py b/deepdoc/parser/figure_parser.py
+--- a/deepdoc/parser/figure_parser.py
++++ b/deepdoc/parser/figure_parser.py
+@@ -41,0 +41,5 @@ def _runtime_ensure_url() -> str:
++
++def _vision_enhancement_enabled() -> bool:
++    enabled = os.environ.get("LOCALMATHRAG_ENABLE_VISION_ENHANCEMENT", "")
++    return enabled.strip().lower() in {"1", "true", "yes", "on"}
++
+@@ -71,9 +76,12 @@ def _get_ready_vision_model(kwargs, callback=None):
+-    if not _ensure_vision_runtime(callback):
++    if not _vision_enhancement_enabled():
++        logging.info("Visual model enhancement disabled; preserving image chunks without VLM.")
+         return None
+     try:
+         vision_model_config = get_tenant_default_model_by_type(kwargs["tenant_id"], LLMType.IMAGE2TEXT)
+-        return LLMBundle(kwargs["tenant_id"], vision_model_config)
+     except Exception as e:
+         logging.warning("Visual model enhancement skipped: %s", e)
+         return None
++    if not _ensure_vision_runtime(callback):
++        return None
++    return LLMBundle(kwargs["tenant_id"], vision_model_config)
+@@ -110,6 +118,8 @@ def vision_figure_parser_docx_wrapper(sections, tbls, callback=None,**kwargs):
+     if not sections:
+         return tbls
++    figures_data = vision_figure_parser_figure_data_wrapper(sections)
++    if not figures_data:
++        return tbls
+     vision_model = _get_ready_vision_model(kwargs, callback)
+     if vision_model:
+-        figures_data = vision_figure_parser_figure_data_wrapper(sections)
+         try:
+@@ -150,12 +160,14 @@ def vision_figure_parser_pdf_wrapper(tbls, callback=None, **kwargs):
+     parser_config = kwargs.get("parser_config", {})
+     context_size = max(0, int(parser_config.get("image_context_size", 0) or 0))
+-    vision_model = _get_ready_vision_model(kwargs, callback)
+-    if vision_model:
+ 
+-        def is_figure_item(item):
+-            return is_image_like(item[0][0]) and isinstance(item[0][1], list)
++    def is_figure_item(item):
++        return is_image_like(item[0][0]) and isinstance(item[0][1], list)
+ 
+-        figures_data = [item for item in tbls if is_figure_item(item)]
++    figures_data = [item for item in tbls if is_figure_item(item)]
++    if not figures_data:
++        return tbls
++    vision_model = _get_ready_vision_model(kwargs, callback)
++    if vision_model:
+         figure_contexts = []
+@@ -183,2 +195,2 @@ def vision_figure_parser_docx_wrapper_naive(chunks, idx_lst, callback=None, **kwargs):
+-    if not chunks:
++    if not chunks or not idx_lst:
+         return []

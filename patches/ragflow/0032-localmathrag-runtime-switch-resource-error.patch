@@ -1,0 +1,41 @@
+diff --git a/api/apps/services/models_api_service.py b/api/apps/services/models_api_service.py
+--- a/api/apps/services/models_api_service.py
++++ b/api/apps/services/models_api_service.py
+@@ -171,6 +171,19 @@ def _switch_local_runtime_model_if_needed(
+         logging.warning("LocalMathRAG runtime switch failed for %s/%s: %s", kind, model_name, exc)
+         return {"ok": False, "kind": kind, "model": model_name, "reason": str(exc)}
+ 
++
++def _runtime_switch_failure_message(result: dict) -> str:
++    kind = str(result.get("kind") or "model runtime")
++    resource = result.get("resource_status") if isinstance(result.get("resource_status"), dict) else {}
++    available = resource.get("available_memory_gb")
++    required = resource.get("min_available_memory_gb")
++    if isinstance(available, (int, float)) and isinstance(required, (int, float)):
++        return (
++            f"Local runtime model switch failed: {kind} requires at least {required:.1f}GB available memory, "
++            f"but only {available:.1f}GB is available. Close memory-heavy applications or choose a smaller model."
++        )
++    return f"Local runtime model switch failed: {result.get('reason') or result.get('detail') or result}"
++
+ 
+ def _to_int(v, default=500):
+@@ -459,7 +472,7 @@ def set_tenant_default_models(tenant_id: str, model_provider: str, model_instan
+             model_type,
+         )
+         if isinstance(switch_result, dict) and not switch_result.get("ok", True):
+-            return False, f"Local runtime model switch failed: {switch_result.get('reason') or switch_result.get('detail') or switch_result}"
++            return False, _runtime_switch_failure_message(switch_result)
+     TenantService.update_by_id(tenant_id, {field_name: default_model})
+     return True, "success"
+diff --git a/web/src/hooks/use-llm-request.tsx b/web/src/hooks/use-llm-request.tsx
+--- a/web/src/hooks/use-llm-request.tsx
++++ b/web/src/hooks/use-llm-request.tsx
+@@ -500,6 +500,8 @@ export const useSetDefaultModel = () => {
+         queryClient.invalidateQueries({
+           queryKey: LlmKeys.defaultModels(),
+         });
++      } else {
++        message.error(data.message || t('message.modified'));
+       }
+       return data;

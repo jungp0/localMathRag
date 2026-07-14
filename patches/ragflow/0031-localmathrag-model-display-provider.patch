@@ -1,0 +1,51 @@
+diff --git a/web/src/components/llm-select/llm-label.tsx b/web/src/components/llm-select/llm-label.tsx
+--- a/web/src/components/llm-select/llm-label.tsx
++++ b/web/src/components/llm-select/llm-label.tsx
+@@ -10,7 +10,8 @@ export const LLMLabel = ({ value }: IProps) => {
+   const parsed = value ? parseModelValue(value) : null;
+   const modelName = parsed?.model_name;
+   const instanceName = parsed?.model_instance;
+-  const iconName = parsed ? parsed.model_provider : '';
++  const providerName = parsed?.model_provider;
++  const iconName = providerName ?? '';
++  const displayName =
++    providerName && providerName !== 'OpenAI-API-Compatible'
++      ? `${providerName}/${modelName}`
++      : modelName;
+ 
+   if (!modelName) return null;
+@@ -23,7 +24,9 @@ export const LLMLabel = ({ value }: IProps) => {
+         height={22}
+         imgClass="size-[22px] flex-shrink-0"
+       />
+-      <span className="font-medium truncate">{modelName}</span>
++      <span className="font-medium truncate">
++        {displayName}
++      </span>
+       {instanceName && (
+diff --git a/web/src/components/model-tree-select.tsx b/web/src/components/model-tree-select.tsx
+--- a/web/src/components/model-tree-select.tsx
++++ b/web/src/components/model-tree-select.tsx
+@@ -61,6 +61,7 @@ export function buildModelTree(
+       children: models.reduce<TreeSelectNode[]>((acc, m) => {
+         const modelName = getRealModelName(m.name);
++        const displayName =
++          m.provider_name === 'OpenAI-API-Compatible'
++            ? modelName
++            : `${m.provider_name}/${modelName}`;
+         const id = `${modelName}@${m.instance_name}@${m.provider_name}`;
+@@ -69,7 +70,7 @@ export function buildModelTree(
+         if (seenLeafIds.has(id)) return acc;
+         seenLeafIds.add(id);
+         const leafNode: TreeSelectNode = {
+           id,
+-          title: modelName,
++          title: displayName,
+           label: (
+@@ -80,7 +81,7 @@ export function buildModelTree(
+                 height={22}
+                 imgClass="size-[22px] flex-shrink-0"
+               />
+-              <span className="truncate">{modelName}</span>
++              <span className="truncate">{displayName}</span>
+             </span>

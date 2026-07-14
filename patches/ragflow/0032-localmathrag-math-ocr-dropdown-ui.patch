@@ -1,0 +1,63 @@
+diff --git a/web/src/constants/llm.ts b/web/src/constants/llm.ts
+--- a/web/src/constants/llm.ts
++++ b/web/src/constants/llm.ts
+@@ -1 +1 @@
+ export const ModelTypeToField: Record<string, string> = {
+   chat: 'llm_id',
+   embedding: 'embd_id',
+   image2text: 'img2txt_id',
+   speech2text: 'asr_id',
+   rerank: 'rerank_id',
+   tts: 'tts_id',
++  ocr: 'ocr_id',
+ };
+@@ -1 +1 @@
+ export const FieldToModelType: Record<string, string> = {
+   llm_id: 'chat',
+   embd_id: 'embedding',
+   img2txt_id: 'vision',
+   asr_id: 'asr',
+   rerank_id: 'rerank',
+   tts_id: 'tts',
++  ocr_id: 'ocr',
+ };
+diff --git a/web/src/components/model-tree-select.tsx b/web/src/components/model-tree-select.tsx
+--- a/web/src/components/model-tree-select.tsx
++++ b/web/src/components/model-tree-select.tsx
+@@ -1 +1 @@
+ export const ModelTypeMap: Record<string, string[]> = {
+   llm_id: ['chat', 'image2text'],
+   embd_id: ['embedding'],
+   img2txt_id: ['image2text'],
+   asr_id: ['speech2text'],
+   rerank_id: ['rerank'],
+   tts_id: ['tts'],
++  ocr_id: ['ocr'],
+ };
+diff --git a/web/src/pages/user-setting/setting-model/components/un-add-model.tsx b/web/src/pages/user-setting/setting-model/components/un-add-model.tsx
+--- a/web/src/pages/user-setting/setting-model/components/un-add-model.tsx
++++ b/web/src/pages/user-setting/setting-model/components/un-add-model.tsx
+@@ -1 +1 @@
+   const configureModel = (model: LocalModel | RecommendedModel) => {
+-    if (getPrimaryType(model) === 'math_ocr') return;
+     handleAddModel(LLMFactory.OpenAiAPICompatible, makeDefaults(model));
+   };
+diff --git a/web/src/pages/user-setting/setting-model/components/system-setting.tsx b/web/src/pages/user-setting/setting-model/components/system-setting.tsx
+--- a/web/src/pages/user-setting/setting-model/components/system-setting.tsx
++++ b/web/src/pages/user-setting/setting-model/components/system-setting.tsx
+@@ -1 +1 @@
+       {
+         id: 'img2txt_id',
+         label: t('img2txtModel'),
+         value: defaultModelDictionary.img2txt_id,
+         tooltip: t('img2txtModelTip'),
+       },
++      {
++        id: 'ocr_id',
++        label: 'Formula OCR',
++        value: defaultModelDictionary.ocr_id,
++        tooltip: 'Default local formula recognition model for Word equation images.',
++      },
+       {
+         id: 'asr_id',
+         label: t('sequence2txtModel'),

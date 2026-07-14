@@ -105,18 +105,20 @@ diff --git a/api/apps/services/models_api_service.py b/api/apps/services/models_
  
  def _to_int(v, default=500):
      try:
-@@ -294,6 +384,14 @@ def set_tenant_default_models(tenant_id: str, model_provider: str, model_instanc
+@@ -294,6 +384,16 @@ def set_tenant_default_models(tenant_id: str, model_provider: str, model_instanc
          return False, "model_provider, model_instance and model_name must be specified together"
  
-     TenantService.update_by_id(tenant_id, {field_name: default_model})
 +    if default_model:
-+        _switch_local_runtime_model_if_needed(
++        switch_result = _switch_local_runtime_model_if_needed(
 +            tenant_id,
 +            model_provider,
 +            model_instance,
 +            model_name,
 +            model_type,
 +        )
++        if isinstance(switch_result, dict) and not switch_result.get("ok", True):
++            return False, f"Local runtime model switch failed: {switch_result.get('reason') or switch_result.get('detail') or switch_result}"
+     TenantService.update_by_id(tenant_id, {field_name: default_model})
      return True, "success"
  
  

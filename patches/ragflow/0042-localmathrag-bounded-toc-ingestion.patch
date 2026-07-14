@@ -1,0 +1,245 @@
+diff --git a/rag/prompts/generator.py b/rag/prompts/generator.py
+--- a/rag/prompts/generator.py
++++ b/rag/prompts/generator.py
+@@ -17,6 +17,7 @@ import asyncio
+ import datetime
+ import json
+ import logging
++import os
+ import re
+ from copy import deepcopy
+ from typing import Tuple
+@@ -774,6 +775,10 @@ async def assign_toc_levels(toc_secs, chat_mdl, gen_conf={"temperature": 0.2}):
+ 
+ TOC_FROM_TEXT_SYSTEM = load_prompt("toc_from_text_system")
+ TOC_FROM_TEXT_USER = load_prompt("toc_from_text_user")
++TOC_INPUT_BUDGET = max(512, int(os.environ.get("LOCALMATHRAG_TOC_INPUT_BUDGET", "4096")))
++TOC_MAX_OUTPUT_TOKENS = max(64, int(os.environ.get("LOCALMATHRAG_TOC_MAX_OUTPUT_TOKENS", "512")))
++TOC_MAX_CONCURRENT_REQUESTS = max(1, int(os.environ.get("LOCALMATHRAG_TOC_MAX_CONCURRENT_REQUESTS", "1")))
++TOC_REQUEST_TIMEOUT_SECONDS = max(5.0, float(os.environ.get("LOCALMATHRAG_TOC_REQUEST_TIMEOUT_SECONDS", "45")))
+ 
+ 
+ # Generate TOC from text chunks with text llms
+@@ -785,7 +790,8 @@ async def gen_toc_from_text(txt_info: dict, chat_mdl, callback=None):
+             PROMPT_JINJA_ENV.from_string(TOC_FROM_TEXT_SYSTEM).render(),
+             PROMPT_JINJA_ENV.from_string(TOC_FROM_TEXT_USER).render(text="\n".join([json.dumps(d, ensure_ascii=False) for d in txt_info["chunks"]])),
+             chat_mdl,
+-            gen_conf={"temperature": 0.0, "top_p": 0.9},
++            gen_conf={"temperature": 0.0, "top_p": 0.9, "max_tokens": TOC_MAX_OUTPUT_TOKENS},
++            max_retry=1,
+         )
+         txt_info["toc"] = ans if ans and not isinstance(ans, str) else []
+     except Exception as e:
+@@ -816,17 +822,26 @@ def split_chunks(chunks, max_length: int):
+ async def run_toc_from_text(chunks, chat_mdl, callback=None):
+     input_budget = int(chat_mdl.max_length * INPUT_UTILIZATION) - num_tokens_from_string(TOC_FROM_TEXT_USER + TOC_FROM_TEXT_SYSTEM)
+ 
+-    input_budget = 1024 if input_budget > 1024 else input_budget
++    input_budget = min(TOC_INPUT_BUDGET, input_budget)
+     chunk_sections = split_chunks(chunks, input_budget)
+     titles = []
+ 
+     chunks_res = []
+     tasks = []
++    request_limiter = asyncio.Semaphore(TOC_MAX_CONCURRENT_REQUESTS)
++
++    async def generate_section(txt_info):
++        async with request_limiter:
++            await asyncio.wait_for(
++                gen_toc_from_text(txt_info, chat_mdl, callback),
++                timeout=TOC_REQUEST_TIMEOUT_SECONDS,
++            )
++
+     for i, chunk in enumerate(chunk_sections):
+         if not chunk:
+             continue
+         chunks_res.append({"chunks": chunk})
+-        tasks.append(asyncio.create_task(gen_toc_from_text(chunks_res[-1], chat_mdl, callback)))
++        tasks.append(asyncio.create_task(generate_section(chunks_res[-1])))
+     try:
+         await asyncio.gather(*tasks, return_exceptions=False)
+     except Exception as e:
+@@ -860,7 +875,14 @@ async def run_toc_from_text(chunks, chat_mdl, callback=None):
+     raw_structure = [x.get("title", "") for x in filtered]
+ 
+     # Assign hierarchy levels using LLM
+-    toc_with_levels = await assign_toc_levels(raw_structure, chat_mdl, {"temperature": 0.0, "top_p": 0.9})
++    toc_with_levels = await asyncio.wait_for(
++        assign_toc_levels(
++            raw_structure,
++            chat_mdl,
++            {"temperature": 0.0, "top_p": 0.9, "max_tokens": TOC_MAX_OUTPUT_TOKENS},
++        ),
++        timeout=TOC_REQUEST_TIMEOUT_SECONDS,
++    )
+     if not toc_with_levels:
+         return []
+ 
+diff --git a/rag/svr/task_executor_limiter.py b/rag/svr/task_executor_limiter.py
+--- a/rag/svr/task_executor_limiter.py
++++ b/rag/svr/task_executor_limiter.py
+@@ -20,9 +20,11 @@ from common.asyncio_utils import LoopLocalSemaphore
+ MAX_CONCURRENT_TASKS = int(os.environ.get("MAX_CONCURRENT_TASKS", "5"))
+ MAX_CONCURRENT_CHUNK_BUILDERS = int(os.environ.get("MAX_CONCURRENT_CHUNK_BUILDERS", "1"))
+ MAX_CONCURRENT_MINIO = int(os.environ.get("MAX_CONCURRENT_MINIO", "10"))
++MAX_CONCURRENT_TOC = int(os.environ.get("LOCALMATHRAG_MAX_CONCURRENT_TOC", "1"))
+ 
+ task_limiter = LoopLocalSemaphore(MAX_CONCURRENT_TASKS)
+ chunk_limiter = LoopLocalSemaphore(MAX_CONCURRENT_CHUNK_BUILDERS)
+ embed_limiter = LoopLocalSemaphore(MAX_CONCURRENT_CHUNK_BUILDERS)
+ minio_limiter = LoopLocalSemaphore(MAX_CONCURRENT_MINIO)
+-kg_limiter = LoopLocalSemaphore(2)
++kg_limiter = LoopLocalSemaphore(2)
++toc_limiter = LoopLocalSemaphore(MAX_CONCURRENT_TOC)
+diff --git a/rag/svr/task_executor_refactor/task_handler.py b/rag/svr/task_executor_refactor/task_handler.py
+--- a/rag/svr/task_executor_refactor/task_handler.py
++++ b/rag/svr/task_executor_refactor/task_handler.py
+@@ -23,6 +23,7 @@ for handling document processing tasks with refactored, testable methods.
+ import asyncio
+ import logging
+ import json
++import os
+ import xxhash
+ 
+ from timeit import default_timer as timer
+@@ -51,6 +52,7 @@ from rag.svr.task_executor_refactor.raptor_service import RaptorService
+ from rag.svr.task_executor_refactor.raptor_utils import delete_raptor_chunks
+ from rag.svr.task_executor_refactor.recording_context import RecordingContext
+ from rag.svr.task_executor_refactor.task_context import TaskContext
++from rag.svr.task_executor_limiter import toc_limiter
+ from rag.graphrag.general.index import run_graphrag_for_kb
+ from api.db.services.file2document_service import File2DocumentService
+ from rag.prompts.generator import run_toc_from_text
+@@ -460,7 +462,7 @@ class TaskHandler:
+         # Build TOC if needed
+         toc_thread = None
+         if ctx.parser_id.lower() == "naive" and ctx.parser_config.get("toc_extraction", False):
+-            toc_thread = asyncio.create_task(asyncio.to_thread(self._build_toc, ctx, chunks, ctx.progress_cb))
++            toc_thread = asyncio.create_task(self._build_toc_guarded(ctx, chunks, ctx.progress_cb))
+ 
+         # Insert chunks
+         chunk_count = len(set([chunk["id"] for chunk in chunks]))
+@@ -520,10 +522,31 @@ class TaskHandler:
+                 return await toc_thread
+             else:
+                 return None
++        except Exception as e:
++            logging.warning("Optional TOC generation failed; document indexing will continue: %s", e)
++            return None
+         finally:
+             if toc_thread is not None and not toc_thread.done():
+                 toc_thread.cancel()
+ 
++    async def _build_toc_guarded(self, ctx: TaskContext, docs: List[Dict], progress_cb: Callable) -> Optional[Dict]:
++        queue_wait = max(0.1, float(os.environ.get("LOCALMATHRAG_TOC_QUEUE_WAIT_SECONDS", "2")))
++        acquired = False
++        try:
++            await asyncio.wait_for(toc_limiter.acquire(), timeout=queue_wait)
++            acquired = True
++            return await asyncio.to_thread(self._build_toc, ctx, docs, progress_cb)
++        except asyncio.TimeoutError:
++            progress_cb(msg="TOC generation skipped because another document is using the local LLM.")
++            return None
++        except Exception as e:
++            logging.warning("Optional TOC generation failed; document indexing will continue: %s", e)
++            progress_cb(msg="TOC generation skipped after an optional post-processing error.")
++            return None
++        finally:
++            if acquired:
++                toc_limiter.release()
++
+     @classmethod
+     async def _get_storage_binary(cls, bucket: str, name: str) -> bytes:
+         from common import settings
+@@ -547,9 +570,20 @@ class TaskHandler:
+             # NOTE: asyncio.run() creates a new event loop in the worker thread
+             # (this method is called via asyncio.to_thread), which is the
+             # intended pattern for bridging sync -> async in a thread context.
+-            toc: list[dict] = asyncio.run(
+-                run_toc_from_text([d["content_with_weight"] for d in docs], chat_mdl, progress_cb)
+-            )
++            timeout_seconds = max(5.0, float(os.environ.get("LOCALMATHRAG_TOC_TIMEOUT_SECONDS", "60")))
++
++            async def run_with_timeout():
++                return await asyncio.wait_for(
++                    run_toc_from_text([d["content_with_weight"] for d in docs], chat_mdl, progress_cb),
++                    timeout=timeout_seconds,
++                )
++
++            try:
++                toc: list[dict] = asyncio.run(run_with_timeout())
++            except asyncio.TimeoutError:
++                logging.warning("TOC generation timed out after %.1fs; keeping the indexed document without TOC.", timeout_seconds)
++                progress_cb(msg=f"TOC generation skipped after {timeout_seconds:.0f}s timeout; document indexing is complete.")
++                return None
+             logging.info("------------ T O C -------------\n" + json.dumps(toc, ensure_ascii=False, indent='  '))
+ 
+             for ii, item in enumerate(toc):
+diff --git a/rag/svr/task_executor.py b/rag/svr/task_executor.py
+--- a/rag/svr/task_executor.py
++++ b/rag/svr/task_executor.py
+@@ -101,6 +101,7 @@ from rag.svr.task_executor_limiter import (
+     minio_limiter,
+     kg_limiter,
++    toc_limiter,
+ )
+ from common import settings
+ from common.constants import PAGERANK_FLD, TAG_FLD, SVR_CONSUMER_GROUP_NAME
+@@ -639,7 +640,20 @@ def build_TOC(task, docs, progress_callback):
+             d.get("top_int", 0)[0] if isinstance(d.get("top_int", 0), list) else d.get("top_int", 0),
+         ),
+     )
+-    toc: list[dict] = asyncio.run(run_toc_from_text([d["content_with_weight"] for d in docs], chat_mdl, progress_callback))
++    timeout_seconds = max(5.0, float(os.environ.get("LOCALMATHRAG_TOC_TIMEOUT_SECONDS", "60")))
++
++    async def run_with_timeout():
++        return await asyncio.wait_for(
++            run_toc_from_text([d["content_with_weight"] for d in docs], chat_mdl, progress_callback),
++            timeout=timeout_seconds,
++        )
++
++    try:
++        toc: list[dict] = asyncio.run(run_with_timeout())
++    except asyncio.TimeoutError:
++        logging.warning("TOC generation timed out after %.1fs; keeping the indexed document without TOC.", timeout_seconds)
++        progress_callback(msg=f"TOC generation skipped after {timeout_seconds:.0f}s timeout; document indexing is complete.")
++        return None
+     logging.info("------------ T O C -------------\n" + json.dumps(toc, ensure_ascii=False, indent="  "))
+     for ii, item in enumerate(toc):
+         try:
+@@ -687,6 +701,25 @@ def build_TOC(task, docs, progress_callback):
+         return d
+     return None
+ 
++
++async def build_TOC_guarded(task, docs, progress_callback):
++    queue_wait = max(0.1, float(os.environ.get("LOCALMATHRAG_TOC_QUEUE_WAIT_SECONDS", "2")))
++    acquired = False
++    try:
++        await asyncio.wait_for(toc_limiter.acquire(), timeout=queue_wait)
++        acquired = True
++        return await asyncio.to_thread(build_TOC, task, docs, progress_callback)
++    except asyncio.TimeoutError:
++        progress_callback(msg="TOC generation skipped because another document is using the local LLM.")
++        return None
++    except Exception as e:
++        logging.warning("Optional TOC generation failed; document indexing will continue: %s", e)
++        progress_callback(msg="TOC generation skipped after an optional post-processing error.")
++        return None
++    finally:
++        if acquired:
++            toc_limiter.release()
++
++
+ def init_kb(row, vector_size: int):
+     idxnm = search.index_name(row["tenant_id"])
+     parser_id = row.get("parser_id", None)
+@@ -1571,7 +1604,7 @@ async def do_handle_task(task: dict):
+         logging.info(progress_message)
+         progress_callback(msg=progress_message)
+         if task["parser_id"].lower() == "naive" and task["parser_config"].get("toc_extraction", False):
+-            toc_thread = asyncio.create_task(asyncio.to_thread(build_TOC, task, chunks, progress_callback))
++            toc_thread = asyncio.create_task(build_TOC_guarded(task, chunks, progress_callback))
+ 
+     chunk_count = len(set([chunk["id"] for chunk in chunks]))
+     start_ts = timer()

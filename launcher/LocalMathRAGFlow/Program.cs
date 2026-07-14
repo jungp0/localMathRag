@@ -11,6 +11,8 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 using System.Windows.Forms;
+using Microsoft.Web.WebView2.Core;
+using Microsoft.Web.WebView2.WinForms;
 
 namespace LocalMathRAGFlow;
 
@@ -109,6 +111,9 @@ internal sealed class TrayContext : ApplicationContext
     private readonly System.Windows.Forms.Timer windowStateTimer;
     private readonly SynchronizationContext uiContext;
     private Process? browserProcess;
+    private Icon? browserWindowIcon;
+    private LocalMathWebForm? webWindow;
+    private bool webViewFallbackActive;
     private DateTimeOffset lastOpenAt = DateTimeOffset.MinValue;
 
     public TrayContext()
@@ -286,6 +291,50 @@ internal sealed class TrayContext : ApplicationContext
         Log("open web requested");
         var url = StartupStatusServer.EntryUrl;
         var state = LoadBrowserWindowState();
+        if (!webViewFallbackActive)
+        {
+            OpenWebViewWindow(url, state);
+            return;
+        }
+
+        OpenBrowserFallback(url, state, forceStatusPage);
+    }
+
+    private void OpenWebViewWindow(string url, BrowserWindowState state)
+    {
+        if (webWindow is { IsDisposed: false })
+        {
+            webWindow.Navigate(url);
+            ApplyWebWindowState(webWindow, state);
+            webWindow.Show();
+            webWindow.Activate();
+            return;
+        }
+
+        var profileDir = Path.Combine(FindRoot(), "data", "launcher", "webview2-profile");
+        webWindow = new LocalMathWebForm(
+            url,
+            LoadTrayIcon(),
+            profileDir,
+            exception =>
+            {
+                Log("webview2 initialization failed: " + exception.Message);
+                webViewFallbackActive = true;
+                OpenWeb(forceStatusPage: true);
+            });
+        webWindow.FormClosed += (_, _) => webWindow = null;
+        ApplyWebWindowState(webWindow, state);
+        webWindow.Show();
+        webWindow.Activate();
+    }
+
+    private static void ApplyWebWindowState(Form window, BrowserWindowState state)
+    {
+        window.WindowState = state.Maximized ? FormWindowState.Maximized : FormWindowState.Normal;
+    }
+
+    private void OpenBrowserFallback(string url, BrowserWindowState state, bool forceStatusPage)
+    {
         var browser = FindChromiumBrowser();
         if (browser is null)
         {
@@ -316,6 +365,7 @@ internal sealed class TrayContext : ApplicationContext
             Arguments = browserArgs,
             UseShellExecute = false
         });
+        TryApplyBrowserWindowIcon(browserProcess, TimeSpan.FromSeconds(5));
     }
 
     private bool TryFocusExistingBrowserWindow(BrowserWindowState state)
@@ -333,6 +383,7 @@ internal sealed class TrayContext : ApplicationContext
 
         if (TryFindBrowserAppWindow(out var handle))
         {
+            ApplyBrowserWindowIcon(handle);
             ApplyBrowserWindowState(handle, state);
             SetForegroundWindow(handle);
             Log("focused existing browser app window");
@@ -367,6 +418,7 @@ internal sealed class TrayContext : ApplicationContext
                 }
                 if (handle != IntPtr.Zero)
                 {
+                    ApplyBrowserWindowIcon(handle);
                     ApplyBrowserWindowState(handle, state);
                     SetForegroundWindow(handle);
                     Log("focused tracked browser app window");
@@ -381,6 +433,55 @@ internal sealed class TrayContext : ApplicationContext
         }
 
         return false;
+    }
+
+    private void TryApplyBrowserWindowIcon(Process? process, TimeSpan timeout)
+    {
+        if (process is null)
+        {
+            return;
+        }
+
+        var start = DateTimeOffset.UtcNow;
+        while (DateTimeOffset.UtcNow - start <= timeout)
+        {
+            try
+            {
+                if (process.HasExited)
+                {
+                    return;
+                }
+
+                process.Refresh();
+                var handle = process.MainWindowHandle;
+                if (handle == IntPtr.Zero)
+                {
+                    handle = FindTopLevelWindowForProcess(process.Id);
+                }
+                if (handle != IntPtr.Zero)
+                {
+                    ApplyBrowserWindowIcon(handle);
+                    return;
+                }
+            }
+            catch
+            {
+                return;
+            }
+            Thread.Sleep(100);
+        }
+    }
+
+    private void ApplyBrowserWindowIcon(IntPtr handle)
+    {
+        if (handle == IntPtr.Zero)
+        {
+            return;
+        }
+
+        browserWindowIcon ??= LoadTrayIcon();
+        SendMessage(handle, WmSetIcon, IconSmall, browserWindowIcon.Handle);
+        SendMessage(handle, WmSetIcon, IconBig, browserWindowIcon.Handle);
     }
 
     private static string BuildBrowserArguments(string url, string profileDir, BrowserWindowState state)
@@ -459,6 +560,12 @@ internal sealed class TrayContext : ApplicationContext
 
     private void SaveCurrentBrowserWindowState()
     {
+        if (webWindow is { IsDisposed: false, Visible: true })
+        {
+            SaveBrowserWindowState(webWindow.WindowState == FormWindowState.Maximized);
+            return;
+        }
+
         if (browserProcess is not { HasExited: false })
         {
             return;
@@ -476,11 +583,16 @@ internal sealed class TrayContext : ApplicationContext
             return;
         }
 
+        SaveBrowserWindowState(placement.ShowCmd == ShowWindowMaximized);
+    }
+
+    private static void SaveBrowserWindowState(bool maximized)
+    {
         var path = BrowserWindowStatePath();
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(path) ?? FindRoot());
-            File.WriteAllText(path, JsonSerializer.Serialize(new BrowserWindowState(placement.ShowCmd == ShowWindowMaximized)), Encoding.UTF8);
+            File.WriteAllText(path, JsonSerializer.Serialize(new BrowserWindowState(maximized)), Encoding.UTF8);
         }
         catch
         {
@@ -587,6 +699,7 @@ internal sealed class TrayContext : ApplicationContext
         Log("menu exit clicked");
         OpenWeb(forceStatusPage: true);
         await BackgroundStartupTask.StopServicesAsync(exitAfterStop: true);
+        CloseWebWindow();
         CloseBrowserProcess();
         tray?.Dispose();
         ExitThread();
@@ -595,9 +708,25 @@ internal sealed class TrayContext : ApplicationContext
     private void ShutdownLauncherOnly()
     {
         Log("shutdown requested by newer launcher");
+        CloseWebWindow();
         CloseBrowserProcess();
         tray?.Dispose();
         ExitThread();
+    }
+
+    private void CloseWebWindow()
+    {
+        try
+        {
+            if (webWindow is { IsDisposed: false })
+            {
+                webWindow.Close();
+            }
+        }
+        catch
+        {
+        }
+        webWindow = null;
     }
 
     private void CloseBrowserProcess()
@@ -721,6 +850,12 @@ internal sealed class TrayContext : ApplicationContext
     [DllImport("user32.dll")]
     private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
 
+    [DllImport("user32.dll")]
+    private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+
+    private const int WmSetIcon = 0x0080;
+    private static readonly IntPtr IconSmall = new(0);
+    private static readonly IntPtr IconBig = new(1);
     private const int ShowWindowRestore = 9;
     private const int ShowWindowMaximized = 3;
     private const int ShowWindowMinimized = 2;
@@ -738,6 +873,83 @@ internal sealed class TrayContext : ApplicationContext
         public Point MinPosition;
         public Point MaxPosition;
         public Rectangle NormalPosition;
+    }
+}
+
+internal sealed class LocalMathWebForm : Form
+{
+    private readonly WebView2 webView;
+    private readonly string profileDir;
+    private readonly Action<Exception> initializationFailed;
+    private string pendingUrl;
+    private bool initialized;
+
+    public LocalMathWebForm(string url, Icon icon, string profileDir, Action<Exception> initializationFailed)
+    {
+        this.profileDir = profileDir;
+        this.initializationFailed = initializationFailed;
+        pendingUrl = url;
+
+        Text = "LocalMathRAGFlow";
+        Icon = icon;
+        StartPosition = FormStartPosition.CenterScreen;
+        Width = 1280;
+        Height = 860;
+
+        webView = new WebView2
+        {
+            Dock = DockStyle.Fill,
+            DefaultBackgroundColor = Color.White
+        };
+        Controls.Add(webView);
+
+        _ = InitializeWebViewAsync();
+    }
+
+    public void Navigate(string url)
+    {
+        pendingUrl = url;
+        if (initialized && webView.CoreWebView2 is not null)
+        {
+            webView.CoreWebView2.Navigate(url);
+        }
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            webView.Dispose();
+            Icon?.Dispose();
+        }
+        base.Dispose(disposing);
+    }
+
+    private async Task InitializeWebViewAsync()
+    {
+        try
+        {
+            Directory.CreateDirectory(profileDir);
+            var environment = await CoreWebView2Environment.CreateAsync(userDataFolder: profileDir);
+            await webView.EnsureCoreWebView2Async(environment);
+            initialized = true;
+            webView.CoreWebView2.Settings.AreDefaultContextMenusEnabled = true;
+            webView.CoreWebView2.Settings.AreDevToolsEnabled = true;
+            webView.CoreWebView2.Navigate(pendingUrl);
+        }
+        catch (Exception exception)
+        {
+            if (IsDisposed)
+            {
+                return;
+            }
+
+            BeginInvoke(() =>
+            {
+                Close();
+                initializationFailed(exception);
+            });
+        }
     }
 }
 

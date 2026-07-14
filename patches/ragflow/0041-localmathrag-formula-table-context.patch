@@ -1,0 +1,43 @@
+diff --git a/rag/app/naive.py b/rag/app/naive.py
+--- a/rag/app/naive.py
++++ b/rag/app/naive.py
+@@ -19,6 +19,6 @@ import os
+ import subprocess
+ from functools import reduce
+-from html import escape
++from html import escape, unescape
+ from io import BytesIO
+ from timeit import default_timer as timer
+ from docx import Document
+@@ -1147,6 +1147,28 @@ def load_from_xml_v2(baseURI, rels_item_xml):
+     return srels
+ 
+ 
++def _coalesce_docx_formula_tables(chunks):
++    """Attach formula-only Word layout tables to their preceding text chunk."""
++    merged = []
++    for chunk in chunks:
++        text = str(chunk.get("text") or "")
++        formula_only_table = chunk.get("ck_type") == "table" and "$$" in text and chunk.get("image") is None
++        if formula_only_table:
++            outside_formula = re.sub(r"\$\$.*?\$\$", "", text, flags=re.DOTALL)
++            outside_formula = unescape(re.sub(r"<[^>]+>", "", outside_formula))
++            formula_only_table = not re.sub(r"[\W_]+", "", outside_formula, flags=re.UNICODE)
++
++        if formula_only_table:
++            anchor = next((item for item in reversed(merged) if item.get("ck_type") == "text"), None)
++            if anchor is not None:
++                anchor["text"] = f"{(anchor.get('text') or '').rstrip()}\n{text.strip()}".strip()
++                anchor["tk_nums"] = num_tokens_from_string(anchor["text"])
++                anchor["_docx_has_formula"] = True
++                continue
++        merged.append(chunk)
++    return merged
++
++
+ def chunk(filename, binary=None, from_page=0, to_page=MAXIMUM_PAGE_NUMBER, lang="Chinese", callback=None, **kwargs):
+     """
+     Supported file formats are docx, pdf, excel, txt.
+@@ -1230,1 +1252,2 @@ def chunk(filename, binary=None, from_page=0, to_page=MAXIMUM_PAGE_NUMBER, lang=
+         vision_figure_parser_docx_wrapper_naive(chunks=chunks, idx_lst=images, callback=callback, **kwargs)
++        chunks = _coalesce_docx_formula_tables(chunks)

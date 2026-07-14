@@ -1,0 +1,16 @@
+diff --git a/web/src/pages/user-setting/setting-model/components/un-add-model.tsx b/web/src/pages/user-setting/setting-model/components/un-add-model.tsx
+--- a/web/src/pages/user-setting/setting-model/components/un-add-model.tsx
++++ b/web/src/pages/user-setting/setting-model/components/un-add-model.tsx
+@@ -166,7 +166,10 @@ const makeDefaults = (
+ ): LocalModelDefaults => {
+   const primaryType = getPrimaryType(model);
+   return {
+     instance_name: instanceNameByType[primaryType],
+-    model_name: model.runtime_model_name || model.name,
++    // Persist the same provider-facing identifier for every model type.
++    // The runtime service resolves this display name to its local file or
++    // repository path when it needs to replace a container model.
++    model_name: model.name,
+     model_type: ragflowTypeByGroup[primaryType],
+     base_url: model.base_url,
+     api_key: 'local',

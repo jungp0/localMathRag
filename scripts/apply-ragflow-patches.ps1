@@ -89,11 +89,15 @@ function Test-PatchContentAlreadyApplied {
     return (($found / $total) -ge 0.55)
 }
 
-$patches = Get-ChildItem $PatchDir -Filter "*.patch" | Sort-Object Name
-foreach ($patch in $patches) {
+$patches = @(Get-ChildItem $PatchDir -Filter "*.patch" | Sort-Object Name)
+$supersededBy = @{
+    "0029-localmathrag-vlm-chat-model-compatibility.patch" = "0034-localmathrag-role-derived-runtime-scheduling.patch"
+}
+for ($patchIndex = 0; $patchIndex -lt $patches.Count; $patchIndex++) {
+    $patch = $patches[$patchIndex]
     Push-Location $RagflowRoot
     try {
-        $baseArgs = @("-c", "safe.directory=$RagflowRoot", "apply", "--unidiff-zero")
+        $baseArgs = @("-c", "safe.directory=$RagflowRoot", "apply", "--unidiff-zero", "--recount")
         $check = Invoke-Git ($baseArgs + @("--check", $patch.FullName))
         if ($check.Code -eq 0) {
             $apply = Invoke-Git ($baseArgs + @($patch.FullName))
@@ -112,6 +116,16 @@ foreach ($patch in $patches) {
 
         if (Test-PatchContentAlreadyApplied -PatchPath $patch.FullName -RepoRoot $RagflowRoot) {
             Write-Host "Already applied $($patch.Name) (content match)"
+            continue
+        }
+
+        # A newer patch may intentionally replace the exact lines added by a
+        # named older patch. Keep that relationship explicit so unrelated
+        # patches can never mask an apply failure.
+        $supersedingName = $supersededBy[$patch.Name]
+        $supersedingPatch = if ($supersedingName) { $patches | Where-Object Name -eq $supersedingName | Select-Object -First 1 } else { $null }
+        if ($supersedingPatch -and (Test-PatchContentAlreadyApplied -PatchPath $supersedingPatch.FullName -RepoRoot $RagflowRoot)) {
+            Write-Host "Superseded $($patch.Name) by already-applied $supersedingName"
             continue
         }
 

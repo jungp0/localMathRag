@@ -1,0 +1,160 @@
+diff --git a/web/src/pages/user-setting/setting-model/index.tsx b/web/src/pages/user-setting/setting-model/index.tsx
+--- a/web/src/pages/user-setting/setting-model/index.tsx
++++ b/web/src/pages/user-setting/setting-model/index.tsx
+@@ -244,6 +244,42 @@ const ModelProviders = () => {
+     [ModalMap],
+   );
+ 
++  const ensureLocalModel = useCallback(
++    async (defaults: LocalModelDefaults) => {
++      const {
++        instance_name: instanceName,
++        model_name: modelName,
++        model_type: modelType,
++        base_url: baseUrl,
++        api_key: apiKey,
++        max_tokens: maxTokens,
++      } = defaults;
++      if (!instanceName || !modelName || !modelType || !baseUrl) {
++        return false;
++      }
++
++      try {
++        const instanceRet = await addProviderInstance({
++          llm_factory: LLMFactory.OpenAiAPICompatible,
++          instance_name: instanceName,
++          api_key: apiKey ?? 'local',
++          base_url: baseUrl,
++          model_info: [],
++        } as IAddProviderInstanceRequestBody);
++        if (instanceRet.code !== 0) return false;
++
++        const modelRet = await addInstanceModel({
++          provider_name: LLMFactory.OpenAiAPICompatible,
++          instance_name: instanceName,
++          model_name: modelName,
++          model_type: modelType,
++          max_tokens: maxTokens ?? 0,
++        });
++        return modelRet.code === 0;
++      } catch {
++        return false;
++      }
++    },
++    [addInstanceModel, addProviderInstance],
++  );
++
+   // Open the ProviderModal in viewMode (read-only) for an existing
+   // instance so the user can edit its model list. The instance's
+   // `api_key`, `baseUrl` and `model_info` are passed as initial values;
+@@ -422,7 +458,10 @@ const ModelProviders = () => {
+         <UsedModel
+           handleAddModel={handleAddModel}
+           onEditInstance={handleEditInstance}
+         />
+       </section>
+       <section className="flex flex-col w-2/5 overflow-auto scrollbar-auto">
+-        <AvailableModels handleAddModel={handleAddModel} />
++        <AvailableModels
++          handleAddModel={handleAddModel}
++          ensureLocalModel={ensureLocalModel}
++        />
+       </section>
+       {/* Unified ProviderModal (replaces 9 independent modals) */}
+       <ProviderModal
+diff --git a/web/src/pages/user-setting/setting-model/components/un-add-model.tsx b/web/src/pages/user-setting/setting-model/components/un-add-model.tsx
+--- a/web/src/pages/user-setting/setting-model/components/un-add-model.tsx
++++ b/web/src/pages/user-setting/setting-model/components/un-add-model.tsx
+@@ -212,8 +212,9 @@ const typeDescription = (type: ModelGroup, isZh: boolean) => {
+ 
+ export const AvailableModels: FC<{
+   handleAddModel: (factory: string, defaults?: LocalModelDefaults) => void;
++  ensureLocalModel: (defaults: LocalModelDefaults) => Promise<boolean>;
+}> = ({ handleAddModel, ensureLocalModel }) => {
+   const { i18n } = useTranslation();
+   const isZh = i18n.language.startsWith('zh');
+   const [localModels, setLocalModels] = useState<LocalModel[]>([]);
+@@ -228,6 +229,7 @@ export const AvailableModels: FC<{
+   const [downloadProgress, setDownloadProgress] = useState(0);
+   const [activeGroup, setActiveGroup] = useState<ModelGroup>('chat');
+   const [error, setError] = useState('');
++  const mathOcrRegistrationRef = useRef<string | null>(null);
+ 
+   const copy = useMemo(
+@@ -260,6 +262,12 @@ export const AvailableModels: FC<{
+       mathOcrComplete: isZh
+         ? '已安装并自动配置。后续 Word 解析会自动尝试公式 OCR。'
+         : 'Installed and configured. Word parsing will try formula OCR automatically.',
++      mathOcrAvailable: isZh
++        ? '已加入公式 OCR 可选模型'
++        : 'Available in Formula OCR selection',
++      mathOcrRegistrationError: isZh
++        ? '公式 OCR 已安装，但未能加入可选模型'
++        : 'Formula OCR is installed but could not be added to the selection.',
+       runtimeHint: isZh
+         ? '下载只保存模型文件；配置和使用前需要对应的本地运行服务可用。'
+         : 'Download stores model files only. The matching local runtime must be available before use.',
+@@ -274,6 +282,25 @@ export const AvailableModels: FC<{
+     [isZh],
+   );
+ 
++  const ensureMathOcrAvailable = useCallback(
++    async (models: LocalModel[]) => {
++      const mathOcrModel = models.find(
++        (model) => getPrimaryType(model) === 'math_ocr',
++      );
++      if (!mathOcrModel || mathOcrRegistrationRef.current === mathOcrModel.path) {
++        return;
++      }
++
++      mathOcrRegistrationRef.current = mathOcrModel.path;
++      const registered = await ensureLocalModel(makeDefaults(mathOcrModel));
++      if (!registered) {
++        mathOcrRegistrationRef.current = null;
++        setError(copy.mathOcrRegistrationError);
++      }
++    },
++    [copy.mathOcrRegistrationError, ensureLocalModel],
++  );
++
+   const loadModels = useCallback(async () => {
+     setLoading(true);
+     setError('');
+@@ -285,12 +312,13 @@ export const AvailableModels: FC<{
+       setLocalModels(localData.models ?? []);
+       setModelDir(localData.model_dir ?? '');
+       setRecommendedModels(recommendedData.models ?? []);
++      await ensureMathOcrAvailable(localData.models ?? []);
+     } catch (err) {
+       setError(err instanceof Error ? err.message : copy.error);
+     } finally {
+       setLoading(false);
+     }
+-  }, [copy.error]);
++  }, [copy.error, ensureMathOcrAvailable]);
+@@ -548,8 +576,11 @@ export const AvailableModels: FC<{
+                 </div>
+                 {getPrimaryType(model) === 'math_ocr' ? (
+-                  <span className="inline-flex h-8 shrink-0 items-center rounded-md border border-state-success/40 px-3 text-xs text-state-success">
+-                    {copy.downloaded}
++                  <span
++                    className="inline-flex h-8 shrink-0 items-center rounded-md border border-state-success/40 px-3 text-xs text-state-success"
++                    data-testid="math-ocr-auto-registered"
++                  >
++                    {copy.mathOcrAvailable}
+                   </span>
+                 ) : (
+                   <Button
+@@ -631,8 +662,11 @@ export const AvailableModels: FC<{
+                 <div className="mt-3 flex flex-wrap gap-2">
+                   {model.downloaded && getPrimaryType(model) === 'math_ocr' ? (
+-                    <span className="inline-flex h-8 items-center rounded-md border border-state-success/40 px-3 text-xs text-state-success">
+-                      {copy.downloaded}
++                    <span
++                      className="inline-flex h-8 items-center rounded-md border border-state-success/40 px-3 text-xs text-state-success"
++                      data-testid="math-ocr-auto-registered"
++                    >
++                      {copy.mathOcrAvailable}
+                     </span>
+                   ) : model.downloaded ? (
+                     <Button
