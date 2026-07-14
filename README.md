@@ -1,4 +1,6 @@
-﻿# LocalMathRAGFlow
+﻿**简体中文** | [English](README_EN.md)
+
+# LocalMathRAGFlow
 
 > 在 Windows 上运行的本地工程文档知识库：把 PDF、Word 等资料放进文件夹，就能在浏览器里检索、提问、查看引用，并尽量保留公式、表格和图片上下文。
 
