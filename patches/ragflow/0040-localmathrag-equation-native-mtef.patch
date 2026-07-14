@@ -1,0 +1,215 @@
+diff --git a/rag/app/naive.py b/rag/app/naive.py
+--- a/rag/app/naive.py
++++ b/rag/app/naive.py
+@@ -16,6 +16,7 @@
+ import logging
+ import re
+ import os
++import subprocess
+ from functools import reduce
+ from html import escape
+ from io import BytesIO
+@@ -396,7 +397,7 @@ class Docx(DocxParser):
+     WORD_EQUATION_PREFIX = "[Word equation:"
+ 
+     def __init__(self):
+-        pass
++        self._equation_native_cache = {}
+ 
+     def __clean(self, line):
+         line = "" if line is None else str(line)
+@@ -499,6 +500,23 @@ class Docx(DocxParser):
+ 
+     def __paragraph_text_with_math_placeholders(self, paragraph):
+         pieces = []
++        native_relationship_ids = set()
+         for run in paragraph.runs:
+             if run.text:
+                 pieces.append(run.text)
+             equation_text = self.__omml_text(run._element)
+             if equation_text:
+                 pieces.append(equation_text)
++            for source in self.__equation_editor_sources(run):
++                relationship_id = source.get("relationship_id")
++                native_latex = str(source.get("native_latex") or "").strip()
++                if relationship_id:
++                    native_relationship_ids.add(relationship_id)
++                if native_latex:
++                    pieces.append(f"\n$$\n{native_latex}\n$$\n")
++        for source in self.__equation_editor_sources(paragraph):
++            relationship_id = source.get("relationship_id")
++            native_latex = str(source.get("native_latex") or "").strip()
++            if relationship_id in native_relationship_ids or not native_latex:
++                continue
++            pieces.append(f"\n$$\n{native_latex}\n$$\n")
+         paragraph_equations = self.__omml_text(paragraph._element)
+         text = "".join(pieces).strip()
+         if paragraph_equations and paragraph_equations not in text:
+@@ -544,14 +562,52 @@ class Docx(DocxParser):
+             normalized = prog_id.lower()
+             if not (normalized.startswith("equation.") or "mathtype" in normalized):
+                 continue
+-            sources.append(
+-                {
+-                    "prog_id": prog_id or "Equation.3",
+-                    "relationship_id": self.__attr(element, "id"),
+-                }
+-            )
++            relationship_id = self.__attr(element, "id")
++            source = {
++                "prog_id": prog_id or "Equation.3",
++                "relationship_id": relationship_id,
++            }
++            native_latex = self.__equation_native_latex(relationship_id)
++            if native_latex:
++                source["native_latex"] = native_latex
++            sources.append(source)
+         return sources
+ 
++    def __equation_native_latex(self, relationship_id):
++        if not relationship_id:
++            return ""
++        if relationship_id in self._equation_native_cache:
++            return self._equation_native_cache[relationship_id]
++
++        latex = ""
++        converter = os.environ.get("LOCALMATHRAG_MTEF_PARSER", "/usr/local/bin/localmathrag-mtef")
++        try:
++            related_part = self.doc.part.related_parts[relationship_id]
++            ole_blob = getattr(related_part, "blob", None)
++            if not ole_blob or not os.path.isfile(converter):
++                self._equation_native_cache[relationship_id] = ""
++                return ""
++            timeout_seconds = float(os.environ.get("LOCALMATHRAG_MTEF_TIMEOUT_SECONDS", "5"))
++            completed = subprocess.run(
++                [converter],
++                input=ole_blob,
++                capture_output=True,
++                check=False,
++                timeout=max(0.2, timeout_seconds),
++            )
++            if completed.returncode == 0:
++                text = completed.stdout.decode("utf-8", errors="replace").strip()
++                wrapped = re.fullmatch(r"\$\$\s*(.*?)\s*\$\$", text, flags=re.DOTALL)
++                latex = (wrapped.group(1) if wrapped else text).strip()
++                if len(latex) > 100000:
++                    latex = ""
++            else:
++                detail = completed.stderr.decode("utf-8", errors="replace").strip()
++                logging.info("Equation Native MTEF parser skipped %s: %s", relationship_id, detail)
++        except (KeyError, OSError, subprocess.TimeoutExpired, ValueError) as exc:
++            logging.info("Equation Native MTEF parser skipped %s: %s", relationship_id, exc)
++
++        self._equation_native_cache[relationship_id] = latex
++        return latex
++
+     def __paragraph_metadata(self, paragraph, paragraph_id, anchor_text=""):
+         metadata = {
+             "_docx_paragraph_id": paragraph_id,
+@@ -561,14 +617,25 @@ class Docx(DocxParser):
+         equation_sources = self.__equation_editor_sources(paragraph)
+         if equation_sources:
+             metadata["_docx_formula_sources"] = equation_sources
++            metadata["_docx_native_formulas_inline"] = all(
++                str(source.get("native_latex") or "").strip()
++                for source in equation_sources
++                if isinstance(source, dict)
++            )
+         return metadata
+ 
+     def __cell_text(self, cell):
+         texts = []
+         for paragraph in cell.paragraphs:
+             text = self.__paragraph_text_with_math_placeholders(paragraph)
+-            if self.get_picture(self.doc, paragraph) is not None:
++            equation_sources = self.__equation_editor_sources(paragraph)
++            native_latex = [
++                str(source.get("native_latex") or "").strip()
++                for source in equation_sources
++                if isinstance(source, dict) and source.get("native_latex")
++            ]
++            native_complete = bool(equation_sources) and len(native_latex) == len(equation_sources)
++            if self.get_picture(self.doc, paragraph) is not None and not native_complete:
+                 text = self.__image_placeholder(paragraph, text)
+             if text and text.strip():
+                 texts.append(self.__clean(text))
+diff --git a/deepdoc/parser/figure_parser.py b/deepdoc/parser/figure_parser.py
+--- a/deepdoc/parser/figure_parser.py
++++ b/deepdoc/parser/figure_parser.py
+@@ -156,11 +156,37 @@ def _enhance_docx_chunks_with_math_ocr(chunks, idx_lst, callback=None):
+         for idx in idx_lst
+         if 0 <= idx < len(chunks) and chunks[idx].get("_docx_formula_sources")
+     }
++    native_indices = set()
++    native_formula_count = 0
++    for idx in sorted(formula_indices):
++        sources = chunks[idx].get("_docx_formula_sources") or []
++        latex_items = [
++            str(source.get("native_latex") or "").strip()
++            for source in sources
++            if isinstance(source, dict)
++        ]
++        if sources and len(latex_items) == len(sources) and all(latex_items):
++            chunks[idx]["_docx_formula_latex_items"] = latex_items
++            native_indices.add(idx)
++            native_formula_count += len(latex_items)
++    if native_formula_count and callback:
++        callback(0.69, f"Parsed {native_formula_count} Equation Native formulas locally (MTEF).")
++
+     if not _math_ocr_enabled():
+         return formula_indices
+-    if callback:
+-        callback(0.69, "Local Math OCR enabled. Parsing Word formula images...")
+-    candidate_indices = sorted(formula_indices) if formula_indices else idx_lst
++    candidate_indices = [
++        idx
++        for idx in (sorted(formula_indices) if formula_indices else idx_lst)
++        if idx not in native_indices
++    ]
++    if not candidate_indices:
++        return formula_indices
++    if callback:
++        callback(0.69, "Local Math OCR enabled. Parsing Word formula images...")
+     if _math_ocr_backend_name() == "rapid_latex_ocr" and not _rapid_equation_editor_ocr_allowed():
+         rapid_unsupported = {
+             idx
+@@ -287,7 +313,7 @@ def _coalesce_docx_formula_chunks(chunks, formula_indices):
+     if not formula_indices:
+         for chunk in chunks:
+-            for key in ("_docx_paragraph_id", "_docx_anchor_text", "_docx_formula_sources", "_docx_formula_latex", "_docx_formula_latex_items"):
++            for key in ("_docx_paragraph_id", "_docx_anchor_text", "_docx_formula_sources", "_docx_formula_latex", "_docx_formula_latex_items", "_docx_native_formulas_inline"):
+                 chunk.pop(key, None)
+         return [idx for idx, chunk in enumerate(chunks) if chunk.get("ck_type") == "image" and chunk.get("image") is not None]
+ 
+@@ -316,17 +342,22 @@ def _coalesce_docx_formula_chunks(chunks, formula_indices):
+                 anchor_idx = min(candidates, key=lambda idx: (abs(idx - formula_idx), idx > formula_idx))
+ 
+         formula_text = _formula_chunk_text(formula_chunk)
++        native_formulas_inline = bool(formula_chunk.get("_docx_native_formulas_inline"))
+         if anchor_idx is None:
+-            formula_chunk["text"] = formula_text
++            if not native_formulas_inline:
++                formula_chunk["text"] = formula_text
+             formula_chunk["ck_type"] = "formula"
+-            formula_chunk["tk_nums"] = num_tokens_from_string(formula_text)
++            formula_chunk["tk_nums"] = num_tokens_from_string(formula_chunk.get("text") or "")
+             continue
+ 
+         anchor = chunks[anchor_idx]
+         anchor_text = (formula_chunk.get("_docx_anchor_text") or "").strip()
+         current_text = anchor.get("text") or ""
+         insertion = f"{anchor_text}\n{formula_text}" if anchor_text else formula_text
+-        if anchor_text and anchor_text in current_text:
++        if native_formulas_inline:
++            pass
++        elif anchor_text and anchor_text in current_text:
+             anchor["text"] = current_text.replace(anchor_text, insertion, 1)
+         elif formula_text not in current_text:
+             anchor["text"] = f"{current_text.rstrip()}\n{formula_text}".strip()
+@@ -339,7 +370,7 @@ def _coalesce_docx_formula_chunks(chunks, formula_indices):
+     chunks[:] = [chunk for idx, chunk in enumerate(chunks) if idx not in remove_indices]
+     for chunk in chunks:
+-        for key in ("_docx_paragraph_id", "_docx_anchor_text", "_docx_formula_sources", "_docx_formula_latex", "_docx_formula_latex_items"):
++        for key in ("_docx_paragraph_id", "_docx_anchor_text", "_docx_formula_sources", "_docx_formula_latex", "_docx_formula_latex_items", "_docx_native_formulas_inline"):
+             chunk.pop(key, None)
+     return [idx for idx, chunk in enumerate(chunks) if chunk.get("ck_type") == "image" and chunk.get("image") is not None]

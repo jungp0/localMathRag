@@ -1,0 +1,68 @@
+diff --git a/rag/svr/localmathrag_priority_queue.py b/rag/svr/localmathrag_priority_queue.py
+index da12810..ae7516b 100644
+--- a/rag/svr/localmathrag_priority_queue.py
++++ b/rag/svr/localmathrag_priority_queue.py
+@@ -58,6 +58,17 @@ def acquire_auxiliary_index_lease(task_id: str) -> str | None:
+     return None
+ 
+ 
++def refresh_auxiliary_index_lease(token: str | None) -> bool:
++    if not token:
++        return False
++    try:
++        if str(REDIS_CONN.REDIS.get(AUXILIARY_INDEX_LOCK_KEY) or "") != str(token):
++            return False
++        return bool(REDIS_CONN.REDIS.expire(AUXILIARY_INDEX_LOCK_KEY, AUXILIARY_INDEX_LOCK_TTL_SECONDS))
++    except Exception:
++        return False
++
++
+ def release_auxiliary_index_lease(token: str | None) -> bool:
+     if not token:
+         return True
+diff --git a/rag/svr/task_executor.py b/rag/svr/task_executor.py
+index 0dcf7d1..c6445ea 100644
+--- a/rag/svr/task_executor.py
++++ b/rag/svr/task_executor.py
+@@ -102,10 +102,12 @@ from rag.svr.task_executor_limiter import (
+ )
+ from rag.svr.localmathrag_toc_queue import enqueue_toc_task, toc_queue_worker
+ from rag.svr.localmathrag_priority_queue import (
++    AUXILIARY_INDEX_LOCK_TTL_SECONDS,
+     AUXILIARY_INDEX_PRIORITY,
+     AUXILIARY_INDEX_TASK_TYPES,
+     acquire_auxiliary_index_lease,
+     document_parse_queue_busy,
++    refresh_auxiliary_index_lease,
+     release_auxiliary_index_lease,
+ )
+ from common import settings
+@@ -1747,6 +1749,19 @@ async def handle_task():
+     task_type = task["task_type"]
+     pipeline_task_type = TASK_TYPE_TO_PIPELINE_TASK_TYPE.get(task_type, PipelineTaskType.PARSE) or PipelineTaskType.PARSE
+     task_id = task["id"]
++    auxiliary_lease = task.get("_localmathrag_auxiliary_lease")
++    lease_heartbeat = None
++    if auxiliary_lease:
++        async def renew_auxiliary_lease():
++            interval = max(60, min(3600, AUXILIARY_INDEX_LOCK_TTL_SECONDS // 3))
++            while True:
++                await asyncio.sleep(interval)
++                if not refresh_auxiliary_index_lease(auxiliary_lease):
++                    logging.warning("Auxiliary index lease heartbeat stopped for task %s", task_id)
++                    return
++
++        lease_heartbeat = asyncio.create_task(renew_auxiliary_lease())
+     try:
+         CURRENT_TASKS[task["id"]] = copy.deepcopy(task)
+         run_mode = os.environ.get("TE_RUN_MODE", "0")
+@@ -1806,6 +1821,9 @@ async def handle_task():
+             pass
+         logging.exception(f"handle_task got exception for task {json.dumps(task)}")
+     finally:
++        if lease_heartbeat:
++            lease_heartbeat.cancel()
++            await asyncio.gather(lease_heartbeat, return_exceptions=True)
+         auxiliary_lease = task.pop("_localmathrag_auxiliary_lease", None)
+         if auxiliary_lease and not release_auxiliary_index_lease(auxiliary_lease):
+             logging.warning("Unable to release auxiliary index lease for task %s", task_id)

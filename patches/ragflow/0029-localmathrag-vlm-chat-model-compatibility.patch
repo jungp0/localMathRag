@@ -1,0 +1,23 @@
+diff --git a/api/apps/services/models_api_service.py b/api/apps/services/models_api_service.py
+--- a/api/apps/services/models_api_service.py
++++ b/api/apps/services/models_api_service.py
+@@ -85,7 +85,10 @@ def _runtime_kind_for_model_type(
+     shared_chat_vision: bool = False,
+ ) -> str | None:
+     normalized = MODEL_TAG_TO_TYPE.get(model_type, model_type)
+-    if normalized == "chat" and shared_chat_vision and _is_local_vlm_endpoint(base_url):
++    # A local VLM can serve chat completions even when it has not also been
++    # selected as the image-to-text default. Route its chat selection to the
++    # VLM runtime instead of the llama.cpp chat runtime.
++    if normalized == "chat" and _is_local_vlm_endpoint(base_url):
+         return "vision"
+@@ -154,7 +157,9 @@ def _switch_local_runtime_model_if_needed(
+     payload = {
+         "kind": kind,
+         "model": model_name,
+-        "start": kind in {"chat", "rerank"} or (kind == "vision" and shared_chat_vision),
++        # A chat-model selection must be ready before it is committed, even
++        # when that chat model is served by the local VLM runtime.
++        "start": kind in {"chat", "rerank"} or model_type == "chat",
+         "timeout_seconds": float(os.getenv("LOCALMATHRAG_RUNTIME_SWITCH_TIMEOUT_SECONDS", "240")),
+     }

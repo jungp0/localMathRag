@@ -1,0 +1,144 @@
+diff --git a/rag/utils/lazy_image.py b/rag/utils/lazy_image.py
+--- a/rag/utils/lazy_image.py
++++ b/rag/utils/lazy_image.py
+@@ -1,11 +1,101 @@
+ import logging
++import os
++import shutil
++import subprocess
++import tempfile
+ from io import BytesIO
++from pathlib import Path
+ 
+-from PIL import Image
++from PIL import Image, ImageChops
+ 
+ from rag.nlp import concat_img
+ 
+ 
++WMF_PLACEABLE_MAGIC = b"\xd7\xcd\xc6\x9a"
++
++
++def _crop_formula_canvas(image):
++    if image.width <= 1 or image.height <= 1:
++        return image
++    background = Image.new("RGB", image.size, image.getpixel((0, 0)))
++    bbox = ImageChops.difference(image, background).getbbox()
++    if not bbox:
++        return image
++    content_width = bbox[2] - bbox[0]
++    content_height = bbox[3] - bbox[1]
++    padding = max(8, int(max(content_width, content_height) * 0.02))
++    crop_box = (
++        max(0, bbox[0] - padding),
++        max(0, bbox[1] - padding),
++        min(image.width, bbox[2] + padding),
++        min(image.height, bbox[3] + padding),
++    )
++    cropped = image.crop(crop_box)
++    image.close()
++    return cropped
++
++
++def _open_wmf_with_libwmf(blob):
++    if not blob.startswith(WMF_PLACEABLE_MAGIC):
++        return None
++
++    converter = shutil.which("wmf2gd")
++    if not converter:
++        logging.info("LazyImage: wmf2gd is unavailable; cannot rasterize the WMF preview")
++        return None
++
++    max_width = os.environ.get("LOCALMATHRAG_WMF_MAX_WIDTH", "2048")
++    max_height = os.environ.get("LOCALMATHRAG_WMF_MAX_HEIGHT", "1024")
++    timeout = float(os.environ.get("LOCALMATHRAG_WMF_TIMEOUT_SECONDS", "15"))
++    font_dir = os.environ.get("LOCALMATHRAG_MATH_FONT_DIR", "").strip()
++
++    with tempfile.TemporaryDirectory(prefix="localmathrag-wmf-") as tmp_dir:
++        source_path = Path(tmp_dir) / "formula.wmf"
++        output_path = Path(tmp_dir) / "formula.png"
++        source_path.write_bytes(blob)
++        command = [
++            converter,
++            f"--maxwidth={max_width}",
++            f"--maxheight={max_height}",
++            "--maxpect",
++            "--wmf-sys-fonts",
++        ]
++        if font_dir and Path(font_dir).is_dir():
++            command.append(f"--wmf-fontdir={font_dir}")
++        command.extend(["-o", str(output_path), str(source_path)])
++
++        try:
++            completed = subprocess.run(
++                command,
++                capture_output=True,
++                check=False,
++                timeout=timeout,
++            )
++        except (OSError, subprocess.TimeoutExpired) as exc:
++            logging.info(f"LazyImage: WMF rasterization failed: {exc}")
++            return None
++
++        if completed.returncode != 0 or not output_path.is_file():
++            detail = completed.stderr.decode("utf-8", errors="replace").strip()
++            logging.info(f"LazyImage: wmf2gd failed ({completed.returncode}): {detail}")
++            return None
++
++        try:
++            with Image.open(output_path) as rendered:
++                image = rendered.convert("RGB").copy()
++            return _crop_formula_canvas(image)
++        except Exception as exc:
++            logging.info(f"LazyImage: cannot open rasterized WMF: {exc}")
++            return None
++
++
++def _open_image_blob(blob):
++    wmf = _open_wmf_with_libwmf(blob)
++    if wmf is not None:
++        return wmf
++    return Image.open(BytesIO(blob)).convert("RGB")
++
++
+ class LazyImage:
+     def __init__(self, blobs, source=None):
+         self._blobs = [b for b in (blobs or []) if b]
+@@ -15,6 +105,13 @@ class LazyImage:
+     def __bool__(self):
+         return bool(self._blobs)
+ 
++    def iter_pil_images(self):
++        for blob in self._blobs:
++            try:
++                yield _open_image_blob(blob)
++            except Exception as exc:
++                logging.info(f"LazyImage: skip bad image blob: {exc}")
++
+     def to_pil(self):
+         if self._pil is not None:
+             try:
+@@ -27,13 +124,7 @@ class LazyImage:
+                     pass
+                 self._pil = None
+         res_img = None
+-        for blob in self._blobs:
+-            try:
+-                image = Image.open(BytesIO(blob)).convert("RGB")
+-            except Exception as e:
+-                logging.info(f"LazyImage: skip bad image blob: {e}")
+-                continue
+-
++        for image in self.iter_pil_images():
+             if res_img is None:
+                 res_img = image
+                 continue
+@@ -124,7 +215,7 @@ def open_image_for_processing(img, *, allow_bytes=False):
+         return img.to_pil_detached(), True
+     if allow_bytes and isinstance(img, (bytes, bytearray)):
+         try:
+-            pil = Image.open(BytesIO(img)).convert("RGB")
++            pil = _open_image_blob(bytes(img))
+             return pil, True
+         except Exception as e:
+             logging.info(f"open_image_for_processing: bad bytes: {e}")

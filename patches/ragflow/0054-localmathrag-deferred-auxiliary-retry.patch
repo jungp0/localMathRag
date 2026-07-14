@@ -1,0 +1,81 @@
+diff --git a/api/db/services/task_service.py b/api/db/services/task_service.py
+--- a/api/db/services/task_service.py
++++ b/api/db/services/task_service.py
+@@ -76,6 +76,6 @@ class TaskService(CommonService):
+     @classmethod
+     @DB.connection_context()
+-    def get_task(cls, task_id, doc_ids=[]):
++    def get_task(cls, task_id, doc_ids=[], increment_retry=True):
+         """Retrieve detailed task information by task ID.
+ 
+         This method fetches comprehensive task details including associated document,
+@@ -84,6 +84,8 @@ class TaskService(CommonService):
+ 
+         Args:
+             task_id (str): The unique identifier of the task to retrieve.
++            increment_retry (bool): Whether this retrieval represents a real
++                execution attempt. Queue deferrals must set this to False.
+ 
+         Returns:
+             dict: Task details dictionary containing all task information and related metadata.
+@@ -126,6 +128,9 @@ class TaskService(CommonService):
+         if not docs:
+             return None
+ 
++        if not increment_retry:
++            return docs[0]
++
+         msg = f"\n{datetime.now().strftime('%H:%M:%S')} Task has been received."
+         prog = random.random() / 10.0
+         if docs[0]["retry_count"] >= 3:
+diff --git a/rag/svr/task_executor.py b/rag/svr/task_executor.py
+--- a/rag/svr/task_executor.py
++++ b/rag/svr/task_executor.py
+@@ -242,11 +242,13 @@ async def collect():
+         redis_msg.ack()
+         return None, None
+ 
++    task_type = msg.get("task_type", "")
++    increment_retry = task_type not in AUXILIARY_INDEX_TASK_TYPES
+     canceled = False
+     if msg.get("doc_id", "") in [GRAPH_RAPTOR_FAKE_DOC_ID, CANVAS_DEBUG_DOC_ID]:
+         task = msg
+         if task["task_type"] in PIPELINE_SPECIAL_PROGRESS_FREEZE_TASK_TYPES:
+-            task = TaskService.get_task(msg["id"], msg["doc_ids"])
++            task = TaskService.get_task(msg["id"], msg["doc_ids"], increment_retry=increment_retry)
+             if task:
+                 task["doc_id"] = msg["doc_id"]
+                 task["doc_ids"] = msg.get("doc_ids", []) or []
+@@ -256,6 +258,6 @@ async def collect():
+         _, task_obj = TaskService.get_by_id(msg["id"])
+         task = task_obj.to_dict()
+     else:
+-        task = TaskService.get_task(msg["id"])
++        task = TaskService.get_task(msg["id"], increment_retry=increment_retry)
+ 
+     if task:
+         canceled = has_canceled(task["id"])
+@@ -267,7 +269,6 @@ async def collect():
+         redis_msg.ack()
+         return None, None
+ 
+-    task_type = msg.get("task_type", "")
+     if task_type in AUXILIARY_INDEX_TASK_TYPES:
+         defer_reason = None
+         if document_parse_queue_busy(TASK_TYPE):
+@@ -288,6 +289,15 @@ async def collect():
+             else:
+                 logging.warning("Unable to defer %s task %s; leaving the message pending", task_type, task["id"])
+             return None, None
++        admitted_task = TaskService.get_task(msg["id"], msg.get("doc_ids", []))
++        if not admitted_task:
++            if not release_auxiliary_index_lease(lease_token):
++                logging.warning("Unable to release auxiliary index lease for abandoned task %s", task["id"])
++            redis_msg.ack()
++            return None, None
++        admitted_task["doc_id"] = msg.get("doc_id", admitted_task.get("doc_id", ""))
++        admitted_task["doc_ids"] = msg.get("doc_ids", []) or []
++        task = admitted_task
+         task["_localmathrag_auxiliary_lease"] = lease_token
+     task["task_type"] = task_type
+     if task_type[:8] == "dataflow":

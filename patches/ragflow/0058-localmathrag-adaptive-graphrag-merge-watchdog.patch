@@ -1,0 +1,117 @@
+diff --git a/rag/graphrag/general/index.py b/rag/graphrag/general/index.py
+--- a/rag/graphrag/general/index.py
++++ b/rag/graphrag/general/index.py
+@@ -75,7 +75,7 @@ DEFAULT_GRAPHRAG_LLM_REQUEST_TIMEOUT_SECONDS = float(os.environ.get("LOCALMATHR
+ DEFAULT_GRAPHRAG_STALL_TIMEOUT_FACTOR = float(os.environ.get("LOCALMATHRAG_GRAPHRAG_STALL_TIMEOUT_FACTOR", 1.5))
+ DEFAULT_GRAPHRAG_STALL_TIMEOUT_MAX_FACTOR = float(os.environ.get("LOCALMATHRAG_GRAPHRAG_STALL_TIMEOUT_MAX_FACTOR", 8.0))
+ DEFAULT_GRAPHRAG_STALL_OBSERVED_GAP_FACTOR = float(os.environ.get("LOCALMATHRAG_GRAPHRAG_STALL_OBSERVED_GAP_FACTOR", 3.0))
+-DEFAULT_GRAPHRAG_MERGE_TIMEOUT_SECONDS = 180
++DEFAULT_GRAPHRAG_MERGE_TIMEOUT_SECONDS = 0
+ DEFAULT_GRAPHRAG_RESOLUTION_TIMEOUT_SECONDS = 1800
+ DEFAULT_GRAPHRAG_COMMUNITY_TIMEOUT_SECONDS = 1800
+ DEFAULT_GRAPHRAG_LOCK_ACQUIRE_TIMEOUT_SECONDS = 600
+@@ -443,7 +443,13 @@ async def run_graphrag(
+         100.0,
+     )
+     merge_timeout_seconds = _bounded_int_config(graphrag_config, "merge_timeout_seconds", DEFAULT_GRAPHRAG_MERGE_TIMEOUT_SECONDS, 0, 86400)
++    merge_stall_timeout_seconds = max(
++        build_subgraph_min_timeout_seconds,
++        llm_request_timeout_seconds * stall_timeout_factor,
++        merge_timeout_seconds,
++    )
++    merge_stall_timeout_max_seconds = merge_stall_timeout_seconds * stall_timeout_max_factor
+     resolution_timeout_seconds = _bounded_int_config(graphrag_config, "resolution_timeout_seconds", DEFAULT_GRAPHRAG_RESOLUTION_TIMEOUT_SECONDS, 0, 86400)
+     community_timeout_seconds = _bounded_int_config(graphrag_config, "community_timeout_seconds", DEFAULT_GRAPHRAG_COMMUNITY_TIMEOUT_SECONDS, 0, 86400)
+     lock_acquire_timeout_seconds = _lock_acquire_timeout_config(graphrag_config)
+ 
+@@ -686,29 +692,52 @@ async def run_graphrag(
+             union_nodes.update(set(sg.nodes()))
+ 
+             try:
++                active_merge_watchdog = None
++
++                def set_active_merge_watchdog(watchdog):
++                    nonlocal active_merge_watchdog
++                    active_merge_watchdog = watchdog
++
++                def merge_callback(*args, **kwargs):
++                    if active_merge_watchdog is not None:
++                        active_merge_watchdog.touch()
++                    callback(*args, **kwargs)
++
+                 async def merge_subgraph_attempt():
+                     current_graph = await get_graph(tenant_id, kb_id)
+                     if current_graph and doc_id in current_graph.graph.get("source_id", []):
+-                        callback(msg=f"[GraphRAG] merge_subgraph doc:{doc_id} already merged, skipping retry.")
++                        merge_callback(msg=f"[GraphRAG] merge_subgraph doc:{doc_id} already merged, skipping retry.")
+                         return current_graph
+                     return await merge_subgraph(
+                         tenant_id,
+                         kb_id,
+                         doc_id,
+                         sg,
+                         embedding_model,
+-                        callback,
++                        merge_callback,
+                     )
+ 
++                callback(
++                    msg=(
++                        f"[GraphRAG] merge_subgraph doc:{doc_id} start "
++                        f"(inactivity_timeout={merge_stall_timeout_seconds:.1f}s, attempts={merge_retry_attempts})"
++                    )
++                )
+                 new_graph = await _run_with_retry(
+                     f"merge_subgraph doc:{doc_id}",
+                     merge_subgraph_attempt,
+                     attempts=merge_retry_attempts,
+-                    timeout_seconds=merge_timeout_seconds,
++                    timeout_seconds=0,
+                     backoff_seconds=retry_backoff_seconds,
+                     backoff_max_seconds=retry_backoff_max_seconds,
+                     callback=callback,
+                     task_id=task_id,
++                    activity_watchdog_factory=lambda: AdaptiveActivityWatchdog(
++                        merge_stall_timeout_seconds,
++                        merge_stall_timeout_max_seconds,
++                        observed_gap_multiplier=stall_observed_gap_factor,
++                    ),
++                    activity_watchdog_setter=set_active_merge_watchdog,
+                 )
+             except TaskCanceledException:
+                 raise
+@@ -950,30 +979,33 @@ async def generate_subgraph(
+     return subgraph
+ 
+ 
+-@timeout(60 * 3)
+ async def merge_subgraph(
+     tenant_id: str,
+     kb_id: str,
+     doc_id: str,
+     subgraph: nx.Graph,
+     embedding_model,
+     callback,
+ ):
+     start = asyncio.get_running_loop().time()
+     change = GraphChange()
++    callback(msg=f"[GraphRAG] merge_subgraph doc:{doc_id} loading global graph.")
+     old_graph = await get_graph(tenant_id, kb_id, subgraph.graph["source_id"])
+     if old_graph is not None:
+         logging.info("Merge with an exiting graph...................")
++        callback(msg=f"[GraphRAG] merge_subgraph doc:{doc_id} tidying existing graph.")
+         tidy_graph(old_graph, callback)
+         new_graph = graph_merge(old_graph, subgraph, change)
+     else:
+         new_graph = subgraph
+         change.added_updated_nodes = set(new_graph.nodes())
+         change.added_updated_edges = set(new_graph.edges())
++    callback(msg=f"[GraphRAG] merge_subgraph doc:{doc_id} updating pagerank.")
+     pr = nx.pagerank(new_graph)
+     for node_name, pagerank in pr.items():
+         new_graph.nodes[node_name]["pagerank"] = pagerank
+ 
++    callback(msg=f"[GraphRAG] merge_subgraph doc:{doc_id} persisting graph and embeddings.")
+     await set_graph(tenant_id, kb_id, embedding_model, new_graph, change, callback)
+     now = asyncio.get_running_loop().time()
+     callback(msg=f"merging subgraph for doc {doc_id} into the global graph done in {now - start:.2f} seconds.")

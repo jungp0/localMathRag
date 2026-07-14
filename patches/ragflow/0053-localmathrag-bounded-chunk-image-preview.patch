@@ -1,0 +1,203 @@
+diff --git a/web/src/pages/chunk/parsed-result/add-knowledge/components/knowledge-chunk/components/chunk-card/index.tsx b/web/src/pages/chunk/parsed-result/add-knowledge/components/knowledge-chunk/components/chunk-card/index.tsx
+--- a/web/src/pages/chunk/parsed-result/add-knowledge/components/knowledge-chunk/components/chunk-card/index.tsx
++++ b/web/src/pages/chunk/parsed-result/add-knowledge/components/knowledge-chunk/components/chunk-card/index.tsx
+@@ -29,6 +29,11 @@ interface IProps {
+   t?: string | number; // Cache-busting key for images
+ }
+ 
++const thumbnailMaxWidth = 224;
++const thumbnailMaxHeight = 320;
++const narrowThumbnailMaxHeight = 192;
++const narrowThumbnailAspectRatio = 0.5;
++
+ const ChunkCard = ({
+   item,
+   checked,
+@@ -43,6 +48,7 @@ const ChunkCard = ({
+   const { t } = useTranslation();
+   const available = Number(item.available_int);
+   const [enabled, setEnabled] = useState(false);
++  const [imageMaxHeight, setImageMaxHeight] = useState(thumbnailMaxHeight);
+ 
+   const onChange = (checked: boolean) => {
+     setEnabled(checked);
+@@ -61,6 +67,17 @@ const ChunkCard = ({
+     clickChunkCard(item.chunk_id);
+   };
+ 
++  const handleThumbnailLoad = (image: HTMLImageElement) => {
++    if (image.naturalHeight > 0) {
++      const aspectRatio = image.naturalWidth / image.naturalHeight;
++      setImageMaxHeight(
++        aspectRatio < narrowThumbnailAspectRatio
++          ? narrowThumbnailMaxHeight
++          : thumbnailMaxHeight,
++      );
++    }
++  };
++
+   useEffect(() => {
+     setEnabled(available === 1);
+   }, [available]);
+@@ -97,16 +114,35 @@ const ChunkCard = ({
+         {/* Using <Tooltip> instead of <Popover> to avoid flickering when hovering over the image */}
+         {item.image_id && (
+           <Tooltip>
+-            <TooltipTrigger>
+-              <Image
+-                t={imageCacheKey}
+-                id={item.image_id}
+-                className="mt-1 rounded !w-28 object-contain"
+-              />
++            <TooltipTrigger asChild>
++              <button
++                type="button"
++                aria-label="Preview chunk image"
++                className="mt-1 flex max-h-80 max-w-56 shrink-0 items-center justify-center overflow-hidden rounded border border-border-button bg-white"
++                style={{
++                  maxHeight: imageMaxHeight,
++                  maxWidth: thumbnailMaxWidth,
++                }}
++              >
++                <Image
++                  t={imageCacheKey}
++                  id={item.image_id}
++                  className="!h-auto !w-auto max-h-80 max-w-56 object-contain"
++                  style={{
++                    height: 'auto',
++                    maxHeight: imageMaxHeight,
++                    maxWidth: thumbnailMaxWidth,
++                    width: 'auto',
++                  }}
++                  onLoad={({ currentTarget }) =>
++                    handleThumbnailLoad(currentTarget)
++                  }
++                />
++              </button>
+             </TooltipTrigger>
+ 
+             <TooltipContent
+-              className="p-0"
++              className="w-auto max-w-[72vw] overflow-hidden bg-white p-2"
+               align="start"
+               side="left"
+               sideOffset={-20}
+@@ -115,7 +151,7 @@ const ChunkCard = ({
+               <Image
+                 t={imageCacheKey}
+                 id={item.image_id}
+-                className="size-full max-w-[50vw] max-h-[50vh] object-contain"
++                className="!h-auto !w-auto max-h-[70vh] max-w-[70vw] object-contain"
+               />
+             </TooltipContent>
+           </Tooltip>
+diff --git a/web/src/pages/dataflow-result/components/chunk-card/index.module.less b/web/src/pages/dataflow-result/components/chunk-card/index.module.less
+--- a/web/src/pages/dataflow-result/components/chunk-card/index.module.less
++++ b/web/src/pages/dataflow-result/components/chunk-card/index.module.less
+@@ -1,14 +1,3 @@
+-.image {
+-  width: 100px !important;
+-  object-fit: contain;
+-}
+-
+-.imagePreview {
+-  max-width: 50vw;
+-  max-height: 50vh;
+-  object-fit: contain;
+-}
+-
+ .content {
+   flex: 1;
+   .chunkText;
+diff --git a/web/src/pages/dataflow-result/components/chunk-card/index.tsx b/web/src/pages/dataflow-result/components/chunk-card/index.tsx
+--- a/web/src/pages/dataflow-result/components/chunk-card/index.tsx
++++ b/web/src/pages/dataflow-result/components/chunk-card/index.tsx
+@@ -26,6 +26,11 @@ interface IProps {
+   textMode: ChunkTextMode;
+ }
+ 
++const thumbnailMaxWidth = 224;
++const thumbnailMaxHeight = 320;
++const narrowThumbnailMaxHeight = 192;
++const narrowThumbnailAspectRatio = 0.5;
++
+ const ChunkCard = ({
+   item,
+   checked,
+@@ -38,6 +43,7 @@ const ChunkCard = ({
+ }: IProps) => {
+   const available = Number(item.available_int);
+   const [enabled, setEnabled] = useState(false);
++  const [imageMaxHeight, setImageMaxHeight] = useState(thumbnailMaxHeight);
+ 
+   const onChange = (checked: boolean) => {
+     setEnabled(checked);
+@@ -56,6 +62,17 @@ const ChunkCard = ({
+     clickChunkCard(item.chunk_id);
+   };
+ 
++  const handleThumbnailLoad = (image: HTMLImageElement) => {
++    if (image.naturalHeight > 0) {
++      const aspectRatio = image.naturalWidth / image.naturalHeight;
++      setImageMaxHeight(
++        aspectRatio < narrowThumbnailAspectRatio
++          ? narrowThumbnailMaxHeight
++          : thumbnailMaxHeight,
++      );
++    }
++  };
++
+   useEffect(() => {
+     setEnabled(available === 1);
+   }, [available]);
+@@ -76,22 +93,40 @@ const ChunkCard = ({
+               onMouseEnter={() => setOpen(true)}
+               onMouseLeave={() => setOpen(false)}
+             >
+-              <div>
+-                <Image id={item.image_id} className={styles.image}></Image>
+-              </div>
++              <button
++                type="button"
++                aria-label="Preview chunk image"
++                className="flex max-h-80 max-w-56 shrink-0 items-center justify-center overflow-hidden rounded border border-border-button bg-white"
++                style={{
++                  maxHeight: imageMaxHeight,
++                  maxWidth: thumbnailMaxWidth,
++                }}
++              >
++                <Image
++                  id={item.image_id}
++                  className="!h-auto !w-auto max-h-80 max-w-56 object-contain"
++                  style={{
++                    height: 'auto',
++                    maxHeight: imageMaxHeight,
++                    maxWidth: thumbnailMaxWidth,
++                    width: 'auto',
++                  }}
++                  onLoad={({ currentTarget }) =>
++                    handleThumbnailLoad(currentTarget)
++                  }
++                ></Image>
++              </button>
+             </PopoverTrigger>
+             <PopoverContent
+-              className="p-0"
++              className="w-auto max-w-[72vw] overflow-hidden bg-white p-2"
+               align={'start'}
+               side={'right'}
+               sideOffset={-20}
+             >
+-              <div>
+-                <Image
+-                  id={item.image_id}
+-                  className={styles.imagePreview}
+-                ></Image>
+-              </div>
++              <Image
++                id={item.image_id}
++                className="!h-auto !w-auto max-h-[70vh] max-w-[70vw] object-contain"
++              ></Image>
+             </PopoverContent>
+           </Popover>
+         )}

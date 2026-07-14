@@ -1,0 +1,41 @@
+diff --git a/api/apps/services/models_api_service.py b/api/apps/services/models_api_service.py
+--- a/api/apps/services/models_api_service.py
++++ b/api/apps/services/models_api_service.py
+@@ -15,6 +15,7 @@
+ import os
+ import logging
+ import json
++import re
+ import urllib.error
+ import urllib.request
+@@ -181,4 +182,6 @@ def _runtime_switch_failure_message(result: dict) -> str:
+             f"Local runtime model switch failed: {kind} requires at least {required:.1f}GB available memory, "
+             f"but only {available:.1f}GB is available. Close memory-heavy applications or choose a smaller model."
+         )
+-    return f"Local runtime model switch failed: {result.get('reason') or result.get('detail') or result}"
++    reason = str(result.get("reason") or result.get("detail") or result)
++    reason = re.sub(r"^[\x00-\x1f\ufffd]+", "", reason).strip()
++    return f"Local runtime model switch failed: {reason}"
+diff --git a/web/src/hooks/use-llm-request.tsx b/web/src/hooks/use-llm-request.tsx
+--- a/web/src/hooks/use-llm-request.tsx
++++ b/web/src/hooks/use-llm-request.tsx
+@@ -491,7 +491,10 @@ export const useSetDefaultModel = () => {
+   const { isPending: loading, mutateAsync } = useMutation({
+     mutationKey: [LLMApiAction.SetDefaultModel],
+     onError: () => {
+-      message.error('切换模型失败，请检查本地运行时状态后重试。');
++      message.error({
++        message: '切换模型失败，请检查本地运行时状态后重试。',
++        duration: 12,
++      });
+     },
+@@ -507,7 +510,10 @@ export const useSetDefaultModel = () => {
+           queryKey: LlmKeys.defaultModels(),
+         });
+       } else {
+-        message.error(data.message || t('message.modified'));
++        message.error({
++          message: data.message || t('message.modified'),
++          duration: 12,
++        });
+       }

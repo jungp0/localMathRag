@@ -1,0 +1,151 @@
+diff --git a/rag/svr/localmathrag_toc_builder.py b/rag/svr/localmathrag_toc_builder.py
+index 68d113a..e5bd675 100644
+--- a/rag/svr/localmathrag_toc_builder.py
++++ b/rag/svr/localmathrag_toc_builder.py
+@@ -19,6 +19,22 @@ _CAPTION_RE = re.compile(r"<caption>\s*Table Location:\s*(.*?)</caption>", re.IG
+ _SPACE_RE = re.compile(r"\s+")
+ _MATCH_SPACE_RE = re.compile(r"[\s\u3000]+")
+ _SENTENCE_PUNCTUATION_RE = re.compile(r"[\uff1a:;\uff1b\u3002\uff01\uff1f!?]")
++_PROSE_PUNCTUATION_RE = re.compile(r"[,\uff0c;\uff1b\u3002\uff01\uff1f!?]")
++_TRAILING_PAGE_NUMBER_RE = re.compile(r"^(?P<title>.*?\S)\s+(?P<page>\d{1,4})$")
++_LIST_STYLE_PREFIX_RE = re.compile(
++    r"^(?:[\uff08(]|[\u2460-\u2473]|[A-Za-zIVXLCDM]+[.)\uff09\u3001]|\d+[)\uff09\u3001])"
++)
++_HEADING_NUMBER_PREFIX_RE = re.compile(
++    r"^(?:"
++    r"#{1,6}\s*|"
++    r"\u7b2c[\u96f6\u3007\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u767e\u5343\d]+(?:\u7ae0|\u7bc7|\u90e8\u5206|\u8282|\u6761)\s*|"
++    r"(?:[A-Za-z][.\uff0e])?\d+(?:[.\uff0e]\d+)*(?:[)\uff09\u3001.\uff0e]|\s+)?\s*|"
++    r"[\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u767e]+[\u3001.\uff0e]\s*|"
++    r"[\uff08(][\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u767e\d]+[\uff09)]\s*|"
++    r"[\u2460-\u2473]\s*|"
++    r"[A-Za-zIVXLCDM]+[.)\uff09\u3001]\s*"
++    r")"
++)
+ _FIGURE_OR_TABLE_RE = re.compile(r"^(?:[\u56fe\u8868]\s*\d+|(?:figure|table)\s+\d+)\b", re.IGNORECASE)
+ _NON_HEADING_PREFIX_RE = re.compile(
+     r"^(?:\u5176\u4e2d|\u5f0f\u4e2d|\u7531\u4e8e|\u5982\u679c|\u5bf9\u4e8e|\u5047\u8bbe|"
+@@ -95,6 +111,23 @@ def _match_text(value: Any) -> str:
+     return _MATCH_SPACE_RE.sub("", _clean_title(value)).casefold()
+ 
+ 
++def _strip_trailing_page_number(value: Any) -> tuple[str, int | None]:
++    title = _clean_title(value)
++    match = _TRAILING_PAGE_NUMBER_RE.match(title)
++    if not match:
++        return title, None
++    title_without_page = _clean_title(match.group("title"))
++    if len(title_without_page) < 2:
++        return title, None
++    return title_without_page, int(match.group("page"))
++
++
++def _heading_key(value: Any) -> str:
++    title, _page = _strip_trailing_page_number(value)
++    title = _HEADING_NUMBER_PREFIX_RE.sub("", title, count=1)
++    return re.sub(r"[\s\u3000()\uff08\uff09\u3001.\uff0e_-]+", "", title).casefold()
++
++
+ def _looks_like_formula(text: str) -> bool:
+     lowered = text.casefold()
+     if not text or text.startswith("$") or "\\begin" in lowered or "[word equation" in lowered:
+@@ -124,8 +157,15 @@ def _numbered_title(line: str) -> tuple[str, int] | None:
+         body = _SPACE_RE.sub(" ", match.group("body") or "").strip()
+         if body:
+             boundary = _SENTENCE_PUNCTUATION_RE.search(body)
+-            if boundary and (len(body) > 40 or boundary.group(0) in {":", "\uff1a"}):
+-                body = body[: boundary.start()].strip()
++            if boundary:
++                if boundary.group(0) in {":", "\uff1a"} and 1 < boundary.start() <= 48:
++                    body = body[: boundary.start()].strip()
++                else:
++                    return None
++        if len(body) > 72:
++            return None
++        if _LIST_STYLE_PREFIX_RE.match(prefix) and (len(body) > 36 or _PROSE_PUNCTUATION_RE.search(body)):
++            return None
+         title = _clean_title(f"{prefix}{body}")
+         if _valid_title(title, numbered=True):
+             return title, max(1, min(6, int(level_getter(match))))
+@@ -241,8 +281,63 @@ def _text_candidates(content: str, chunk_id: int) -> list[dict[str, Any]]:
+     return candidates
+ 
+ 
++def _resolve_rendered_toc(candidates: list[dict[str, Any]], chunk_count: int) -> list[dict[str, Any]]:
++    if chunk_count < 2:
++        return []
++    leading_chunk_limit = min(chunk_count, max(4, (chunk_count + 9) // 10))
++    rendered = []
++    for item in sorted(candidates, key=lambda value: (value["chunk_id"], value["offset"])):
++        if item["chunk_id"] >= leading_chunk_limit or item["source"] not in {"numbered", "semantic"}:
++            continue
++        title, page = _strip_trailing_page_number(item["title"])
++        if page is None or not _heading_key(title):
++            continue
++        rendered.append((item, title, page))
++    if len(rendered) < 8 or len({page for _item, _title, page in rendered}) < 3:
++        return []
++    monotonic_pairs = sum(
++        current[2] >= previous[2] for previous, current in zip(rendered, rendered[1:])
++    )
++    if monotonic_pairs / max(1, len(rendered) - 1) < 0.75:
++        return []
++
++    toc_end = max((item["chunk_id"], item["offset"]) for item, _title, _page in rendered)
++    body_candidates = [
++        item
++        for item in sorted(candidates, key=lambda value: (value["chunk_id"], value["offset"]))
++        if (item["chunk_id"], item["offset"]) > toc_end
++        and item["source"] in {"numbered", "semantic"}
++        and _strip_trailing_page_number(item["title"])[1] is None
++    ]
++    body_keys = [_heading_key(item["title"]) for item in body_candidates]
++    resolved = []
++    cursor = 0
++    for toc_item, clean_title, _page in rendered:
++        toc_key = _heading_key(clean_title)
++        match_index = None
++        for index in range(cursor, len(body_candidates)):
++            if body_keys[index] == toc_key:
++                match_index = index
++                break
++        if match_index is None:
++            continue
++        body_item = body_candidates[match_index]
++        resolved.append(
++            _candidate(
++                clean_title,
++                body_item["chunk_id"],
++                toc_item["level"],
++                body_item["offset"],
++                "rendered_toc",
++            )
++        )
++        cursor = match_index + 1
++    required_matches = max(6, (len(rendered) + 2) // 3)
++    return resolved if len(resolved) >= required_matches else []
++
++
+ def _dedupe_and_normalize(candidates: list[dict[str, Any]]) -> list[dict[str, str]]:
+-    priorities = {"outline": 0, "numbered": 1, "semantic": 2, "caption": 3}
++    priorities = {"rendered_toc": 0, "outline": 1, "numbered": 2, "semantic": 3, "caption": 4}
+     candidates.sort(key=lambda item: (item["chunk_id"], item["offset"], priorities.get(item["source"], 9)))
+     seen_in_chunk = set()
+     seen_caption_paths = set()
+@@ -286,9 +381,14 @@ def _dedupe_and_normalize(candidates: list[dict[str, Any]]) -> list[dict[str, st
+ 
+ def build_local_toc(chunks: list[str], outline: list[dict[str, Any]] | None = None) -> list[dict[str, str]]:
+     normalized_chunks = [str(chunk or "") for chunk in chunks]
+-    candidates = _outline_candidates(normalized_chunks, outline)
++    text_candidates = []
+     for chunk_id, content in enumerate(normalized_chunks):
+-        candidates.extend(_text_candidates(content, chunk_id))
++        text_candidates.extend(_text_candidates(content, chunk_id))
++    rendered_toc = _resolve_rendered_toc(text_candidates, len(normalized_chunks))
++    if rendered_toc:
++        return _dedupe_and_normalize(rendered_toc)
++    candidates = _outline_candidates(normalized_chunks, outline)
++    candidates.extend(text_candidates)
+     structural_candidates = [item for item in candidates if item["source"] != "caption"]
+     if outline or len(structural_candidates) >= 3:
+         candidates = structural_candidates

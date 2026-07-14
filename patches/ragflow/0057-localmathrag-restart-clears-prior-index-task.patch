@@ -1,0 +1,32 @@
+diff --git a/api/apps/services/dataset_api_service.py b/api/apps/services/dataset_api_service.py
+--- a/api/apps/services/dataset_api_service.py
++++ b/api/apps/services/dataset_api_service.py
+@@ -511,11 +511,25 @@ def start_index(dataset_id: str, tenant_id: str, index_type: str):
+     existing_task_id = getattr(kb, task_id_field, None)
+     if existing_task_id:
+         ok, task = TaskService.get_by_id(existing_task_id)
+         if not ok:
+             logging.warning(f"A valid {display_name} task id is expected for Dataset {dataset_id}")
+-
+-        if task and task.progress not in [-1, 1]:
+-            return False, f"Task {existing_task_id} in progress with status {task.progress}. A {display_name} Task is already running."
++        else:
++            logging.info(
++                "Restarting %s index for dataset=%s; clearing prior task=%s progress=%s while preserving index checkpoints",
++                display_name,
++                dataset_id,
++                existing_task_id,
++                task.progress,
++            )
++
++        from rag.utils.redis_conn import REDIS_CONN
++
++        try:
++            REDIS_CONN.set(f"{existing_task_id}-cancel", "x")
++        except Exception as exc:
++            logging.warning("Unable to mark prior %s task %s cancelled: %s", display_name, existing_task_id, exc)
++        remove_stale_auxiliary_index_messages(task_ids={existing_task_id})
++        TaskService.delete_by_id(existing_task_id)
+ 
+     documents, _ = DocumentService.get_by_kb_id(
+         kb_id=dataset_id,

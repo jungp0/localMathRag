@@ -1,0 +1,575 @@
+diff --git a/rag/svr/localmathrag_toc_builder.py b/rag/svr/localmathrag_toc_builder.py
+new file mode 100644
+--- /dev/null
++++ b/rag/svr/localmathrag_toc_builder.py
+@@ -0,0 +1,295 @@
++# Copyright 2026 LocalMathRAGFlow contributors.
++# Licensed under the Apache License, Version 2.0.
++
++from __future__ import annotations
++
++import html
++import os
++import re
++from typing import Any
++
++
++MAX_TOC_ENTRIES = max(8, int(os.environ.get("LOCALMATHRAG_TOC_LOCAL_MAX_ENTRIES", "256")))
++MAX_TITLE_CHARS = max(24, int(os.environ.get("LOCALMATHRAG_TOC_LOCAL_MAX_TITLE_CHARS", "96")))
++
++_FORMULA_BLOCK_RE = re.compile(r"\$\$.*?\$\$", re.DOTALL)
++_WORD_FORMULA_RE = re.compile(r"\[(?:Word equation|Word inline image/formula)[^\]]*\]", re.IGNORECASE)
++_HTML_TAG_RE = re.compile(r"<[^>]+>")
++_CAPTION_RE = re.compile(r"<caption>\s*Table Location:\s*(.*?)</caption>", re.IGNORECASE | re.DOTALL)
++_SPACE_RE = re.compile(r"\s+")
++_MATCH_SPACE_RE = re.compile(r"[\s\u3000]+")
++_SENTENCE_PUNCTUATION_RE = re.compile(r"[\uff1a:;\uff1b\u3002\uff01\uff1f!?]")
++_FIGURE_OR_TABLE_RE = re.compile(r"^(?:[\u56fe\u8868]\s*\d+|(?:figure|table)\s+\d+)\b", re.IGNORECASE)
++_NON_HEADING_PREFIX_RE = re.compile(
++    r"^(?:\u5176\u4e2d|\u5f0f\u4e2d|\u7531\u4e8e|\u5982\u679c|\u5bf9\u4e8e|\u5047\u8bbe|"
++    r"\u901a\u8fc7|\u6839\u636e|\u8ba1\u7b97|\u5219|therefore|where|assuming|because)\b",
++    re.IGNORECASE,
++)
++_SEMANTIC_HEADING_RE = re.compile(
++    r"(?:"
++    r"\u76ee\u5f55|\u6458\u8981|\u524d\u8a00|\u5f15\u8a00|\u80cc\u666f|\u76ee\u7684|\u8303\u56f4|"
++    r"\u672f\u8bed(?:\u548c\u7f29\u7565\u8bed)?|\u53c2\u8003(?:\u8d44\u6599|\u6587\u732e)|"
++    r"\u603b\u7ed3|\u7ed3\u8bba|\u9644\u5f55|\u81f4\u8c22|"
++    r"[\u4e00-\u9fffA-Za-z0-9()\uff08\uff09_-]{0,32}"
++    r"(?:\u8bbe\u8ba1|\u65b9\u6cd5|\u6a21\u5757|\u6d41\u7a0b|\u5206\u6790|\u66f4\u65b0|"
++    r"\u6ee4\u6ce2|\u878d\u5408|\u63a5\u53e3|\u6982\u8ff0|\u8bf4\u660e|\u8981\u6c42|"
++    r"\u63cf\u8ff0|\u539f\u7406|\u65b9\u6848|\u65b9\u7a0b|\u6b65\u9aa4|\u67b6\u6784|"
++    r"\u5254\u9664|\u68c0\u6d4b|\u5904\u7406|\u63a7\u5236|\u90e8\u7f72|\u5b9e\u73b0|\u9a8c\u8bc1)|"
++    r"overview|introduction|background|purpose|scope|definitions?|methods?|procedure|results?|"
++    r"discussion|summary|conclusions?|appendix|references?|acknowledg(?:e)?ments?"
++    r")$",
++    re.IGNORECASE,
++)
++
++_NUMBERED_PATTERNS: tuple[tuple[re.Pattern[str], Any], ...] = (
++    (re.compile(r"^(?P<prefix>#{1,6}\s+)(?P<body>.+)$"), lambda match: len(match.group("prefix").strip())),
++    (
++        re.compile(
++            r"^(?P<prefix>\u7b2c[\u96f6\u3007\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u767e\u5343\d]+"
++            r"(?:\u7ae0|\u7bc7|\u90e8\u5206)\s*)(?P<body>.*)$"
++        ),
++        lambda _match: 1,
++    ),
++    (
++        re.compile(
++            r"^(?P<prefix>\u7b2c[\u96f6\u3007\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u767e\u5343\d]+"
++            r"(?:\u8282|\u6761)\s*)(?P<body>.*)$"
++        ),
++        lambda _match: 2,
++    ),
++    (
++        re.compile(r"^(?P<prefix>\d+(?:[.\uff0e]\d+)*(?:[)\uff09\u3001.\uff0e]|\s+)\s*)(?P<body>.+)$"),
++        lambda match: max(1, len(re.findall(r"[.\uff0e]", match.group("prefix"))) + 1),
++    ),
++    (
++        re.compile(
++            r"^(?P<prefix>[\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u767e]+[\u3001.\uff0e]\s*)"
++            r"(?P<body>.+)$"
++        ),
++        lambda _match: 1,
++    ),
++    (
++        re.compile(
++            r"^(?P<prefix>[\uff08(][\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u767e]+[\uff09)]\s*)"
++            r"(?P<body>.+)$"
++        ),
++        lambda _match: 2,
++    ),
++    (re.compile(r"^(?P<prefix>[\uff08(]\d+[\uff09)]\s*)(?P<body>.+)$"), lambda _match: 3),
++    (re.compile(r"^(?P<prefix>[\u2460-\u2473]\s*)(?P<body>.+)$"), lambda _match: 3),
++    (re.compile(r"^(?P<prefix>[IVXLCDM]+[.)\uff09\u3001]\s*)(?P<body>.+)$"), lambda _match: 2),
++    (re.compile(r"^(?P<prefix>[A-Za-z][.)\uff09\u3001]\s*)(?P<body>.+)$"), lambda _match: 3),
++)
++
++
++def _clean_title(value: Any) -> str:
++    text = html.unescape(str(value or ""))
++    text = _HTML_TAG_RE.sub(" ", text)
++    text = text.replace("\u200b", "").replace("\ufeff", "").replace("\u3000", " ")
++    text = re.sub(r"[\ue000-\uf8ff]", "", text)
++    text = _SPACE_RE.sub(" ", text).strip(" \t\r\n-\u2013\u2014")
++    return text.rstrip(" \uff1a:")
++
++
++def _match_text(value: Any) -> str:
++    return _MATCH_SPACE_RE.sub("", _clean_title(value)).casefold()
++
++
++def _looks_like_formula(text: str) -> bool:
++    lowered = text.casefold()
++    if not text or text.startswith("$") or "\\begin" in lowered or "[word equation" in lowered:
++        return True
++    math_chars = sum(text.count(char) for char in "\\{}_=^$")
++    return math_chars >= 5 and math_chars / max(1, len(text)) > 0.08
++
++
++def _valid_title(title: str, numbered: bool = False) -> bool:
++    if len(title) < 2 or len(title) > MAX_TITLE_CHARS or _looks_like_formula(title):
++        return False
++    if _FIGURE_OR_TABLE_RE.match(title) or "[Word inline image/formula]" in title:
++        return False
++    if not numbered and (_NON_HEADING_PREFIX_RE.match(title) or re.search(r"[\u3002\uff01\uff1f!?;\uff1b]$", title)):
++        return False
++    if re.fullmatch(r"[\d\W_]+", title):
++        return False
++    return True
++
++
++def _numbered_title(line: str) -> tuple[str, int] | None:
++    for pattern, level_getter in _NUMBERED_PATTERNS:
++        match = pattern.match(line)
++        if not match:
++            continue
++        prefix = _SPACE_RE.sub(" ", match.group("prefix")).strip()
++        body = _SPACE_RE.sub(" ", match.group("body") or "").strip()
++        if body:
++            boundary = _SENTENCE_PUNCTUATION_RE.search(body)
++            if boundary and (len(body) > 40 or boundary.group(0) in {":", "\uff1a"}):
++                body = body[: boundary.start()].strip()
++        title = _clean_title(f"{prefix}{body}")
++        if _valid_title(title, numbered=True):
++            return title, max(1, min(6, int(level_getter(match))))
++    return None
++
++
++def _semantic_title(line: str) -> str | None:
++    title = _clean_title(line)
++    if len(title) > 48 or len(title.split()) > 12:
++        return None
++    if re.search(r"[,\uff0c\u3002\uff01\uff1f!?;\uff1b]", title):
++        return None
++    if not _SEMANTIC_HEADING_RE.fullmatch(title) or not _valid_title(title):
++        return None
++    return title
++
++
++def _candidate(title: str, chunk_id: int, level: int, offset: int, source: str, path_key: str = "") -> dict[str, Any]:
++    return {
++        "title": title,
++        "chunk_id": chunk_id,
++        "level": max(1, min(6, int(level))),
++        "offset": max(0, int(offset)),
++        "source": source,
++        "path_key": path_key,
++    }
++
++
++def _outline_candidates(chunks: list[str], outline: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
++    if not outline:
++        return []
++    searchable = [_match_text(chunk) for chunk in chunks]
++    raw_depths = []
++    for item in outline:
++        try:
++            raw_depths.append(int(item.get("depth", item.get("level", 1))))
++        except (TypeError, ValueError, AttributeError):
++            continue
++    zero_based = bool(raw_depths) and min(raw_depths) == 0
++    candidates = []
++    cursor = 0
++    for item in outline:
++        if not isinstance(item, dict):
++            continue
++        title = _clean_title(item.get("title"))
++        needle = _match_text(title)
++        if not needle or not _valid_title(title):
++            continue
++        try:
++            depth = int(item.get("depth", item.get("level", 1))) + (1 if zero_based else 0)
++        except (TypeError, ValueError):
++            depth = 1
++        match_index = None
++        for index in range(max(0, cursor - 1), len(searchable)):
++            if needle in searchable[index]:
++                match_index = index
++                break
++        if match_index is None:
++            for index, content in enumerate(searchable):
++                if needle in content:
++                    match_index = index
++                    break
++        if match_index is None:
++            continue
++        cursor = match_index
++        candidates.append(_candidate(title, match_index, depth, chunks[match_index].find(title), "outline"))
++    return candidates
++
++
++def _caption_candidates(content: str, chunk_id: int) -> list[dict[str, Any]]:
++    candidates = []
++    for match in _CAPTION_RE.finditer(content):
++        path = [_clean_title(part) for part in re.split(r"\s+>\s+", html.unescape(match.group(1)))]
++        path = [part for part in path if part]
++        if len(path) < 2:
++            continue
++        # The first component is the document name, not a section heading.
++        path = path[1:]
++        for index, title in enumerate(path):
++            if not _valid_title(title):
++                continue
++            path_key = " > ".join(_match_text(part) for part in path[: index + 1])
++            candidates.append(_candidate(title, chunk_id, index + 1, match.start(), "caption", path_key))
++    return candidates
++
++
++def _text_candidates(content: str, chunk_id: int) -> list[dict[str, Any]]:
++    if not content:
++        return []
++    candidates = _caption_candidates(content, chunk_id)
++    if re.match(r"^\s*<table\b", content, re.IGNORECASE):
++        return candidates
++    text = _FORMULA_BLOCK_RE.sub("\n", content)
++    text = _WORD_FORMULA_RE.sub(" ", text)
++    text = _HTML_TAG_RE.sub("\n", text)
++    search_from = 0
++    for raw_line in text.splitlines():
++        line = _clean_title(raw_line)
++        if not line or _looks_like_formula(line):
++            continue
++        offset = content.find(raw_line, search_from)
++        if offset < 0:
++            offset = search_from
++        search_from = max(search_from, offset + len(raw_line))
++        numbered = _numbered_title(line)
++        if numbered:
++            title, level = numbered
++            candidates.append(_candidate(title, chunk_id, level, offset, "numbered"))
++            continue
++        title = _semantic_title(line)
++        if title:
++            candidates.append(_candidate(title, chunk_id, 1, offset, "semantic"))
++    return candidates
++
++
++def _dedupe_and_normalize(candidates: list[dict[str, Any]]) -> list[dict[str, str]]:
++    priorities = {"outline": 0, "numbered": 1, "semantic": 2, "caption": 3}
++    candidates.sort(key=lambda item: (item["chunk_id"], item["offset"], priorities.get(item["source"], 9)))
++    seen_in_chunk = set()
++    seen_caption_paths = set()
++    recent_title: dict[tuple[str, int], int] = {}
++    filtered = []
++    for item in candidates:
++        normalized_title = _match_text(item["title"])
++        in_chunk_key = (normalized_title, item["chunk_id"])
++        if in_chunk_key in seen_in_chunk:
++            continue
++        if item["source"] == "caption" and item["path_key"]:
++            if item["path_key"] in seen_caption_paths:
++                continue
++            seen_caption_paths.add(item["path_key"])
++        recent_key = (normalized_title, item["level"])
++        previous_chunk = recent_title.get(recent_key)
++        if previous_chunk is not None and item["chunk_id"] - previous_chunk <= 1:
++            continue
++        seen_in_chunk.add(in_chunk_key)
++        recent_title[recent_key] = item["chunk_id"]
++        filtered.append(item)
++        if len(filtered) >= MAX_TOC_ENTRIES:
++            break
++
++    if not filtered:
++        return []
++    level_shift = max(0, int(filtered[0]["level"]) - 1)
++    result = []
++    previous_level = 1
++    inferred_level_by_raw: dict[int, int] = {}
++    for index, item in enumerate(filtered):
++        raw_level = int(item["level"])
++        level = inferred_level_by_raw.get(raw_level, max(1, raw_level - level_shift))
++        if index and level > previous_level + 1:
++            level = previous_level + 1
++        inferred_level_by_raw.setdefault(raw_level, level)
++        previous_level = level
++        result.append({"level": str(level), "title": item["title"], "chunk_id": str(item["chunk_id"])})
++    return result
++
++
++def build_local_toc(chunks: list[str], outline: list[dict[str, Any]] | None = None) -> list[dict[str, str]]:
++    normalized_chunks = [str(chunk or "") for chunk in chunks]
++    candidates = _outline_candidates(normalized_chunks, outline)
++    for chunk_id, content in enumerate(normalized_chunks):
++        candidates.extend(_text_candidates(content, chunk_id))
++    structural_candidates = [item for item in candidates if item["source"] != "caption"]
++    if outline or len(structural_candidates) >= 3:
++        candidates = structural_candidates
++    return _dedupe_and_normalize(candidates)
+diff --git a/rag/app/naive.py b/rag/app/naive.py
+index 6ba2c9b..b0ba5a2 100644
+--- a/rag/app/naive.py
++++ b/rag/app/naive.py
+@@ -396,12 +396,28 @@ class Docx(DocxParser):
+ 
+     def __init__(self):
+         self._equation_native_cache = {}
++        self.outlines = []
+ 
+     def __clean(self, line):
+         line = "" if line is None else str(line)
+         line = re.sub(r"\u3000", " ", line).strip()
+         return line
+ 
++    def __heading_level(self, paragraph):
++        style_name = paragraph.style.name if paragraph.style else ""
++        style_match = re.search(r"(?:Heading|\u6807\u9898)\s*(\d+)", style_name, re.I)
++        if style_match:
++            return max(1, min(9, int(style_match.group(1))))
++        try:
++            outline_nodes = paragraph._element.xpath("./w:pPr/w:outlineLvl")
++            if outline_nodes:
++                value = self.__attr(outline_nodes[0], "val")
++                if value is not None:
++                    return max(1, min(9, int(value) + 1))
++        except (TypeError, ValueError):
++            pass
++        return None
++
+     def __attr(self, element, *names):
+         wanted = set(names)
+         for key, value in element.attrib.items():
+@@ -735,6 +751,7 @@ class Docx(DocxParser):
+ 
+     def __call__(self, filename, binary=None, from_page=0, to_page=MAXIMUM_PAGE_NUMBER):
+         self.doc = Document(filename) if not binary else Document(BytesIO(binary))
++        self.outlines = []
+         pn = 0
+         lines = []
+         last_image = None
+@@ -773,6 +790,9 @@ class Docx(DocxParser):
+                     style_name = p.style.name if p.style else ""
+ 
+                     if text:
++                        heading_level = self.__heading_level(p)
++                        if heading_level:
++                            self.outlines.append({"title": self.__clean(text), "depth": heading_level})
+                         if style_name == "Caption":
+                             former_image = None
+ 
+@@ -1242,7 +1262,8 @@ def chunk(filename, binary=None, from_page=0, to_page=MAXIMUM_PAGE_NUMBER, lang=
+         _SerializedRelationships.load_from_xml = load_from_xml_v2
+ 
+         # sections = (text, image, tables)
+-        sections = Docx()(filename, binary)
++        docx_parser = Docx()
++        sections = docx_parser(filename, binary)
+         sections = _normalize_section_text_for_rtl_presentation_forms(sections)
+ 
+         # chunks list[dict]
+@@ -1256,6 +1277,8 @@ def chunk(filename, binary=None, from_page=0, to_page=MAXIMUM_PAGE_NUMBER, lang=
+         st = timer()
+ 
+         res.extend(doc_tokenize_chunks_with_images(chunks, doc, is_english, child_delimiters_pattern=child_deli))
++        if res and docx_parser.outlines:
++            res[0]["__outline__"] = docx_parser.outlines
+         logging.info("naive_merge({}): {}".format(filename, timer() - st))
+         res.extend(embed_res)
+         res.extend(url_res)
+diff --git a/rag/prompts/generator.py b/rag/prompts/generator.py
+--- a/rag/prompts/generator.py
++++ b/rag/prompts/generator.py
+@@ -777,7 +777,7 @@ async def assign_toc_levels(toc_secs, chat_mdl, gen_conf={"temperature": 0.2}):
+ TOC_FROM_TEXT_SYSTEM = load_prompt("toc_from_text_system")
+ TOC_FROM_TEXT_USER = load_prompt("toc_from_text_user")
+ TOC_INPUT_BUDGET = max(512, int(os.environ.get("LOCALMATHRAG_TOC_INPUT_BUDGET", "4096")))
+-TOC_MAX_OUTPUT_TOKENS = max(64, int(os.environ.get("LOCALMATHRAG_TOC_MAX_OUTPUT_TOKENS", "512")))
++TOC_MAX_OUTPUT_TOKENS = max(64, int(os.environ.get("LOCALMATHRAG_TOC_MAX_OUTPUT_TOKENS", "256")))
+ TOC_MAX_CONCURRENT_REQUESTS = max(1, int(os.environ.get("LOCALMATHRAG_TOC_MAX_CONCURRENT_REQUESTS", "1")))
+ TOC_REQUEST_TIMEOUT_SECONDS = max(5.0, float(os.environ.get("LOCALMATHRAG_TOC_REQUEST_TIMEOUT_SECONDS", "45")))
+diff --git a/rag/svr/localmathrag_toc_queue.py b/rag/svr/localmathrag_toc_queue.py
+index 4bd90c9..437fc54 100644
+--- a/rag/svr/localmathrag_toc_queue.py
++++ b/rag/svr/localmathrag_toc_queue.py
+@@ -12,6 +12,7 @@ from datetime import datetime
+ import xxhash
+ 
+ from api.db.joint_services.tenant_model_service import get_model_config_from_provider_instance
++from api.db.services.doc_metadata_service import DocMetadataService
+ from api.db.services.document_service import DocumentService
+ from api.db.services.llm_service import LLMBundle
+ from api.db.services.task_service import TaskService, has_canceled
+@@ -19,7 +20,8 @@ from common import settings
+ from common.constants import LLMType
+ from common.misc_utils import thread_pool_exec
+ from rag.nlp import search
+-from rag.prompts.generator import run_toc_from_text
++from rag.prompts.generator import assign_toc_levels, run_toc_from_text
++from rag.svr.localmathrag_toc_builder import build_local_toc
+ from rag.utils.redis_conn import REDIS_CONN
+ 
+ 
+@@ -30,6 +32,18 @@ TOC_MAX_RETRIES = max(0, int(os.environ.get("LOCALMATHRAG_TOC_QUEUE_MAX_RETRIES"
+ TOC_PENDING_IDLE_MS = max(30000, int(os.environ.get("LOCALMATHRAG_TOC_QUEUE_PENDING_IDLE_SECONDS", "120")) * 1000)
+ TOC_QUEUE_TIMEOUT_SECONDS = max(30.0, float(os.environ.get("LOCALMATHRAG_TOC_QUEUE_TIMEOUT_SECONDS", "300")))
+ TOC_RECOVERY_INTERVAL_SECONDS = max(5.0, float(os.environ.get("LOCALMATHRAG_TOC_QUEUE_RECOVERY_INTERVAL_SECONDS", "30")))
++TOC_LEVEL_MAX_OUTPUT_TOKENS = max(64, int(os.environ.get("LOCALMATHRAG_TOC_LEVEL_MAX_OUTPUT_TOKENS", "256")))
++
++
++def _env_enabled(name: str, default: bool = False) -> bool:
++    value = os.environ.get(name)
++    if value is None:
++        return default
++    return str(value).strip().lower() in {"1", "true", "yes", "on"}
++
++
++TOC_USE_LLM_LEVELS = _env_enabled("LOCALMATHRAG_TOC_USE_LLM_LEVELS", False)
++TOC_LLM_FALLBACK = _env_enabled("LOCALMATHRAG_TOC_LLM_FALLBACK", False)
+ 
+ 
+ def _dedupe_key(task_id: str) -> str:
+@@ -129,17 +143,78 @@ async def _load_source_chunks(job: dict) -> tuple[list[dict], list[dict]]:
+     return source, existing_toc
+ 
+ 
+-async def _build_toc_chunk(job: dict, docs: list[dict]) -> dict | None:
+-    if not docs:
+-        return None
++async def _load_document_outline(job: dict) -> list[dict]:
++    try:
++        metadata = await thread_pool_exec(DocMetadataService.get_document_metadata, job["doc_id"])
++    except Exception as e:
++        logging.info("Unable to load document outline for local TOC %s: %s", job["doc_id"], e)
++        return []
++    outline = metadata.get("outline") if isinstance(metadata, dict) else None
++    return outline if isinstance(outline, list) else []
++
++
++async def _chat_model(job: dict):
+     model_config = get_model_config_from_provider_instance(job["tenant_id"], LLMType.CHAT, job["llm_id"])
+-    with LLMBundle(job["tenant_id"], model_config, lang=job.get("language") or "Chinese") as chat_mdl:
+-        toc = await asyncio.wait_for(
+-            run_toc_from_text([doc["content_with_weight"] for doc in docs], chat_mdl),
++    return LLMBundle(job["tenant_id"], model_config, lang=job.get("language") or "Chinese")
++
++
++async def _refine_local_levels(job: dict, toc: list[dict]) -> list[dict]:
++    if not toc or not TOC_USE_LLM_LEVELS:
++        return toc
++    try:
++        chat_mdl = await _chat_model(job)
++        with chat_mdl:
++            levels = await asyncio.wait_for(
++                assign_toc_levels(
++                    [item["title"] for item in toc],
++                    chat_mdl,
++                    {"temperature": 0.0, "top_p": 0.9, "max_tokens": TOC_LEVEL_MAX_OUTPUT_TOKENS},
++                ),
++                timeout=TOC_QUEUE_TIMEOUT_SECONDS,
++            )
++        if not isinstance(levels, list) or len(levels) != len(toc):
++            return toc
++        refined = copy.deepcopy(toc)
++        for index, item in enumerate(levels):
++            if isinstance(item, dict) and str(item.get("level") or "").isdigit():
++                refined[index]["level"] = str(max(1, min(9, int(item["level"]))))
++        return refined
++    except Exception as e:
++        logging.warning("Optional TOC level refinement failed; using local levels: %s", e)
++        return toc
++
++
++async def _generate_toc(job: dict, docs: list[dict], outline: list[dict]) -> list[dict]:
++    contents = [doc.get("content_with_weight") or "" for doc in docs]
++    toc = build_local_toc(contents, outline)
++    if toc:
++        job["_toc_mode"] = "local+llm-levels" if TOC_USE_LLM_LEVELS else "local"
++        toc = await _refine_local_levels(job, toc)
++        logging.info("Built local TOC for %s with %d entries", job["doc_id"], len(toc))
++        return toc
++    if not TOC_LLM_FALLBACK:
++        job["_toc_mode"] = "local"
++        logging.info("No structural headings found for local TOC %s", job["doc_id"])
++        return []
++
++    job["_toc_mode"] = "llm-fallback"
++    chat_mdl = await _chat_model(job)
++    with chat_mdl:
++        return await asyncio.wait_for(
++            run_toc_from_text(contents, chat_mdl),
+             timeout=TOC_QUEUE_TIMEOUT_SECONDS,
+         )
+-    for index, item in enumerate(toc):
+-        chunk_value = item.pop("chunk_id", None)
++
++
++async def _build_toc_chunk(job: dict, docs: list[dict], outline: list[dict]) -> dict | None:
++    if not docs:
++        return None
++    toc = await _generate_toc(job, docs, outline)
++    valid_items = []
++    for item in toc:
++        if not isinstance(item, dict):
++            continue
++        chunk_value = item.get("chunk_id")
+         if chunk_value is None or str(chunk_value).strip() == "":
+             continue
+         try:
+@@ -148,17 +223,18 @@ async def _build_toc_chunk(job: dict, docs: list[dict]) -> dict | None:
+             continue
+         if current < 0 or current >= len(docs):
+             continue
+-        item["ids"] = [docs[current]["id"]]
+-        if index + 1 < len(toc):
+-            try:
+-                following = int(toc[index + 1].get("chunk_id", current))
+-            except (TypeError, ValueError):
+-                following = current
+-            item["ids"].extend(docs[pos]["id"] for pos in range(current + 1, min(following + 1, len(docs))))
+-    if not toc:
++        valid_items.append((current, {key: value for key, value in item.items() if key != "chunk_id"}))
++    mapped_toc = []
++    for index, (current, item) in enumerate(valid_items):
++        following = valid_items[index + 1][0] if index + 1 < len(valid_items) else len(docs)
++        section_end = max(current + 1, min(following, len(docs)))
++        item["ids"] = [docs[pos]["id"] for pos in range(current, section_end)]
++        mapped_toc.append(item)
++    job["_toc_entries"] = len(mapped_toc)
++    if not mapped_toc:
+         return None
+     chunk = copy.deepcopy(docs[-1])
+-    chunk["content_with_weight"] = json.dumps(toc, ensure_ascii=False)
++    chunk["content_with_weight"] = json.dumps(mapped_toc, ensure_ascii=False)
+     chunk["toc_kwd"] = "toc"
+     chunk["available_int"] = 0
+     chunk["page_num_int"] = [100000000]
+@@ -167,12 +243,14 @@ async def _build_toc_chunk(job: dict, docs: list[dict]) -> dict | None:
+ 
+ 
+ async def _store_toc_chunk(job: dict, chunk: dict | None, existing_toc: list[dict]) -> None:
+-    if chunk is None:
+-        return
+     index_name = search.index_name(job["tenant_id"])
+     existing_ids = [item["id"] for item in existing_toc if item.get("id")]
+     if existing_ids:
+         await thread_pool_exec(settings.docStoreConn.delete, {"id": existing_ids}, index_name, [job["kb_id"]])
++    if chunk is None:
++        if existing_ids:
++            await thread_pool_exec(DocumentService.decrement_chunk_num, job["doc_id"], job["kb_id"], 0, len(existing_ids), 0)
++        return
+     result = await thread_pool_exec(settings.docStoreConn.insert, [chunk], index_name, job["kb_id"])
+     if result:
+         raise RuntimeError(f"Insert background TOC chunk failed: {result}")
+@@ -186,7 +264,8 @@ async def _process_toc_job(job: dict) -> bool:
+     if has_canceled(job["task_id"]):
+         return False
+     docs, existing_toc = await _load_source_chunks(job)
+-    toc_chunk = await _build_toc_chunk(job, docs)
++    outline = await _load_document_outline(job)
++    toc_chunk = await _build_toc_chunk(job, docs, outline)
+     if has_canceled(job["task_id"]):
+         return False
+     await _store_toc_chunk(job, toc_chunk, existing_toc)
+@@ -221,7 +300,9 @@ async def toc_queue_worker(consumer_name: str) -> None:
+         try:
+             completed = await _process_toc_job(job)
+             if completed:
+-                await _append_task_message(task_id, "Background TOC generation done.")
++                mode = job.get("_toc_mode") or "local"
++                entries = int(job.get("_toc_entries", 0) or 0)
++                await _append_task_message(task_id, f"Background TOC generation done ({mode}, {entries} entries).")
+         except asyncio.CancelledError:
+             acknowledge = False
+             raise

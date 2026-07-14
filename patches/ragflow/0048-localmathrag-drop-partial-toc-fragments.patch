@@ -1,0 +1,37 @@
+diff --git a/rag/svr/localmathrag_toc_builder.py b/rag/svr/localmathrag_toc_builder.py
+index 44864fb..262c94f 100644
+--- a/rag/svr/localmathrag_toc_builder.py
++++ b/rag/svr/localmathrag_toc_builder.py
+@@ -350,6 +350,24 @@ def _resolve_rendered_toc(candidates: list[dict[str, Any]], chunks: list[str]) -
+     return resolved if len(resolved) >= required_matches else []
+ 
+ 
++def _drop_unresolved_toc_fragments(candidates: list[dict[str, Any]], chunks: list[str]) -> list[dict[str, Any]]:
++    if not chunks:
++        return candidates
++    leading_chunk_limit = min(len(chunks), max(4, (len(chunks) + 9) // 10))
++    leading_text = "\n".join(chunks[:leading_chunk_limit])
++    if not re.search(r"(?:\u76ee\s*\u5f55|\bcontents\b)", leading_text, re.IGNORECASE):
++        return candidates
++    return [
++        item
++        for item in candidates
++        if not (
++            item["chunk_id"] < leading_chunk_limit
++            and item["source"] in {"numbered", "semantic"}
++            and _strip_trailing_page_number(item["title"])[1] is not None
++        )
++    ]
++
++
+ def _dedupe_and_normalize(candidates: list[dict[str, Any]]) -> list[dict[str, str]]:
+     priorities = {"rendered_toc": 0, "outline": 1, "numbered": 2, "semantic": 3, "caption": 4}
+     candidates.sort(key=lambda item: (item["chunk_id"], item["offset"], priorities.get(item["source"], 9)))
+@@ -401,6 +419,7 @@ def build_local_toc(chunks: list[str], outline: list[dict[str, Any]] | None = No
+     rendered_toc = _resolve_rendered_toc(text_candidates, normalized_chunks)
+     if rendered_toc:
+         return _dedupe_and_normalize(rendered_toc)
++    text_candidates = _drop_unresolved_toc_fragments(text_candidates, normalized_chunks)
+     candidates = _outline_candidates(normalized_chunks, outline)
+     candidates.extend(text_candidates)
+     structural_candidates = [item for item in candidates if item["source"] != "caption"]

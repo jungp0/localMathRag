@@ -1,0 +1,161 @@
+diff --git a/deepdoc/parser/figure_parser.py b/deepdoc/parser/figure_parser.py
+--- a/deepdoc/parser/figure_parser.py
++++ b/deepdoc/parser/figure_parser.py
+@@ -14,10 +14,12 @@
+ #
+ from concurrent.futures import ThreadPoolExecutor, as_completed
++import base64
+ import json
+ import logging
+ import os
++import time
++from io import BytesIO
+ import urllib.request
+ 
+ from PIL import Image
+@@ -33,6 +35,8 @@ from rag.utils.lazy_image import ensure_pil_image, open_image_for_processing, is
+ 
+ OBJECT_SERVICE_URL = os.environ.get("LOCALMATHRAG_OBJECT_SERVICE_URL", "http://localmathrag-object-service:8088").rstrip("/")
+ VISION_READY_TIMEOUT_SECONDS = float(os.environ.get("LOCALMATHRAG_VISION_READY_TIMEOUT_SECONDS", "75"))
++MATH_OCR_URL = (os.environ.get("LOCALMATHRAG_MATH_OCR_URL") or f"{OBJECT_SERVICE_URL}/v1/math-ocr").rstrip("/")
++MATH_OCR_STATUS_URL = os.environ.get("LOCALMATHRAG_MATH_OCR_STATUS_URL", f"{OBJECT_SERVICE_URL}/v1/math-ocr/status").rstrip("/")
++MATH_OCR_TIMEOUT_SECONDS = float(os.environ.get("LOCALMATHRAG_MATH_OCR_TIMEOUT_SECONDS", "3"))
++MATH_OCR_STATUS_TIMEOUT_SECONDS = float(os.environ.get("LOCALMATHRAG_MATH_OCR_STATUS_TIMEOUT_SECONDS", "0.5"))
++MATH_OCR_STATUS_CACHE_SECONDS = float(os.environ.get("LOCALMATHRAG_MATH_OCR_STATUS_CACHE_SECONDS", "30"))
++_MATH_OCR_STATUS_CHECKED_AT = 0.0
++_MATH_OCR_STATUS_READY = False
+ 
+ 
+ def _runtime_ensure_url() -> str:
+@@ -43,6 +47,94 @@ def _vision_enhancement_enabled() -> bool:
+     return enabled.strip().lower() in {"1", "true", "yes", "on"}
+ 
+ 
++def _math_ocr_enabled() -> bool:
++    enabled = os.environ.get("LOCALMATHRAG_ENABLE_MATH_OCR", "")
++    normalized = enabled.strip().lower()
++    if bool(os.environ.get("LOCALMATHRAG_MATH_OCR_URL")) or normalized in {"1", "true", "yes", "on"}:
++        return True
++    if normalized in {"auto", ""}:
++        return _math_ocr_service_ready()
++    return False
++
++
++def _math_ocr_service_ready() -> bool:
++    global _MATH_OCR_STATUS_CHECKED_AT, _MATH_OCR_STATUS_READY
++    now = time.monotonic()
++    if now - _MATH_OCR_STATUS_CHECKED_AT < MATH_OCR_STATUS_CACHE_SECONDS:
++        return _MATH_OCR_STATUS_READY
++    _MATH_OCR_STATUS_CHECKED_AT = now
++    try:
++        with urllib.request.urlopen(MATH_OCR_STATUS_URL, timeout=MATH_OCR_STATUS_TIMEOUT_SECONDS) as response:
++            data = json.loads(response.read().decode("utf-8"))
++        _MATH_OCR_STATUS_READY = bool(data.get("configured") or data.get("endpoint_ok"))
++    except Exception as e:
++        logging.info("Math OCR auto check skipped: %s", e)
++        _MATH_OCR_STATUS_READY = False
++    return _MATH_OCR_STATUS_READY
++
++
++def _image_to_png_base64(img):
++    if img.mode not in {"RGB", "L"}:
++        img = img.convert("RGB")
++    buffer = BytesIO()
++    img.save(buffer, format="PNG")
++    return base64.b64encode(buffer.getvalue()).decode("ascii")
++
++
++def _first_math_ocr_text(data):
++    if isinstance(data, str):
++        return data.strip()
++    if isinstance(data, dict):
++        for key in ("latex", "text", "formula", "markdown"):
++            value = data.get(key)
++            if isinstance(value, str) and value.strip():
++                return value.strip()
++        for key in ("result", "data", "results"):
++            value = data.get(key)
++            text = _first_math_ocr_text(value)
++            if text:
++                return text
++    if isinstance(data, list):
++        for value in data:
++            text = _first_math_ocr_text(value)
++            if text:
++                return text
++    return ""
++
++
++def _math_ocr_image(img, context_text=""):
++    if not _math_ocr_enabled():
++        return ""
++    payload = json.dumps(
++        {
++            "image": _image_to_png_base64(img),
++            "mime_type": "image/png",
++            "format": "png",
++            "task": "formula",
++            "context": context_text or "",
++        }
++    ).encode("utf-8")
++    req = urllib.request.Request(
++        MATH_OCR_URL,
++        data=payload,
++        headers={"Content-Type": "application/json"},
++        method="POST",
++    )
++    with urllib.request.urlopen(req, timeout=MATH_OCR_TIMEOUT_SECONDS) as response:
++        data = json.loads(response.read().decode("utf-8"))
++    return _first_math_ocr_text(data)
++
++
++def _append_chunk_text(ck, text):
++    if text:
++        ck["text"] = (ck.get("text") or "").rstrip() + "\n" + text
++
++
++def _enhance_docx_chunks_with_math_ocr(chunks, idx_lst, callback=None):
++    if not _math_ocr_enabled():
++        return
++    if callback:
++        callback(0.69, "Local Math OCR enabled. Parsing Word formula images...")
++    for idx in idx_lst:
++        try:
++            ck = chunks[idx]
++        except Exception:
++            continue
++        img = None
++        close_after = False
++        try:
++            img, close_after = open_image_for_processing(ck.get("image"), allow_bytes=True)
++            if not isinstance(img, Image.Image):
++                continue
++            context_text = " ".join(
++                text
++                for text in (ck.get("context_above"), ck.get("text"), ck.get("context_below"))
++                if text
++            )
++            latex = _math_ocr_image(img, context_text=context_text)
++            if latex:
++                _append_chunk_text(ck, f"[Math OCR LaTeX: {latex}]")
++        except Exception as e:
++            logging.warning("Math OCR skipped for one Word image: %s", e)
++        finally:
++            if close_after and isinstance(img, Image.Image):
++                try:
++                    img.close()
++                except Exception:
++                    pass
++
++
+ def _ensure_vision_runtime(callback=None) -> bool:
+     payload = json.dumps({"kind": "vision", "timeout_seconds": VISION_READY_TIMEOUT_SECONDS, "start": True}).encode("utf-8")
+     req = urllib.request.Request(
+@@ -196,6 +288,7 @@ def vision_figure_parser_docx_wrapper_naive(chunks, idx_lst, callback=None, **k
+ def vision_figure_parser_docx_wrapper_naive(chunks, idx_lst, callback=None, **kwargs):
+     if not chunks or not idx_lst:
+         return []
++    _enhance_docx_chunks_with_math_ocr(chunks, idx_lst, callback)
+     vision_model = _get_ready_vision_model(kwargs, callback)
+     if vision_model:
+         @timeout(30, 3)

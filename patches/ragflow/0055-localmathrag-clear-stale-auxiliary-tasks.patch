@@ -1,0 +1,156 @@
+diff --git a/rag/svr/localmathrag_priority_queue.py b/rag/svr/localmathrag_priority_queue.py
+--- a/rag/svr/localmathrag_priority_queue.py
++++ b/rag/svr/localmathrag_priority_queue.py
+@@ -3,6 +3,8 @@
+ 
+ from __future__ import annotations
+ 
++import json
++import logging
+ import os
+ 
+ from common import settings
+@@ -24,6 +26,90 @@
+     task_type = str(message.get("task_type") or "")
+     priority = AUXILIARY_INDEX_PRIORITY if task_type in AUXILIARY_INDEX_TASK_TYPES else DOCUMENT_PARSE_PRIORITY
+     return settings.get_svr_queue_name(priority, worker_task_type)
++
++
++def _stream_id_tuple(stream_id) -> tuple[int, int]:
++    if isinstance(stream_id, bytes):
++        stream_id = stream_id.decode("utf-8", errors="replace")
++    major, _, minor = str(stream_id or "0-0").partition("-")
++    try:
++        return int(major), int(minor or 0)
++    except ValueError:
++        return 0, 0
++
++
++def remove_stale_auxiliary_index_messages(
++    task_ids: set[str] | None = None,
++    doc_ids: set[str] | None = None,
++    worker_task_type: str = "common",
++) -> set[str]:
++    """Cancel and remove queued/pending auxiliary messages matching a task or dataset."""
++    task_ids = {str(task_id) for task_id in (task_ids or set()) if task_id}
++    doc_ids = {str(doc_id) for doc_id in (doc_ids or set()) if doc_id}
++    if not task_ids and not doc_ids:
++        return set()
++
++    queue_name = settings.get_svr_queue_name(AUXILIARY_INDEX_PRIORITY, worker_task_type)
++    try:
++        groups = REDIS_CONN.REDIS.xinfo_groups(queue_name)
++    except Exception as exc:
++        if "no such key" not in str(exc).lower():
++            logging.warning("Unable to inspect auxiliary queue %s: %s", queue_name, exc)
++        return set()
++
++    group = next((item for item in groups if item.get("name") == SVR_CONSUMER_GROUP_NAME), None)
++    last_delivered_id = (group or {}).get("last-delivered-id", "0-0")
++    pending_ids: set[str] = set()
++    if group:
++        try:
++            pending = REDIS_CONN.REDIS.xpending_range(queue_name, SVR_CONSUMER_GROUP_NAME, "-", "+", 10000)
++            pending_ids = {
++                item.get("message_id").decode("utf-8", errors="replace")
++                if isinstance(item.get("message_id"), bytes)
++                else str(item.get("message_id"))
++                for item in pending
++            }
++        except Exception as exc:
++            logging.warning("Unable to inspect pending auxiliary tasks on %s: %s", queue_name, exc)
++            return set()
++
++    try:
++        entries = REDIS_CONN.REDIS.xrange(queue_name, "-", "+")
++    except Exception as exc:
++        logging.warning("Unable to scan auxiliary queue %s: %s", queue_name, exc)
++        return set()
++
++    matched_task_ids: set[str] = set()
++    pipeline = REDIS_CONN.REDIS.pipeline(transaction=True)
++    for message_id, payload in entries:
++        normalized_message_id = message_id.decode("utf-8", errors="replace") if isinstance(message_id, bytes) else str(message_id)
++        is_pending = normalized_message_id in pending_ids
++        is_queued = _stream_id_tuple(normalized_message_id) > _stream_id_tuple(last_delivered_id)
++        if not is_pending and not is_queued:
++            continue
++        try:
++            raw_message = payload.get("message", payload.get(b"message", "{}"))
++            if isinstance(raw_message, bytes):
++                raw_message = raw_message.decode("utf-8", errors="replace")
++            message = json.loads(raw_message)
++        except (TypeError, ValueError):
++            continue
++        if message.get("task_type") not in AUXILIARY_INDEX_TASK_TYPES:
++            continue
++        message_task_id = str(message.get("id") or "")
++        message_doc_ids = {str(doc_id) for doc_id in (message.get("doc_ids") or []) if doc_id}
++        if message_task_id not in task_ids and not (doc_ids & message_doc_ids):
++            continue
++        matched_task_ids.add(message_task_id)
++        pipeline.set(f"{message_task_id}-cancel", "x")
++        if group:
++            pipeline.xack(queue_name, SVR_CONSUMER_GROUP_NAME, message_id)
++        pipeline.xdel(queue_name, message_id)
++
++    if matched_task_ids:
++        pipeline.execute()
++        logging.info("Removed %d stale auxiliary queue message(s): %s", len(matched_task_ids), sorted(matched_task_ids))
++    return matched_task_ids
+ 
+ 
+ def document_parse_queue_busy(worker_task_type: str = "common") -> bool:
+diff --git a/api/apps/services/dataset_api_service.py b/api/apps/services/dataset_api_service.py
+--- a/api/apps/services/dataset_api_service.py
++++ b/api/apps/services/dataset_api_service.py
+@@ -32,6 +32,7 @@
+ from common.constants import FileSource, StatusEnum
+ from api.utils.api_utils import deep_merge, get_parser_config, remap_dictionary_keys, verify_embedding_availability
+ from api.apps.services.local_dataset_service import refresh_local_dataset
++from rag.svr.localmathrag_priority_queue import remove_stale_auxiliary_index_messages
+ 
+ _VALID_INDEX_TYPES = {"graph", "raptor", "mindmap"}
+ 
+@@ -533,6 +534,13 @@
+     sample_document = documents[0]
+     document_ids = [document["id"] for document in documents]
+ 
++    stale_task_ids = remove_stale_auxiliary_index_messages(
++        task_ids={existing_task_id} if existing_task_id else set(),
++        doc_ids=set(document_ids),
++    )
++    for stale_task_id in stale_task_ids:
++        TaskService.delete_by_id(stale_task_id)
++
+     task_id = queue_raptor_o_graphrag_tasks(sample_doc=sample_document, ty=task_type, priority=0, fake_doc_id=GRAPH_RAPTOR_FAKE_DOC_ID, doc_ids=list(document_ids))
+ 
+     if not KnowledgebaseService.update_by_id(kb.id, {task_id_field: task_id}):
+@@ -869,6 +877,7 @@
+             REDIS_CONN.set(f"{task_id}-cancel", "x")
+         except Exception as e:
+             logging.exception(e)
++        remove_stale_auxiliary_index_messages(task_ids={task_id})
+         TaskService.delete_by_id(task_id)
+ 
+     if wipe and index_type == "graph":
+diff --git a/api/apps/restful_apis/task_api.py b/api/apps/restful_apis/task_api.py
+--- a/api/apps/restful_apis/task_api.py
++++ b/api/apps/restful_apis/task_api.py
+@@ -24,6 +24,7 @@
+     validate_request,
+ )
+ from common.constants import RetCode, TaskStatus
++from rag.svr.localmathrag_priority_queue import remove_stale_auxiliary_index_messages
+ from rag.utils.redis_conn import REDIS_CONN
+ 
+ 
+@@ -65,6 +66,8 @@
+             message="Failed to stop task",
+         )
+ 
++    remove_stale_auxiliary_index_messages(task_ids={task_id})
++
+     exists, task = TaskService.get_by_id(task_id)
+     if not exists:
+         return get_json_result(data=True)

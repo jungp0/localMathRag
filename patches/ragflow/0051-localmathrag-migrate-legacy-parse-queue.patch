@@ -1,0 +1,47 @@
+diff --git a/rag/svr/localmathrag_priority_queue.py b/rag/svr/localmathrag_priority_queue.py
+index ae7516b..a1d534c 100644
+--- a/rag/svr/localmathrag_priority_queue.py
++++ b/rag/svr/localmathrag_priority_queue.py
+@@ -19,6 +19,12 @@ AUXILIARY_INDEX_LOCK_TTL_SECONDS = max(
+ )
+ 
+ 
++def queue_name_for_task(message: dict, worker_task_type: str = "common") -> str:
++    task_type = str(message.get("task_type") or "")
++    priority = AUXILIARY_INDEX_PRIORITY if task_type in AUXILIARY_INDEX_TASK_TYPES else DOCUMENT_PARSE_PRIORITY
++    return settings.get_svr_queue_name(priority, worker_task_type)
++
++
+ def document_parse_queue_busy(worker_task_type: str = "common") -> bool:
+     queue_name = settings.get_svr_queue_name(DOCUMENT_PARSE_PRIORITY, worker_task_type)
+     try:
+diff --git a/rag/svr/task_executor.py b/rag/svr/task_executor.py
+index c6445ea..f5c5d20 100644
+--- a/rag/svr/task_executor.py
++++ b/rag/svr/task_executor.py
+@@ -108,6 +108,7 @@ from rag.svr.localmathrag_priority_queue import (
+     AUXILIARY_INDEX_TASK_TYPES,
+     acquire_auxiliary_index_lease,
+     document_parse_queue_busy,
++    queue_name_for_task,
+     refresh_auxiliary_index_lease,
+     release_auxiliary_index_lease,
+ )
+@@ -1886,9 +1887,17 @@ def requeue_expired_worker_tasks(worker_name: str) -> int:
+                 try:
+                     entries = REDIS_CONN.REDIS.xrange(queue_name, message_id, message_id)
+                     if entries:
++                        payload = entries[0][1]
++                        try:
++                            message = json.loads(payload.get("message", "{}"))
++                        except (TypeError, ValueError):
++                            message = {}
++                        target_queue = queue_name_for_task(message, worker_task_type)
+                         pipeline = REDIS_CONN.REDIS.pipeline(transaction=True)
+-                        pipeline.xadd(queue_name, entries[0][1])
++                        pipeline.xadd(target_queue, payload)
+                         pipeline.xack(queue_name, SVR_CONSUMER_GROUP_NAME, message_id)
++                        pipeline.xdel(queue_name, message_id)
+                         pipeline.execute()
+                         moved += 1
+                 except Exception as e:

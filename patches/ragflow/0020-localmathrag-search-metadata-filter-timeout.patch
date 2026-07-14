@@ -1,0 +1,88 @@
+diff --git a/common/metadata_utils.py b/common/metadata_utils.py
+index a6c6d27..8b8966d 100644
+--- a/common/metadata_utils.py
++++ b/common/metadata_utils.py
+@@ -14,12 +14,21 @@
+ #  limitations under the License.
+ #
+ import ast
++import asyncio
+ import logging
++import os
+ from typing import Any, Callable, Dict
+ 
+ import json_repair
+ 
+ 
++def _localmathrag_metadata_filter_timeout_seconds() -> float:
++    try:
++        return max(0.0, float(os.environ.get("LOCALMATHRAG_SEARCH_METADATA_FILTER_TIMEOUT_SECONDS", "8")))
++    except (TypeError, ValueError):
++        return 8.0
++
++
+ def convert_conditions(metadata_condition):
+     if metadata_condition is None:
+         metadata_condition = {}
+@@ -243,12 +252,38 @@ async def apply_meta_data_filter(
+         logging.debug("Metadata filter falls back to in-memory filter")
+         return meta_filter(_get_metas(), conditions, logic)
+ 
+-    if method == "auto":
+-        filters: dict = await gen_meta_filter(chat_mdl, _get_metas(), question)
+-        logging.debug(f"Metadata filter(auto) generated: {filters}")
+-        doc_ids.extend(_run_metadata_filter(filters["conditions"], filters.get("logic", "and")))
+-        if not doc_ids:
++    async def _gen_meta_filter_safe(source_metas: dict, constraints: dict | None = None) -> dict | None:
++        if not source_metas:
++            logging.info("LocalMathRAG metadata filter skipped: no metadata keys available")
++            return None
++        if chat_mdl is None:
++            logging.info("LocalMathRAG metadata filter skipped: chat model is unavailable")
+             return None
++        timeout_seconds = _localmathrag_metadata_filter_timeout_seconds()
++        kwargs = {"constraints": constraints} if constraints else {}
++        try:
++            if timeout_seconds <= 0:
++                return await gen_meta_filter(chat_mdl, source_metas, question, **kwargs)
++            return await asyncio.wait_for(
++                gen_meta_filter(chat_mdl, source_metas, question, **kwargs),
++                timeout=timeout_seconds,
++            )
++        except TimeoutError:
++            logging.warning(
++                "LocalMathRAG metadata filter generation timed out after %.1fs; continuing without metadata filter",
++                timeout_seconds,
++            )
++        except Exception as e:
++            logging.warning(f"LocalMathRAG metadata filter generation failed; continuing without metadata filter: {e}")
++        return None
++
++    if method == "auto":
++        filters = await _gen_meta_filter_safe(_get_metas())
++        if filters and filters.get("conditions"):
++            logging.debug(f"Metadata filter(auto) generated: {filters}")
++            doc_ids.extend(_run_metadata_filter(filters["conditions"], filters.get("logic", "and")))
++            if not doc_ids:
++                return None
+     elif method == "semi_auto":
+         selected_keys = []
+         constraints = {}
+@@ -266,11 +301,12 @@ async def apply_meta_data_filter(
+             current_metas = _get_metas()
+             filtered_metas = {key: current_metas[key] for key in selected_keys if key in current_metas}
+             if filtered_metas:
+-                filters: dict = await gen_meta_filter(chat_mdl, filtered_metas, question, constraints=constraints)
+-                logging.debug(f"Metadata filter(semi_auto) generated: {filters}")
+-                doc_ids.extend(_run_metadata_filter(filters["conditions"], filters.get("logic", "and")))
+-                if not doc_ids:
+-                    return None
++                filters = await _gen_meta_filter_safe(filtered_metas, constraints=constraints)
++                if filters and filters.get("conditions"):
++                    logging.debug(f"Metadata filter(semi_auto) generated: {filters}")
++                    doc_ids.extend(_run_metadata_filter(filters["conditions"], filters.get("logic", "and")))
++                    if not doc_ids:
++                        return None
+     elif method == "manual":
+         filters = meta_data_filter.get("manual", [])
+         if manual_value_resolver:

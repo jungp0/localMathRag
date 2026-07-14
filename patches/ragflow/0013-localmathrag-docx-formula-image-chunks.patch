@@ -8,17 +8,67 @@ diff --git a/deepdoc/parser/figure_parser.py b/deepdoc/parser/figure_parser.py
 diff --git a/rag/app/naive.py b/rag/app/naive.py
 --- a/rag/app/naive.py
 +++ b/rag/app/naive.py
+@@ -20,0 +20,1 @@ import os
++from html import escape
+@@ -29,0 +30,1 @@ from PIL import Image
++from rag.utils.lazy_image import LazyImage
 @@ -390,0 +390,3 @@ class Docx(DocxParser):
 +    WORD_INLINE_IMAGE_PLACEHOLDER = "[Word inline image/formula]"
 +    WORD_EQUATION_PREFIX = "[Word equation:"
 +
-@@ -396,0 +399,81 @@ class Docx(DocxParser):
-+    def __omml_text(self, element):
-+        def local_name(node):
-+            return node.tag.rsplit("}", 1)[-1]
+@@ -394,5 +399,136 @@ class Docx(DocxParser):
+     def __clean(self, line):
++        line = "" if line is None else str(line)
+         line = re.sub(r"\u3000", " ", line).strip()
+         return line
 +
++    def __attr(self, element, *names):
++        wanted = set(names)
++        for key, value in element.attrib.items():
++            if key.rsplit("}", 1)[-1] in wanted:
++                return value
++        return None
++
++    def __local_name(self, element):
++        return element.tag.rsplit("}", 1)[-1]
++
++    def __image_blobs_from_relation_ids(self, document, relation_ids):
++        image_blobs = []
++        for rid in dict.fromkeys([rid for rid in relation_ids if rid]):
++            try:
++                related_part = document.part.related_parts[rid]
++            except Exception as e:
++                logging.warning("Skipping Word image relation %s: %s", rid, e)
++                continue
++            image_blob = None
++            try:
++                image = related_part.image
++                if image is not None:
++                    image_blob = image.blob
++            except Exception:
++                image_blob = getattr(related_part, "blob", None)
++            if image_blob:
++                image_blobs.append(image_blob)
++        return image_blobs
++
++    def get_picture(self, document, paragraph):
++        drawing_image = super().get_picture(document, paragraph)
++        vml_relation_ids = []
++        for element in paragraph._element.iter():
++            if self.__local_name(element) != "imagedata":
++                continue
++            vml_relation_ids.extend([self.__attr(element, "id"), self.__attr(element, "href")])
++        vml_blobs = self.__image_blobs_from_relation_ids(document, vml_relation_ids)
++        if not vml_blobs:
++            return drawing_image
++        vml_image = LazyImage(vml_blobs)
++        if drawing_image is None:
++            return vml_image
++        return LazyImage.merge(drawing_image, vml_image)
++
++    def __omml_text(self, element):
 +        def text_of(node):
-+            name = local_name(node)
++            name = self.__local_name(node)
 +            if name == "t":
 +                return node.text or ""
 +
@@ -26,29 +76,29 @@ diff --git a/rag/app/naive.py b/rag/app/naive.py
 +            if name in {"num", "den", "e", "deg", "sub", "sup"}:
 +                return "".join(text_of(child) for child in children)
 +            if name == "f":
-+                num = "".join(text_of(child) for child in children if local_name(child) == "num")
-+                den = "".join(text_of(child) for child in children if local_name(child) == "den")
++                num = "".join(text_of(child) for child in children if self.__local_name(child) == "num")
++                den = "".join(text_of(child) for child in children if self.__local_name(child) == "den")
 +                return f"({num})/({den})" if num or den else ""
 +            if name == "sSub":
-+                base = "".join(text_of(child) for child in children if local_name(child) == "e")
-+                sub = "".join(text_of(child) for child in children if local_name(child) == "sub")
++                base = "".join(text_of(child) for child in children if self.__local_name(child) == "e")
++                sub = "".join(text_of(child) for child in children if self.__local_name(child) == "sub")
 +                return f"{base}_{sub}" if sub else base
 +            if name == "sSup":
-+                base = "".join(text_of(child) for child in children if local_name(child) == "e")
-+                sup = "".join(text_of(child) for child in children if local_name(child) == "sup")
++                base = "".join(text_of(child) for child in children if self.__local_name(child) == "e")
++                sup = "".join(text_of(child) for child in children if self.__local_name(child) == "sup")
 +                return f"{base}^{sup}" if sup else base
 +            if name == "sSubSup":
-+                base = "".join(text_of(child) for child in children if local_name(child) == "e")
-+                sub = "".join(text_of(child) for child in children if local_name(child) == "sub")
-+                sup = "".join(text_of(child) for child in children if local_name(child) == "sup")
++                base = "".join(text_of(child) for child in children if self.__local_name(child) == "e")
++                sub = "".join(text_of(child) for child in children if self.__local_name(child) == "sub")
++                sup = "".join(text_of(child) for child in children if self.__local_name(child) == "sup")
 +                if sub and sup:
 +                    return f"{base}_{sub}^{sup}"
 +                if sub:
 +                    return f"{base}_{sub}"
 +                return f"{base}^{sup}" if sup else base
 +            if name == "rad":
-+                deg = "".join(text_of(child) for child in children if local_name(child) == "deg")
-+                body = "".join(text_of(child) for child in children if local_name(child) == "e")
++                deg = "".join(text_of(child) for child in children if self.__local_name(child) == "deg")
++                body = "".join(text_of(child) for child in children if self.__local_name(child) == "e")
 +                return f"root[{deg}]({body})" if deg else f"sqrt({body})"
 +
 +            return "".join(text_of(child) for child in children)
@@ -79,42 +129,55 @@ diff --git a/rag/app/naive.py b/rag/app/naive.py
 +
 +    def __image_placeholder(self, paragraph, context_text=""):
 +        metadata = []
-+        try:
-+            for pic in paragraph._element.xpath(".//pic:pic"):
-+                for prop in pic.xpath(".//pic:cNvPr"):
-+                    title = prop.get("title")
-+                    descr = prop.get("descr")
-+                    metadata.extend([v for v in (title, descr) if v])
-+        except Exception:
-+            metadata = []
-+        label = "; ".join(dict.fromkeys([m.strip() for m in metadata if m.strip()]))
++        for element in paragraph._element.iter():
++            name = self.__local_name(element)
++            if name == "cNvPr":
++                metadata.extend([self.__attr(element, "title"), self.__attr(element, "descr"), self.__attr(element, "name")])
++            elif name in {"shape", "imagedata"}:
++                metadata.extend([self.__attr(element, "title"), self.__attr(element, "descr"), self.__attr(element, "alt")])
++        label = "; ".join(dict.fromkeys([self.__clean(m) for m in metadata if self.__clean(m)]))
 +        placeholder = self.WORD_INLINE_IMAGE_PLACEHOLDER if not label else f"{self.WORD_INLINE_IMAGE_PLACEHOLDER} {label}"
 +        context_text = self.__clean(context_text)
 +        if context_text:
 +            return f"{context_text}\n{placeholder}"
 +        return placeholder
 +
-@@ -506,0 +590,1 @@ class Docx(DocxParser):
++    def __cell_text(self, cell):
++        texts = []
++        for paragraph in cell.paragraphs:
++            text = self.__paragraph_text_with_math_placeholders(paragraph)
++            if self.get_picture(self.doc, paragraph) is not None:
++                text = self.__image_placeholder(paragraph, text)
++            if text and text.strip():
++                texts.append(self.__clean(text))
++        return "\n".join(texts) if texts else self.__clean(cell.text)
++
+     def __get_nearest_title(self, table_index, filename):
+@@ -506,0 +627,1 @@ class Docx(DocxParser):
 +        last_image_text = ""
-@@ -510,1 +595,1 @@ class Docx(DocxParser):
+@@ -510,1 +632,1 @@ class Docx(DocxParser):
 -            nonlocal last_image, lines
 +            nonlocal last_image, last_image_text, lines
-@@ -512,2 +597,3 @@ class Docx(DocxParser):
+@@ -512,2 +634,3 @@ class Docx(DocxParser):
 -                lines.append({"text": "", "image": last_image, "table": None, "style": "Image"})
 +                lines.append({"text": last_image_text or self.WORD_INLINE_IMAGE_PLACEHOLDER, "image": last_image, "table": None, "style": "Image"})
                  last_image = None
 +                last_image_text = ""
-@@ -524,1 +610,1 @@ class Docx(DocxParser):
+@@ -524,1 +647,1 @@ class Docx(DocxParser):
 -                    text = p.text.strip()
 +                    text = self.__paragraph_text_with_math_placeholders(p)
-@@ -537,0 +623,1 @@ class Docx(DocxParser):
+@@ -537,0 +661,1 @@ class Docx(DocxParser):
 +                                last_image_text = ""
-@@ -548,0 +635,1 @@ class Docx(DocxParser):
+@@ -548,0 +673,1 @@ class Docx(DocxParser):
 +                            current_image = self.get_picture(self.doc, p)
-@@ -557,1 +644,0 @@ class Docx(DocxParser):
+@@ -557,1 +683,0 @@ class Docx(DocxParser):
 -                            current_image = self.get_picture(self.doc, p)
-@@ -561,1 +647,1 @@ class Docx(DocxParser):
+@@ -561,1 +686,1 @@ class Docx(DocxParser):
 -                                        "text": "",
 +                                        "text": self.__image_placeholder(p, text),
-@@ -570,0 +656,1 @@ class Docx(DocxParser):
+@@ -570,0 +696,1 @@ class Docx(DocxParser):
 +                            last_image_text = self.__image_placeholder(p)
+@@ -605,1 +732,2 @@ class Docx(DocxParser):
+-                            html += f"<td>{c.text}</td>" if span == 1 else f"<td colspan='{span}'>{c.text}</td>"
++                            cell_text = escape(self.__cell_text(c))
++                            html += f"<td>{cell_text}</td>" if span == 1 else f"<td colspan='{span}'>{cell_text}</td>"

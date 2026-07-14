@@ -1,0 +1,45 @@
+diff --git a/api/apps/services/dataset_api_service.py b/api/apps/services/dataset_api_service.py
+--- a/api/apps/services/dataset_api_service.py
++++ b/api/apps/services/dataset_api_service.py
+@@ -551,6 +551,7 @@ def run_index(dataset_id: str, tenant_id: str, index_type: str):
+     stale_task_ids = remove_stale_auxiliary_index_messages(
+         task_ids={existing_task_id} if existing_task_id else set(),
+         doc_ids=set(document_ids),
++        task_types={task_type},
+     )
+     for stale_task_id in stale_task_ids:
+         TaskService.delete_by_id(stale_task_id)
+diff --git a/rag/svr/localmathrag_priority_queue.py b/rag/svr/localmathrag_priority_queue.py
+--- a/rag/svr/localmathrag_priority_queue.py
++++ b/rag/svr/localmathrag_priority_queue.py
+@@ -41,10 +41,17 @@ def remove_stale_auxiliary_index_messages(
+     task_ids: set[str] | None = None,
+     doc_ids: set[str] | None = None,
++    task_types: set[str] | None = None,
+     worker_task_type: str = "common",
+ ) -> set[str]:
+-    """Cancel and remove queued/pending auxiliary messages matching a task or dataset."""
++    """Cancel and remove queued/pending auxiliary messages matching a task or dataset.
++
++    ``task_types`` scopes document-based cleanup so restarting one auxiliary index
++    cannot cancel another index type that happens to cover the same documents.
++    Exact task-id cleanup remains backward compatible when no type filter is given.
++    """
+     task_ids = {str(task_id) for task_id in (task_ids or set()) if task_id}
+     doc_ids = {str(doc_id) for doc_id in (doc_ids or set()) if doc_id}
++    task_types = {str(task_type) for task_type in (task_types or set()) if task_type}
+     if not task_ids and not doc_ids:
+         return set()
+ 
+@@ -93,7 +101,10 @@ def remove_stale_auxiliary_index_messages(
+             message = json.loads(raw_message)
+         except (TypeError, ValueError):
+             continue
+-        if message.get("task_type") not in AUXILIARY_INDEX_TASK_TYPES:
++        message_task_type = str(message.get("task_type") or "")
++        if message_task_type not in AUXILIARY_INDEX_TASK_TYPES:
++            continue
++        if task_types and message_task_type not in task_types:
+             continue
+         message_task_id = str(message.get("id") or "")
+         message_doc_ids = {str(doc_id) for doc_id in (message.get("doc_ids") or []) if doc_id}

@@ -1,0 +1,210 @@
+diff --git a/api/apps/services/models_api_service.py b/api/apps/services/models_api_service.py
+--- a/api/apps/services/models_api_service.py
++++ b/api/apps/services/models_api_service.py
+@@ -19,6 +19,7 @@ import logging
+ import json
+ import urllib.error
+ import urllib.request
++from pathlib import PurePosixPath
+@@ -187,6 +188,16 @@ def _factory_model_types(llm: dict) -> list[str]:
+         return model_type
+     return [model_type] if model_type else []
+ 
++
++def _display_model_name(model_name: str) -> str:
++    """Use a provider-facing identifier instead of a local runtime path."""
++    normalized = str(model_name or "").replace("\\", "/")
++    if normalized.startswith("/models/"):
++        normalized = normalized[len("/models/"):]
++    if normalized.endswith(".gguf"):
++        return PurePosixPath(normalized).stem
++    return normalized
++
++
+ def _get_model_info(tenant_id: str, default_model: str, model_type: str):
+@@ -263,7 +274,7 @@ def _get_model_info(tenant_id: str, default_model: str, model_type: str):
+         return {
+         "model_provider": provider_name,
+         "model_instance": instance_name,
+-        "model_name": model_name,
++        "model_name": _display_model_name(model_name),
+         "model_type": model_type,
+         "enable": enable,
+     }
+@@ -288,7 +299,7 @@ def _get_model_info(tenant_id: str, default_model: str, model_type: str):
+     return {
+         "model_provider": provider_name,
+         "model_instance": instance_name,
+-        "model_name": model_name,
++        "model_name": _display_model_name(model_name),
+         "model_type": model_type,
+         "enable": enable,
+     }
+@@ -344,6 +355,26 @@ def _check_model_available(tenant_id: str, provider_name: str, instance_name: s
+             return False, f"Model '{model_name}' isn't available"
+         return True, None
+ 
++    # Existing installations may have stored a local model as /models/*.gguf.
++    # Match that record by its provider-facing display name and create an
++    # equivalent canonical record only when the requested capability matches.
++    legacy_model = next(
++        (
++            item
++            for item in TenantModelService.get_models_by_instance_id(instance_obj.id)
++            if item.model_type == model_type
++            and _display_model_name(item.model_name) == model_name
++        ),
++        None,
++    )
++    if legacy_model:
++        if legacy_model.status != ActiveStatusEnum.ACTIVE.value:
++            return False, f"Model '{model_name}' isn't available"
++        TenantModelService.insert(
++            model_name=model_name,
++            provider_id=provider_obj.id,
++            instance_id=instance_obj.id,
++            model_type=model_type,
++            extra=legacy_model.extra or "{}",
++        )
++        return True, None
+ 
+     llms = factory_info[0].get("llm", [])
+@@ -528,7 +539,7 @@ def list_tenant_added_models(tenant_id: str, model_type_filter: str=None):
+ 
+             added_models.append({
+                 "model_type": model_types,
+-                "name": model_name,
++                "name": _display_model_name(model_name),
+                 "provider_id": provider_id,
+                 "provider_name": provider_info_map[provider_id].provider_name if provider_info_map.get(provider_id) else "",
+                 "instance_id": instance_id,
+diff --git a/api/apps/services/provider_api_service.py b/api/apps/services/provider_api_service.py
+--- a/api/apps/services/provider_api_service.py
++++ b/api/apps/services/provider_api_service.py
+@@ -611,11 +611,20 @@ async def verify_api_key(provider_id_or_name: str, api_key: str | dict, base_ur
+                 msg += f"\nFail to access model({provider_name}/{llm['llm_name']})." + str(e)
+-        if any([embd_passed, chat_passed, rerank_passed, vision_passed, ocr_passed, tts_passed]):
+-            msg = ""
+-            break
+ 
+-    success = any([embd_passed, chat_passed, rerank_passed, vision_passed, ocr_passed, tts_passed])
+-    return success, "success" if success else msg
++    requested_types = {model_type for llm in factory_llms for model_type in _factory_model_types(llm)}
++    passed_types = {
++        LLMType.EMBEDDING.value: embd_passed, LLMType.CHAT.value: chat_passed,
++        LLMType.RERANK.value: rerank_passed, LLMType.IMAGE2TEXT.value: vision_passed,
++        LLMType.OCR.value: ocr_passed, LLMType.TTS.value: tts_passed,
++    }
++    unsupported_types = sorted(model_type for model_type in requested_types if not passed_types.get(model_type, False))
++    if unsupported_types:
++        detail = msg.strip() or "No successful capability probe was returned."
++        return False, f"Model capability validation failed for {', '.join(unsupported_types)}. {detail}"
++    return True, "success"
+@@ -830,8 +839,6 @@ def add_model_to_instance(tenant_id: str, provider_id_or_name: str, instance_id
+     if not instance_obj:
+         return False, f"No instance found for provider '{provider_id_or_name}' and instance '{instance_id_or_name}'"
+-    model_obj = TenantModelService.get_by_provider_id_and_instance_id_and_model_name(provider_obj.id, instance_obj.id, model_name)
+-    if model_obj:
+-        return True, "success"
+     factory_info = [f for f in FACTORY_LLM_INFOS if f["name"] == provider_obj.provider_name]
+@@ -843,6 +850,11 @@ def add_model_to_instance(tenant_id: str, provider_id_or_name: str, instance_id
+         model_type = [model_type]
+ 
+     for _type in model_type:
++        model_obj = TenantModelService.get_by_provider_id_and_instance_id_and_model_type_and_model_name(
++            provider_obj.id, instance_obj.id, _type, model_name
++        )
++        if model_obj:
++            continue
+         extra_fields = {"max_tokens": max_tokens}
+diff --git a/web/src/pages/user-setting/setting-model/modal/provider-modal/field-config/utils.ts b/web/src/pages/user-setting/setting-model/modal/provider-modal/field-config/utils.ts
+--- a/web/src/pages/user-setting/setting-model/modal/provider-modal/field-config/utils.ts
++++ b/web/src/pages/user-setting/setting-model/modal/provider-modal/field-config/utils.ts
+@@ -10,21 +10,6 @@ export function capitalize(s: string): string {
+ }
+ 
+-/**
+- * When model_type contains chat and vision=true, automatically add image2text
+- */
+-export function applyChatToImage2Text(
+-  modelType: string[] | string | undefined,
+-  vision?: boolean,
+-): string[] {
+-  const arr = Array.isArray(modelType)
+-    ? modelType
+-    : modelType
+-      ? [modelType]
+-      : [];
+-  if (arr.includes('chat') && vision) {
+-    return [...arr, 'image2text'];
+-  }
+-  return arr;
+-}
+-
+ /**
+@@ -32,8 +17,8 @@ export function applyChatToImage2Text(
+  * 1. If `values.model_info` is a non-empty array (the picker-merged case,
+  *    populated by the call site before invoking the transform), use it as-is.
+  * 2. Otherwise, assemble a single-entry array from the individual form
+- *    fields (`model_name`, `model_type`, `max_tokens`, plus `is_tools` /
+- *    `vision` placed under `extra.is_tools` when present).
++ *    fields (`model_name`, `model_type`, and `max_tokens`). Runtime probes
++ *    validate every selected capability before the model is saved.
+@@ -44,15 +29,11 @@ export const buildModelInfoFromValues = (
+   }
+   if (!values.model_name) return [];
+-  const is_tools = values.is_tools ?? values.vision;
+   const entry: IModelInfo = {
+     model_name: values.model_name,
+     model_type: values.model_type ?? [],
+     max_tokens: values.max_tokens ?? 0,
+   };
+-  if (is_tools !== undefined) {
+-    entry.extra = { is_tools };
+-  }
+   return [entry];
+ };
+diff --git a/web/src/pages/user-setting/setting-model/modal/provider-modal/field-config/local-llm-configs.ts b/web/src/pages/user-setting/setting-model/modal/provider-modal/field-config/local-llm-configs.ts
+--- a/web/src/pages/user-setting/setting-model/modal/provider-modal/field-config/local-llm-configs.ts
++++ b/web/src/pages/user-setting/setting-model/modal/provider-modal/field-config/local-llm-configs.ts
+@@ -214,13 +214,6 @@ export function getLocalLlmConfig(
+       validation: { min: 0, message: 'maxTokensMessage' },
+     },
+-    {
+-      name: 'is_tools',
+-      label: 'enableToolCall',
+-      type: FormFieldType.Switch,
+-      required: false,
+-      shouldRender: 'modelTypeSupportsToolCall',
+-      defaultValue: false,
+-    },
+   ];
+@@ -234,14 +227,6 @@ export function getLocalLlmConfig(
+     });
+   }
+ 
+-  fields.push({
+-    name: 'vision',
+-    label: 'vision',
+-    type: FormFieldType.Switch,
+-    required: false,
+-    defaultValue: false,
+-    shouldRender: 'modelTypeIncludesChat',
+-  });
+-
+   const customFieldMap = new Map((customFields ?? []).map((f) => [f.name, f]));
+diff --git a/web/src/pages/user-setting/setting-model/modal/provider-modal/field-config/provider-config-map.ts b/web/src/pages/user-setting/setting-model/modal/provider-modal/field-config/provider-config-map.ts
+--- a/web/src/pages/user-setting/setting-model/modal/provider-modal/field-config/provider-config-map.ts
++++ b/web/src/pages/user-setting/setting-model/modal/provider-modal/field-config/provider-config-map.ts
+@@ -79,12 +79,6 @@ export const ProviderConfigMap: Record<string, ProviderConfig> = {
+         defaultValue: 8192,
+         validation: { min: 0, message: 'maxTokensMessage' },
+       },
+-      {
+-        name: 'vision',
+-        label: 'vision',
+-        type: FormFieldType.Switch,
+-        defaultValue: false,
+-        shouldRender: 'modelTypeIncludesChat',
+-      },
+     ],

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import fnmatch
 import http.client
@@ -8,8 +9,11 @@ import logging
 import math
 import os
 import re
+import shlex
 import shutil
 import socket
+import subprocess
+import tempfile
 import threading
 import time
 import urllib.error
@@ -200,6 +204,7 @@ RERANK_RUNTIME_BASE_URL = os.environ.get("LOCALMATHRAG_RERANK_RUNTIME_BASE_URL",
 VISION_BASE_URL = os.environ.get("LOCALMATHRAG_VISION_BASE_URL", "http://host.docker.internal:8083/v1").rstrip("/")
 ASR_BASE_URL = os.environ.get("LOCALMATHRAG_ASR_BASE_URL", "http://host.docker.internal:8084/v1").rstrip("/")
 TTS_BASE_URL = os.environ.get("LOCALMATHRAG_TTS_BASE_URL", "http://host.docker.internal:8085/v1").rstrip("/")
+MATH_OCR_BASE_URL = os.environ.get("LOCALMATHRAG_MATH_OCR_BASE_URL", "http://localmathrag-object-service:8088/v1/math-ocr").rstrip("/")
 LOCAL_EMBEDDING_MODEL = os.environ.get("LOCALMATHRAG_FALLBACK_EMBEDDING_MODEL", "localmathrag-lexical-embedding")
 LOCAL_EMBEDDING_DIM = int(os.environ.get("LOCALMATHRAG_FALLBACK_EMBEDDING_DIM", "1024"))
 LOCAL_RERANK_MODEL = os.environ.get("LOCALMATHRAG_FALLBACK_RERANK_MODEL", "localmathrag-lexical-rerank")
@@ -249,6 +254,8 @@ EMBEDDING_AUTOSTART_COOLDOWN_SECONDS = max(0.0, _env_float("LOCALMATHRAG_EMBEDDI
 EMBEDDING_DOCUMENT_REQUEST_MIN_INPUTS = max(1, _env_int("LOCALMATHRAG_EMBEDDING_DOCUMENT_REQUEST_MIN_INPUTS", 8))
 EMBEDDING_DOCUMENT_REQUEST_MIN_TOKENS = max(1, _env_int("LOCALMATHRAG_EMBEDDING_DOCUMENT_REQUEST_MIN_TOKENS", 2048))
 EMBEDDING_DOCUMENT_READY_TIMEOUT_SECONDS = max(1.0, _env_float("LOCALMATHRAG_EMBEDDING_DOCUMENT_READY_TIMEOUT_SECONDS", 480.0))
+EMBEDDING_DOCUMENT_REQUEST_TIMEOUT_SECONDS = max(1.0, _env_float("LOCALMATHRAG_EMBEDDING_DOCUMENT_REQUEST_TIMEOUT_SECONDS", 300.0))
+EMBEDDING_DOCUMENT_DIRECT_LOAD_TIMEOUT_SECONDS = max(1.0, _env_float("LOCALMATHRAG_EMBEDDING_DOCUMENT_DIRECT_LOAD_TIMEOUT_SECONDS", 120.0))
 EMBEDDING_CITATION_READY_TIMEOUT_SECONDS = max(1.0, _env_float("LOCALMATHRAG_EMBEDDING_CITATION_READY_TIMEOUT_SECONDS", 18.0))
 EMBEDDING_DOCUMENT_PREEMPT_CHAT = _env_bool("LOCALMATHRAG_EMBEDDING_DOCUMENT_PREEMPT_CHAT", True)
 RERANK_BACKGROUND_PREWARM = os.environ.get("LOCALMATHRAG_RERANK_BACKGROUND_PREWARM", "1").lower() not in {"0", "false", "no", "off"}
@@ -303,6 +310,7 @@ RUNTIME_DEGRADATION_LOCK = threading.Lock()
 RUNTIME_DEGRADATIONS: dict[str, dict[str, Any]] = {}
 RUNTIME_REQUEST_ACTIVITY_LOCK = threading.Lock()
 RUNTIME_ACTIVE_REQUESTS: dict[str, int] = {}
+RUNTIME_ACTIVE_QUALITY_REQUESTS: dict[str, int] = {}
 RUNTIME_RECENT_TASKS: list[dict[str, Any]] = []
 RUNTIME_AUX_PREWARM_LOCK = threading.Lock()
 RUNTIME_AUX_PREWARM_THREAD_RUNNING = False
@@ -411,7 +419,7 @@ RECOMMENDED_MODELS = [
         "repo": "Qwen/Qwen3-VL-8B-Instruct",
         "url": "https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct",
         "download_kind": "snapshot",
-        "model_type": ["vision"],
+        "model_type": ["chat", "vision"],
         "max_tokens": 8192,
         "recommended_for": "Vision model for diagrams, figures, screenshots, and OCR-heavy pages",
         "provider": "OpenAI-API-Compatible",
@@ -427,13 +435,36 @@ RECOMMENDED_MODELS = [
         "repo": "Qwen/Qwen3-VL-4B-Instruct",
         "url": "https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct",
         "download_kind": "snapshot",
-        "model_type": ["vision"],
+        "model_type": ["chat", "vision"],
         "max_tokens": 8192,
-        "recommended_for": "Smaller vision fallback for 8 GB class GPUs",
+        "recommended_for": "Smaller vision model for systems with sufficient available accelerator memory",
         "provider": "OpenAI-API-Compatible",
         "base_url": VISION_BASE_URL,
         "downloadable": True,
         "group": "vision",
+    },
+    {
+        "id": "local-formula-ocr-adapter",
+        "name": "RapidLaTeX OCR (ONNX CPU)",
+        "file_name": "local-formula-ocr-adapter",
+        "runtime_model_name": "local-formula-ocr-adapter",
+        "repo": "RapidAI/RapidLaTeXOCR",
+        "url": "https://github.com/RapidAI/RapidLaTeXOCR",
+        "download_kind": "math_ocr_config",
+        "math_ocr_files": {
+            "image_resizer.onnx": "https://github.com/RapidAI/RapidLaTeXOCR/releases/download/v0.0.0/image_resizer.onnx",
+            "encoder.onnx": "https://github.com/RapidAI/RapidLaTeXOCR/releases/download/v0.0.0/encoder.onnx",
+            "decoder.onnx": "https://github.com/RapidAI/RapidLaTeXOCR/releases/download/v0.0.0/decoder.onnx",
+            "tokenizer.json": "https://github.com/RapidAI/RapidLaTeXOCR/releases/download/v0.0.0/tokenizer.json",
+        },
+        "math_ocr_command_template": "python -m localmathrag_math_ocr --model-dir {model_dir} --image {image}",
+        "model_type": ["math_ocr"],
+        "max_tokens": 0,
+        "recommended_for": "CPU ONNX formula OCR for Word equation images; writes LaTeX into chunks without LLM/VLM.",
+        "provider": "LocalMathRAG",
+        "base_url": MATH_OCR_BASE_URL,
+        "downloadable": True,
+        "group": "math_ocr",
     },
     {
         "id": "whisper-large-v3-turbo",
@@ -523,6 +554,20 @@ class RerankRequest(BaseModel):
     return_documents: bool | str | None = None
 
 
+class MathOcrRequest(BaseModel):
+    image: str
+    mime_type: str | None = None
+    format: str | None = None
+    task: str = "formula"
+    context: str | None = None
+
+
+class MathOcrConfigRequest(BaseModel):
+    command: str | None = None
+    model_dir: str | None = None
+    enabled: bool = True
+
+
 class RuntimeEnsureRequest(BaseModel):
     kind: str = "vision"
     timeout_seconds: float | None = None
@@ -542,6 +587,8 @@ class RuntimeStopRequest(BaseModel):
 class RuntimeSwitchModelRequest(BaseModel):
     kind: str = "chat"
     model: str
+    roles: list[str] = []
+    replacing_roles: list[str] = []
     timeout_seconds: float | None = None
     start: bool = True
     force: bool = False
@@ -834,22 +881,28 @@ def _infer_model_type(path: Path) -> list[str]:
     if "rerank" in name or "reranker" in name:
         return ["rerank"]
     if "vl" in name or "vision" in name or "omni" in name:
-        return ["vision"]
+        return ["chat", "vision"]
     if "whisper" in name or "asr" in name or "speech-to-text" in name:
         return ["asr"]
     if "tts" in name or "cosyvoice" in name or "text-to-speech" in name:
         return ["tts"]
+    if "formula" in name or "latex" in name or "math-ocr" in name:
+        return ["math_ocr"]
     if "ocr" in name:
         return ["ocr"]
     return ["chat"]
 
 
 def _base_url_for_model_type(model_type: list[str]) -> str:
+    if "chat" in model_type and any(item in model_type for item in {"vision", "ocr"}):
+        return VISION_BASE_URL
     first_type = model_type[0] if model_type else "chat"
     if first_type == "embedding":
         return EMBEDDING_BASE_URL
     if first_type == "rerank":
         return RERANK_BASE_URL
+    if first_type == "math_ocr":
+        return MATH_OCR_BASE_URL
     if first_type in {"vision", "ocr"}:
         return VISION_BASE_URL
     if first_type == "asr":
@@ -880,6 +933,8 @@ def _endpoint_key_for_model_type(model_type: str) -> str:
         return "embedding"
     if model_type == "rerank":
         return "rerank"
+    if model_type == "math_ocr":
+        return "math_ocr"
     if model_type in {"vision", "ocr"}:
         return "vision"
     if model_type == "asr":
@@ -900,6 +955,8 @@ def _base_url_for_endpoint_key(endpoint_key: str) -> str:
         return ASR_BASE_URL
     if endpoint_key == "tts":
         return TTS_BASE_URL
+    if endpoint_key == "math_ocr":
+        return MATH_OCR_BASE_URL
     return LLAMA_BASE_URL
 
 
@@ -960,6 +1017,7 @@ def _model_endpoint_statuses(timeout: float = 1.5) -> dict[str, Any]:
         "vision": _optional_runtime_endpoint_status("vision", timeout),
         "asr": _optional_runtime_endpoint_status("asr", timeout),
         "tts": _optional_runtime_endpoint_status("tts", timeout),
+        "math_ocr": _math_ocr_status_payload(),
     }
 
 
@@ -1173,7 +1231,7 @@ def _docker_create_container_from_inspect(inspected: dict[str, Any], name: str, 
 
 
 def _has_local_model_type(model_type: str) -> bool:
-    return any((_model_payload(path).get("model_type") or ["chat"])[0] == model_type for path in _model_entries())
+    return any(model_type in (_model_payload(path).get("model_type") or ["chat"]) for path in _model_entries())
 
 
 def _available_memory_bytes() -> int | None:
@@ -1186,10 +1244,24 @@ def _available_memory_bytes() -> int | None:
     return None
 
 
+def _runtime_model_min_memory_gb(kind: str) -> float | None:
+    with RUNTIME_CONFIG_LOCK:
+        config = _load_runtime_config()
+    models = config.get("models") if isinstance(config.get("models"), dict) else {}
+    selection = models.get(kind) if isinstance(models.get(kind), dict) else {}
+    value = selection.get("min_available_memory_gb")
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _runtime_resource_status(kind: str) -> dict[str, Any]:
     normalized = kind.upper()
-    default_memory_gb = 8.0 if kind in {"vision", "vlm"} else 4.0
-    min_memory_gb = _env_float(f"LOCALMATHRAG_{normalized}_MIN_AVAILABLE_MEMORY_GB", _env_float("LOCALMATHRAG_RUNTIME_MIN_AVAILABLE_MEMORY_GB", default_memory_gb))
+    configured_memory_gb = _env_float(f"LOCALMATHRAG_{normalized}_MIN_AVAILABLE_MEMORY_GB", _env_float("LOCALMATHRAG_RUNTIME_MIN_AVAILABLE_MEMORY_GB", 0.0))
+    # Resource policy is a deployment setting only. Individual models are
+    # validated by their own runtime at launch, where GPU availability is known.
+    min_memory_gb = configured_memory_gb
     min_disk_gb = _env_float(f"LOCALMATHRAG_{normalized}_MIN_FREE_DISK_GB", _env_float("LOCALMATHRAG_RUNTIME_MIN_FREE_DISK_GB", 20.0))
     max_load_per_cpu = _env_float("LOCALMATHRAG_RUNTIME_MAX_LOAD_PER_CPU", 3.0)
 
@@ -1216,6 +1288,7 @@ def _runtime_resource_status(kind: str) -> dict[str, Any]:
         "reasons": reasons,
         "available_memory_gb": None if available_memory is None else round(available_memory / 1024 / 1024 / 1024, 2),
         "min_available_memory_gb": min_memory_gb,
+        "model_min_available_memory_gb": None,
         "free_disk_gb": round(disk.free / 1024 / 1024 / 1024, 2),
         "min_free_disk_gb": min_disk_gb,
         "load_1m": round(load_1m, 2),
@@ -1246,6 +1319,104 @@ def _write_runtime_config(config: dict[str, Any]) -> None:
     temp_path = RUNTIME_CONFIG_FILE.with_suffix(RUNTIME_CONFIG_FILE.suffix + ".tmp")
     temp_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
     temp_path.replace(RUNTIME_CONFIG_FILE)
+
+
+def _math_ocr_runtime_config() -> dict[str, Any]:
+    config = _load_runtime_config()
+    math_ocr = config.get("math_ocr") if isinstance(config.get("math_ocr"), dict) else {}
+    return dict(math_ocr)
+
+
+def _math_ocr_configured_command() -> str:
+    env_command = (os.environ.get("LOCALMATHRAG_MATH_OCR_COMMAND") or "").strip()
+    if env_command:
+        return env_command
+    runtime = _math_ocr_runtime_config()
+    if runtime.get("enabled") is False:
+        return ""
+    return str(runtime.get("command") or "").strip()
+
+
+def _math_ocr_configured_model_dir() -> str:
+    return str(_math_ocr_runtime_config().get("model_dir") or "").strip()
+
+
+def _math_ocr_status_payload() -> dict[str, Any]:
+    command = _math_ocr_configured_command()
+    model_dir = _math_ocr_configured_model_dir()
+    try:
+        from localmathrag_math_ocr import backend_status, model_files_status
+
+        backend = backend_status()
+        model = model_files_status(model_dir)
+    except Exception as exc:
+        backend = {"backend_ready": False, "backend": "rapid_latex_ocr", "backend_error": str(exc)}
+        model = {"model_ready": False, "missing_model_files": []}
+    configured = bool(command and model.get("model_ready") and backend.get("backend_ready"))
+    return {
+        "kind": "math_ocr",
+        "base_url": MATH_OCR_BASE_URL,
+        "endpoint_ok": configured,
+        "configured": configured,
+        "command_configured": bool(command),
+        "model_dir": model_dir,
+        **backend,
+        **model,
+        "runtime_config": _math_ocr_runtime_config(),
+    }
+
+
+def _is_math_ocr_model(model: dict[str, Any] | None) -> bool:
+    if not model:
+        return False
+    model_types = model.get("model_type") or []
+    return model.get("group") == "math_ocr" or "math_ocr" in model_types
+
+
+def _persist_math_ocr_runtime_config(model: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    model_dir = MODEL_DIR / Path(model.get("file_name") or payload.get("file_name") or model.get("name") or "").name
+    command_template = str(model.get("math_ocr_command_template") or "").strip()
+    if not command_template:
+        command_template = "python -m localmathrag_math_ocr --model-dir {model_dir} --image {image}"
+    command = command_template.replace("{model_dir}", str(model_dir))
+    runtime = {
+        "enabled": True,
+        "model": model.get("id"),
+        "name": model.get("name"),
+        "model_dir": str(model_dir),
+        "command": command,
+        "command_template": command_template,
+        "base_url": MATH_OCR_BASE_URL,
+        "source": "recommended-download",
+        "updated_at": time.time(),
+    }
+    with RUNTIME_CONFIG_LOCK:
+        config = _load_runtime_config()
+        config["math_ocr"] = runtime
+        config["version"] = 1
+        config["updated_at"] = time.time()
+        _write_runtime_config(config)
+    return runtime
+
+
+def _persist_manual_math_ocr_config(request: MathOcrConfigRequest) -> dict[str, Any]:
+    existing = _math_ocr_runtime_config()
+    runtime = dict(existing)
+    runtime["enabled"] = bool(request.enabled)
+    runtime["command"] = (request.command or "").strip()
+    runtime["model_dir"] = (request.model_dir or "").strip()
+    runtime.setdefault("model", existing.get("model") or "manual")
+    runtime.setdefault("name", existing.get("name") or "Manual Formula OCR")
+    runtime["base_url"] = MATH_OCR_BASE_URL
+    runtime["source"] = "manual-ui"
+    runtime["updated_at"] = time.time()
+    with RUNTIME_CONFIG_LOCK:
+        config = _load_runtime_config()
+        config["math_ocr"] = runtime
+        config["version"] = 1
+        config["updated_at"] = time.time()
+        _write_runtime_config(config)
+    return runtime
 
 
 def _rerank_runtime_config() -> dict[str, Any] | None:
@@ -1363,6 +1534,7 @@ def _runtime_scheduler_policy_snapshot() -> dict[str, Any]:
     policy["recent_task_counts"] = _recent_runtime_task_counts()
     with RUNTIME_REQUEST_ACTIVITY_LOCK:
         policy["active_requests"] = dict(RUNTIME_ACTIVE_REQUESTS)
+        policy["active_quality_requests"] = dict(RUNTIME_ACTIVE_QUALITY_REQUESTS)
     return policy
 
 
@@ -1681,6 +1853,12 @@ def _active_runtime_request_count() -> int:
         return sum(RUNTIME_ACTIVE_REQUESTS.values())
 
 
+def _active_quality_runtime_request_count(kind: str) -> int:
+    normalized = _runtime_target(kind)["kind"]
+    with RUNTIME_REQUEST_ACTIVITY_LOCK:
+        return int(RUNTIME_ACTIVE_QUALITY_REQUESTS.get(normalized, 0))
+
+
 def _persist_recent_runtime_task(kind: str, request_kind: str, quality: bool) -> None:
     try:
         with RUNTIME_CONFIG_LOCK:
@@ -1740,6 +1918,8 @@ def _begin_runtime_request(kind: str, request_kind: str, quality: bool = False) 
     now = time.time()
     with RUNTIME_REQUEST_ACTIVITY_LOCK:
         RUNTIME_ACTIVE_REQUESTS[normalized] = RUNTIME_ACTIVE_REQUESTS.get(normalized, 0) + 1
+        if quality:
+            RUNTIME_ACTIVE_QUALITY_REQUESTS[normalized] = RUNTIME_ACTIVE_QUALITY_REQUESTS.get(normalized, 0) + 1
         RUNTIME_RECENT_TASKS.append({**token, "recorded_at": now})
         cutoff = now - RECENT_TASK_WINDOW_SECONDS
         del RUNTIME_RECENT_TASKS[:-200]
@@ -1756,6 +1936,12 @@ def _end_runtime_request(token: dict[str, Any]) -> None:
             RUNTIME_ACTIVE_REQUESTS.pop(kind, None)
         else:
             RUNTIME_ACTIVE_REQUESTS[kind] = current - 1
+        if token.get("quality"):
+            quality_current = RUNTIME_ACTIVE_QUALITY_REQUESTS.get(kind, 0)
+            if quality_current <= 1:
+                RUNTIME_ACTIVE_QUALITY_REQUESTS.pop(kind, None)
+            else:
+                RUNTIME_ACTIVE_QUALITY_REQUESTS[kind] = quality_current - 1
     _schedule_recent_task_prewarm(f"recent {token.get('request_kind') or kind} request completed")
 
 
@@ -1987,14 +2173,60 @@ def _optional_runtime_targets() -> list[dict[str, Any]]:
     return [_runtime_target(kind) for kind in ("chat", "embedding", "rerank", "vision", "asr", "tts")]
 
 
-def _runtime_preemption_order(kind: str) -> list[str]:
-    if kind == "embedding":
-        return ["rerank", "chat", "vision", "asr", "tts"]
-    if kind == "chat":
-        return ["embedding", "rerank", "vision", "asr", "tts"]
-    if kind == "rerank":
-        return ["embedding", "vision", "asr", "tts"]
-    return ["embedding", "rerank", "chat", "vision", "asr", "tts"]
+RUNTIME_ROLE_PRIORITY = {
+    "chat": 100,
+    "embedding": 80,
+    "rerank": 70,
+    "vision": 40,
+    "ocr": 40,
+    "asr": 30,
+    "tts": 30,
+}
+
+
+def _normalize_runtime_roles(roles: list[str] | None, fallback: str) -> list[str]:
+    aliases = {"image2text": "vision", "speech2text": "asr", "llm": "chat", "vlm": "vision"}
+    normalized = []
+    for role in roles or []:
+        value = aliases.get(str(role).lower(), str(role).lower())
+        if value in RUNTIME_ROLE_PRIORITY and value not in normalized:
+            normalized.append(value)
+    return normalized or [fallback]
+
+
+def _target_runtime_roles(target: dict[str, Any]) -> list[str]:
+    explicit = target.get("roles")
+    if isinstance(explicit, list) and explicit:
+        return _normalize_runtime_roles(explicit, str(target["kind"]))
+    with RUNTIME_CONFIG_LOCK:
+        config = _load_runtime_config()
+    models = config.get("models") if isinstance(config.get("models"), dict) else {}
+    selection = models.get(target["kind"]) if isinstance(models.get(target["kind"]), dict) else {}
+    configured = selection.get("roles") if isinstance(selection.get("roles"), list) else selection.get("model_type")
+    return _normalize_runtime_roles(configured if isinstance(configured, list) else [], str(target["kind"]))
+
+
+def _runtime_priority(target: dict[str, Any]) -> int:
+    return max(RUNTIME_ROLE_PRIORITY.get(role, 0) for role in _target_runtime_roles(target))
+
+
+def _runtime_preemption_order(target: dict[str, Any]) -> list[str]:
+    target_priority = _runtime_priority(target)
+    replacing_roles = set(_normalize_runtime_roles(target.get("replacing_roles"), "")) - {""}
+    candidates = []
+    for candidate in _optional_runtime_targets():
+        if candidate["kind"] == target["kind"]:
+            continue
+        if (
+            candidate["kind"] == "embedding"
+            and target["kind"] != "embedding"
+            and _active_quality_runtime_request_count("embedding") > 0
+        ):
+            continue
+        roles = set(_target_runtime_roles(candidate))
+        if _runtime_priority(candidate) < target_priority or roles & replacing_roles:
+            candidates.append(candidate)
+    return [candidate["kind"] for candidate in sorted(candidates, key=_runtime_priority)]
 
 
 def _running_optional_runtime_states(exclude_kind: str | None = None) -> list[dict[str, Any]]:
@@ -2035,13 +2267,6 @@ def _prepare_quality_embedding_priority(target: dict[str, Any]) -> list[dict[str
             }
         )
 
-    if EMBEDDING_DOCUMENT_PREEMPT_CHAT and _has_local_model_type("chat"):
-        action = _stop_runtime_for_scheduler(
-            "chat",
-            "high priority embedding request reserved resources",
-        )
-        if action:
-            actions.append(action)
     return actions
 
 
@@ -2052,7 +2277,7 @@ def _balance_optional_runtimes(target: dict[str, Any]) -> list[dict[str, Any]]:
     running_kinds = {item["target"]["kind"] for item in running}
     running_count = len(running)
 
-    for victim_kind in _runtime_preemption_order(target["kind"]):
+    for victim_kind in _runtime_preemption_order(target):
         if running_count < OPTIONAL_RUNTIME_MAX_ACTIVE:
             break
         if victim_kind not in running_kinds:
@@ -2071,7 +2296,7 @@ def _balance_optional_runtimes(target: dict[str, Any]) -> list[dict[str, Any]]:
     if resource_status["ok"]:
         return actions
 
-    for victim_kind in _runtime_preemption_order(target["kind"]):
+    for victim_kind in _runtime_preemption_order(target):
         if victim_kind in stopped or victim_kind not in running_kinds:
             continue
         action = _stop_runtime_for_scheduler(
@@ -2186,27 +2411,44 @@ def _runtime_startup_progress(container_id: str | None) -> dict[str, Any]:
         phase, progress, message = "ready", 1.0, "Runtime HTTP server is ready."
     if "ERROR" in clean_logs or "Backend error" in clean_logs or "error:" in clean_logs.lower():
         phase, progress, message = "error", progress, "Runtime logs contain an error."
+    error_line = ""
+    for marker in ("Free memory on device", "CUDA out of memory", "ValueError:", "RuntimeError:", "Exception:", "Error:"):
+        error_line = next((line.strip() for line in reversed(last_lines) if marker in line), "")
+        if error_line:
+            break
     return {
         "phase": phase,
         "progress": progress,
         "message": message,
         "last_log_line": last_line[-500:],
+        "error_detail": error_line[-500:] if phase == "error" else "",
     }
 
 
-def _wait_for_endpoint(base_url: str, timeout_seconds: float, interval_seconds: float = 2.0, container_id: str | None = None, kind: str = "runtime") -> dict[str, Any]:
+def _wait_for_endpoint(
+    base_url: str,
+    timeout_seconds: float,
+    interval_seconds: float = 2.0,
+    container_id: str | None = None,
+    kind: str = "runtime",
+    enforce_stall_timeout: bool = True,
+) -> dict[str, Any]:
     deadline = time.monotonic() + max(0.0, timeout_seconds)
     stall_timeout = _runtime_startup_stall_timeout_seconds(kind)
     stall_deadline = time.monotonic() + max(1.0, stall_timeout)
     last_progress_signature = ""
     last_progress: dict[str, Any] = _runtime_startup_progress(container_id) if container_id else {"phase": "unknown", "progress": 0.0}
     last_status = _endpoint_status(base_url, timeout=RUNTIME_READY_PROBE_TIMEOUT_SECONDS)
-    while time.monotonic() < deadline and time.monotonic() < stall_deadline:
+    while time.monotonic() < deadline and (not enforce_stall_timeout or time.monotonic() < stall_deadline):
         if last_status.get("endpoint_ok"):
             last_status["startup_progress"] = {"phase": "ready", "progress": 1.0, "message": "Runtime endpoint is ready."}
             return last_status
         if container_id:
             last_progress = _runtime_startup_progress(container_id)
+            if last_progress.get("phase") == "error":
+                last_status["startup_progress"] = last_progress
+                last_status["runtime_startup_failed"] = True
+                return last_status
             signature = f"{last_progress.get('phase')}|{last_progress.get('last_log_line')}"
             if signature and signature != last_progress_signature:
                 last_progress_signature = signature
@@ -2214,10 +2456,20 @@ def _wait_for_endpoint(base_url: str, timeout_seconds: float, interval_seconds: 
         time.sleep(interval_seconds)
         last_status = _endpoint_status(base_url, timeout=RUNTIME_READY_PROBE_TIMEOUT_SECONDS)
     last_status["startup_progress"] = last_progress
-    if time.monotonic() >= stall_deadline:
+    if enforce_stall_timeout and time.monotonic() >= stall_deadline:
         last_status["startup_stalled"] = True
         last_status["startup_stall_timeout_seconds"] = stall_timeout
     return last_status
+
+
+def _runtime_not_ready_reason(status: dict[str, Any], timeout_seconds: float) -> str:
+    progress = status.get("startup_progress") if isinstance(status.get("startup_progress"), dict) else {}
+    detail = str(progress.get("error_detail") or "").strip()
+    if detail:
+        return f"runtime startup failed: {detail}"
+    if status.get("runtime_startup_failed"):
+        return "runtime startup failed; inspect the runtime logs for details"
+    return f"runtime did not become ready within {timeout_seconds:.0f}s"
 
 
 def _replace_cmd_value(cmd: list[str], flag: str, value: Any) -> list[str]:
@@ -2450,7 +2702,13 @@ def _retry_runtime_with_lower_config(
 
 
 def _switch_runtime_model(request: RuntimeSwitchModelRequest) -> dict[str, Any]:
-    target = _runtime_target(request.kind)
+    base_target = _runtime_target(request.kind)
+    roles = _normalize_runtime_roles(request.roles, base_target["kind"])
+    target = {
+        **base_target,
+        "roles": roles,
+        "replacing_roles": _normalize_runtime_roles(request.replacing_roles, "") if request.replacing_roles else [],
+    }
     kind = target["kind"]
     payload = _find_local_model_for_runtime(kind, request.model)
     timeout_seconds = request.timeout_seconds if request.timeout_seconds is not None else _runtime_ready_timeout_seconds(kind)
@@ -2478,7 +2736,7 @@ def _switch_runtime_model(request: RuntimeSwitchModelRequest) -> dict[str, Any]:
         actions.append({"kind": kind, "action": "created_container", "container_id": new_container_id[:12]})
 
         _apply_runtime_model_to_process_env(kind, payload)
-        selection = _persist_runtime_model_selection(kind, payload)
+        selection = _persist_runtime_model_selection(kind, payload, roles)
         if kind == "rerank":
             _persist_rerank_runtime_config(disabled=False, reason="runtime model switched", source="runtime-switch")
 
@@ -2511,7 +2769,7 @@ def _switch_runtime_model(request: RuntimeSwitchModelRequest) -> dict[str, Any]:
                     if ready:
                         _clear_runtime_start_failure(kind)
                     else:
-                        reason = f"runtime did not become ready within {timeout_seconds:.0f}s"
+                        reason = _runtime_not_ready_reason(endpoint_status, timeout_seconds)
                         retry_result = _retry_runtime_with_lower_config(
                             target,
                             new_container_id,
@@ -2664,7 +2922,26 @@ def _ensure_runtime_ready(
                 "container_id": container_id[:12],
                 "runtime_start_failure": cached_failure,
             }
-        prepared = _prepare_runtime_start(target)
+        chat_state = _docker_container_state(LLAMA_CONTAINER_NAME, LLAMA_COMPOSE_SERVICE)
+        direct_quality_embedding = (
+            prefer_quality
+            and target["kind"] == "embedding"
+            and bool(chat_state.get("container_running"))
+        )
+        if direct_quality_embedding:
+            prepared = {
+                "ok": True,
+                "actions": [
+                    {
+                        "kind": "embedding",
+                        "action": "quality_embedding_direct_load",
+                        "reason": "try loading required embedding beside chat before reclaiming chat resources",
+                    }
+                ],
+                "resource_status": _runtime_resource_status(target["kind"]),
+            }
+        else:
+            prepared = _prepare_runtime_start(target)
         resource_status = prepared["resource_status"]
         balance_actions = [*priority_actions, *prepared["actions"]]
         if not prepared["ok"]:
@@ -2732,7 +3009,61 @@ def _ensure_runtime_ready(
                     "actions": balance_actions,
                 },
             }
-        status = _wait_for_endpoint(target["base_url"], timeout_seconds, container_id=container_id, kind=target["kind"])
+        initial_ready_timeout = (
+            min(timeout_seconds, EMBEDDING_DOCUMENT_DIRECT_LOAD_TIMEOUT_SECONDS)
+            if direct_quality_embedding
+            else timeout_seconds
+        )
+        status = _wait_for_endpoint(
+            target["base_url"],
+            initial_ready_timeout,
+            container_id=container_id,
+            kind=target["kind"],
+            enforce_stall_timeout=not (prefer_quality and target["kind"] == "embedding" and not direct_quality_embedding),
+        )
+        if direct_quality_embedding and not status.get("endpoint_ok") and EMBEDDING_DOCUMENT_PREEMPT_CHAT:
+            direct_stop = _stop_optional_runtime_for_degrade(
+                target,
+                "required embedding direct load failed; restarting after reclaiming chat resources",
+            )
+            if direct_stop:
+                balance_actions.append(direct_stop)
+            balance_actions.append(
+                {
+                    "kind": "embedding",
+                    "action": "quality_embedding_direct_load_failed",
+                    "reason": f"embedding did not become ready within {initial_ready_timeout:.0f}s beside chat",
+                }
+            )
+            chat_stop = _stop_optional_runtime_for_degrade(
+                _runtime_target("chat"),
+                "required document embedding reclaimed chat resources after direct load failed",
+            )
+            if chat_stop:
+                balance_actions.append(chat_stop)
+            try:
+                start_result = _docker_start_container(container_id)
+                balance_actions.append(
+                    {
+                        "kind": "embedding",
+                        "action": "quality_embedding_exclusive_retry",
+                        "started": bool(start_result.get("started")),
+                        "reason": "retry required embedding after stopping chat",
+                    }
+                )
+                status = _wait_for_endpoint(
+                    target["base_url"],
+                    timeout_seconds,
+                    container_id=container_id,
+                    kind=target["kind"],
+                    enforce_stall_timeout=False,
+                )
+            except Exception as exc:
+                status = {
+                    "endpoint_ok": False,
+                    "error": str(exc),
+                    "runtime_kind": target["kind"],
+                }
         if start_result.get("started") and not status.get("endpoint_ok") and OPTIONAL_RUNTIME_STOP_ON_READY_TIMEOUT:
             degraded_stop = _stop_optional_runtime_for_degrade(target, f"runtime did not become ready within {timeout_seconds:.0f}s")
             if degraded_stop:
@@ -2897,9 +3228,14 @@ def _post_runtime_json(base_url: str, route: str, payload: dict[str, Any], timeo
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        data = response.read()
-        return json.loads(data.decode("utf-8")) if data else {}
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            data = response.read()
+            return json.loads(data.decode("utf-8")) if data else {}
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace").strip()
+        suffix = f": {detail[:1000]}" if detail else ""
+        raise RuntimeError(f"Runtime POST {route} returned HTTP {exc.code}{suffix}") from exc
 
 
 def _runtime_model_name_for_type(model_type: str) -> str:
@@ -2925,6 +3261,14 @@ def _runtime_chat_model_name() -> str:
         model_name = model.replace("\\", "/").rsplit("/", 1)[-1]
         return f"/models/{model_name}"
     return _runtime_model_name_for_type("chat")
+
+
+def _runtime_embedding_model_name() -> str:
+    model = os.environ.get("LOCALMATHRAG_EMBEDDING_MODEL", "bge-m3").strip() or "bge-m3"
+    normalized = model.replace("\\", "/")
+    if normalized.startswith("/models/"):
+        return normalized
+    return f"/models/{normalized.lstrip('/')}"
 
 
 def _rough_chat_token_count(text: str) -> int:
@@ -3816,6 +4160,10 @@ def _model_payload(path: Path) -> dict[str, Any]:
     if path.is_file() and path.suffix.lower() == ".gguf" and model_type[0] == "chat":
         runtime_model_name = f"/models/{path.name}"
     size_bytes = _directory_size(path) if path.is_dir() else path.stat().st_size
+    recommendation = next(
+        (item for item in RECOMMENDED_MODELS if item.get("file_name") == (metadata.get("file_name") or path.name)),
+        {},
+    )
     return {
         "name": metadata.get("name") or path.stem,
         "runtime_model_name": runtime_model_name,
@@ -3829,6 +4177,7 @@ def _model_payload(path: Path) -> dict[str, Any]:
         "base_url": _base_url_for_payload(metadata, model_type),
         "model_type": model_type,
         "max_tokens": metadata.get("max_tokens") or 8192,
+        "min_available_memory_gb": metadata.get("min_available_memory_gb") or recommendation.get("min_available_memory_gb"),
     }
 
 
@@ -3880,13 +4229,18 @@ def _find_local_model_for_runtime(kind: str, model: str) -> dict[str, Any]:
     requested = _normalize_model_switch_key(model)
     if not requested:
         raise HTTPException(status_code=400, detail="Runtime model switch requires a non-empty model")
+    requested_path = Path(requested)
+    requested_keys = {
+        requested,
+        requested_path.name.lower(),
+        requested_path.stem.lower(),
+    }
     for path in _model_entries():
         payload = _model_payload(path)
         model_types = payload.get("model_type") or ["chat"]
-        endpoint_key = _endpoint_key_for_model_type(str(model_types[0]))
-        if endpoint_key != target["model_type"]:
+        if target["model_type"] not in model_types:
             continue
-        if requested in _model_switch_keys(payload):
+        if requested_keys & _model_switch_keys(payload):
             payload["switch_model_path"] = payload.get("relative_path") or payload.get("file_name") or path.name
             return payload
     raise HTTPException(
@@ -3901,6 +4255,13 @@ def _runtime_command_for_model(kind: str, payload: dict[str, Any], cmd: list[str
     container_model_path = f"/models/{normalized_model_path}"
     if kind == "chat":
         return _replace_cmd_value(cmd, "-m", container_model_path)
+    if kind == "vision":
+        updated = _replace_cmd_value(cmd, "--model", container_model_path)
+        return _replace_cmd_value(
+            updated,
+            "--max-model-len",
+            os.environ.get("LOCALMATHRAG_VLM_MAX_MODEL_LEN", "8192"),
+        )
     if kind in {"embedding", "rerank"}:
         return _replace_cmd_value(cmd, "--model-id", container_model_path)
     return cmd
@@ -3933,13 +4294,20 @@ def _apply_runtime_model_to_process_env(kind: str, payload: dict[str, Any]) -> N
         os.environ["LOCALMATHRAG_RERANK_MODEL"] = model_path
 
 
-def _persist_runtime_model_selection(kind: str, payload: dict[str, Any], source: str = "runtime-switch") -> dict[str, Any]:
+def _persist_runtime_model_selection(
+    kind: str,
+    payload: dict[str, Any],
+    roles: list[str] | None = None,
+    source: str = "runtime-switch",
+) -> dict[str, Any]:
     model_path = str(payload.get("switch_model_path") or payload.get("relative_path") or payload.get("file_name") or payload.get("name")).replace("\\", "/")
     selection = {
         "model": model_path,
         "name": payload.get("name"),
         "runtime_model_name": payload.get("runtime_model_name"),
         "model_type": payload.get("model_type"),
+        "roles": _normalize_runtime_roles(roles, kind),
+        "min_available_memory_gb": payload.get("min_available_memory_gb"),
         "source": source,
         "updated_at": time.time(),
     }
@@ -3955,7 +4323,7 @@ def _persist_runtime_model_selection(kind: str, payload: dict[str, Any], source:
 
 
 def _snapshot_metadata(model: dict[str, Any]) -> dict[str, Any]:
-    return {
+    metadata = {
         "id": model.get("id"),
         "name": model.get("name"),
         "file_name": model.get("file_name"),
@@ -3964,9 +4332,15 @@ def _snapshot_metadata(model: dict[str, Any]) -> dict[str, Any]:
         "provider": model.get("provider") or "OpenAI-API-Compatible",
         "base_url": model.get("base_url"),
         "model_type": model.get("model_type") or ["chat"],
+        "min_available_memory_gb": model.get("min_available_memory_gb"),
         "max_tokens": model.get("max_tokens") or 8192,
         "download_kind": "snapshot",
     }
+    if _is_math_ocr_model(model):
+        metadata["math_ocr_command_template"] = model.get("math_ocr_command_template")
+        metadata["base_url"] = MATH_OCR_BASE_URL
+        metadata["max_tokens"] = 0
+    return metadata
 
 
 def _hf_repo_tree(repo: str, revision: str = "main") -> list[dict[str, Any]]:
@@ -4128,6 +4502,45 @@ def _download_snapshot(model: dict[str, Any], job_id: str) -> dict[str, Any]:
     return {"status": "downloaded", "model": _model_payload(target_dir)}
 
 
+def _install_math_ocr_config(model: dict[str, Any], job_id: str) -> dict[str, Any]:
+    target_dir = MODEL_DIR / Path(model.get("file_name") or "local-formula-ocr-adapter").name
+    metadata_path = target_dir / MODEL_METADATA_NAME
+    files = model.get("math_ocr_files") if isinstance(model.get("math_ocr_files"), dict) else {}
+    if not files:
+        raise RuntimeError("Formula OCR model does not define downloadable runtime files")
+    if metadata_path.exists() and all(
+        (target_dir / name).is_file() and (target_dir / name).stat().st_size > 0 for name in files
+    ):
+        return {"status": "exists", "model": _model_payload(target_dir)}
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    total_bytes = 0
+    for url in files.values():
+        try:
+            head = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "LocalMathRAGFlow/0.1"})
+            with urllib.request.urlopen(head, timeout=30) as response:
+                total_bytes += int(response.headers.get("Content-Length") or 0)
+        except Exception:
+            pass
+    if total_bytes:
+        _update_job(job_id, total_bytes=total_bytes)
+
+    for name, url in files.items():
+        target = target_dir / Path(name).name
+        if target.is_file() and target.stat().st_size > 0:
+            _job_add_bytes(job_id, target.stat().st_size)
+            continue
+        _update_job(job_id, current_file=name)
+        _download_url_to_file(str(url), target, job_id)
+
+    metadata = _snapshot_metadata(model)
+    metadata["download_kind"] = "math_ocr_config"
+    metadata["runtime"] = "rapid_latex_ocr"
+    metadata["runtime_files"] = list(files)
+    metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"status": "downloaded", "model": _model_payload(target_dir)}
+
+
 def _download_single_file(url: str, file_name: str, job_id: str) -> dict[str, Any]:
     target = MODEL_DIR / Path(file_name).name
     if target.exists():
@@ -4148,14 +4561,20 @@ def _download_single_file(url: str, file_name: str, job_id: str) -> dict[str, An
 def _run_download_job(job_id: str, selected: dict[str, Any] | None, url: str | None, file_name: str | None) -> None:
     _update_job(job_id, status="downloading")
     try:
-        if selected and selected.get("download_kind") == "snapshot":
+        if selected and selected.get("download_kind") == "math_ocr_config":
+            result = _install_math_ocr_config(selected, job_id)
+        elif selected and selected.get("download_kind") == "snapshot":
             result = _download_snapshot(selected, job_id)
         else:
             result = _download_single_file(url or "", file_name or "", job_id)
+        runtime_config = None
+        if _is_math_ocr_model(selected):
+            runtime_config = _persist_math_ocr_runtime_config(selected or {}, result["model"])
         _update_job(
             job_id,
             status="completed" if result["status"] == "downloaded" else result["status"],
             model=result["model"],
+            runtime_config=runtime_config,
         )
     except Exception as exc:
         _update_job(job_id, status="failed", error=str(exc))
@@ -4223,6 +4642,160 @@ def openai_models() -> dict[str, Any]:
     return {"object": "list", "data": data}
 
 
+def _decode_math_ocr_image(image: str) -> bytes:
+    image_text = (image or "").strip()
+    if "," in image_text and image_text.lower().startswith("data:"):
+        image_text = image_text.split(",", 1)[1]
+    try:
+        image_bytes = base64.b64decode(image_text, validate=False)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid base64 image: {exc}") from exc
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="Image is empty")
+    return image_bytes
+
+
+def _math_ocr_command_parts(command: str, image_path: Path, model_dir: str = "") -> list[str]:
+    has_placeholder = "{image}" in command
+    rendered = command.replace("{image}", str(image_path)).replace("{model_dir}", model_dir)
+    parts = shlex.split(rendered)
+    if not parts:
+        raise HTTPException(status_code=503, detail="LOCALMATHRAG_MATH_OCR_COMMAND is empty")
+    if not has_placeholder:
+        parts.append(str(image_path))
+    return parts
+
+
+def _math_ocr_stdout_response(stdout: str) -> dict[str, Any]:
+    text = stdout.strip()
+    if not text:
+        return {"latex": "", "text": ""}
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return {"latex": text, "text": text}
+    if isinstance(data, dict):
+        return data
+    return {"data": data}
+
+
+@app.get("/v1/math-ocr/status")
+def math_ocr_status() -> dict[str, Any]:
+    return _math_ocr_status_payload()
+
+
+@app.get("/v1/math-ocr/config")
+def get_math_ocr_config() -> dict[str, Any]:
+    return {
+        "runtime_config": _math_ocr_runtime_config(),
+        "status": _math_ocr_status_payload(),
+        "default_command": "python -m localmathrag_math_ocr --model-dir {model_dir} --image {image}",
+    }
+
+
+@app.post("/v1/math-ocr/config")
+def save_math_ocr_config(request: MathOcrConfigRequest) -> dict[str, Any]:
+    runtime = _persist_manual_math_ocr_config(request)
+    return {
+        "runtime_config": runtime,
+        "status": _math_ocr_status_payload(),
+    }
+
+
+@app.post("/v1/math-ocr")
+def local_math_ocr(request: MathOcrRequest) -> dict[str, Any]:
+    command = _math_ocr_configured_command()
+    if not command:
+        raise HTTPException(
+            status_code=503,
+            detail="Math OCR is not configured. Set LOCALMATHRAG_MATH_OCR_COMMAND to enable it.",
+        )
+    model_dir = _math_ocr_configured_model_dir()
+
+    image_bytes = _decode_math_ocr_image(request.image)
+    cache_key = hashlib.sha256(b"rapid_latex_ocr:0.0.9\0" + image_bytes).hexdigest()
+    cache_dir = DATA_DIR / "cache" / "math-ocr-results"
+    cache_path = cache_dir / f"{cache_key}.json"
+    if cache_path.is_file():
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            if isinstance(cached, dict) and (cached.get("latex") or cached.get("text")):
+                cached.setdefault("runtime", {})
+                if isinstance(cached["runtime"], dict):
+                    cached["runtime"]["cache_hit"] = True
+                return cached
+        except (OSError, json.JSONDecodeError):
+            pass
+    timeout_seconds = max(0.2, _env_float("LOCALMATHRAG_MATH_OCR_TIMEOUT_SECONDS", 10.0))
+    temp_dir = DATA_DIR / "cache" / "math-ocr"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=temp_dir, suffix=".png", delete=False) as temp_file:
+            temp_file.write(image_bytes)
+            temp_path = Path(temp_file.name)
+
+        parts = _math_ocr_command_parts(command, temp_path, model_dir)
+        started = time.monotonic()
+        if "localmathrag_math_ocr" in command:
+            from localmathrag_math_ocr import recognize
+
+            response = recognize(temp_path, model_dir)
+            response.setdefault("runtime", {})
+            if isinstance(response["runtime"], dict):
+                response["runtime"].update(
+                    {
+                        "kind": "math_ocr",
+                        "command": "in-process",
+                        "timeout_seconds": timeout_seconds,
+                        "cache_hit": False,
+                    }
+                )
+            if response.get("latex") or response.get("text"):
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                temp_cache_path = cache_path.with_suffix(".json.tmp")
+                temp_cache_path.write_text(json.dumps(response, ensure_ascii=False), encoding="utf-8")
+                temp_cache_path.replace(cache_path)
+            return response
+
+        completed = subprocess.run(
+            parts,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_seconds,
+            check=False,
+        )
+        elapsed_seconds = round(time.monotonic() - started, 3)
+        if completed.returncode != 0:
+            message = (completed.stderr or completed.stdout or "").strip()
+            raise HTTPException(
+                status_code=502,
+                detail=f"Math OCR command failed with exit code {completed.returncode}: {message[:500]}",
+            )
+        response = _math_ocr_stdout_response(completed.stdout)
+        response.setdefault("runtime", {})
+        if isinstance(response["runtime"], dict):
+            response["runtime"].update(
+                {
+                    "kind": "math_ocr",
+                    "command": Path(parts[0]).name,
+                    "timeout_seconds": timeout_seconds,
+                    "elapsed_seconds": elapsed_seconds,
+                }
+            )
+        return response
+    except subprocess.TimeoutExpired as exc:
+        raise HTTPException(status_code=504, detail=f"Math OCR command timed out after {timeout_seconds}s") from exc
+    finally:
+        if temp_path:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 @app.post("/v1/embeddings")
 def openai_embeddings(request: EmbeddingRequest) -> dict[str, Any]:
     inputs = _embedding_inputs(request.input)
@@ -4279,11 +4852,17 @@ def _openai_embeddings_inner(
                 exclude_none=True,
                 exclude={"localmathrag_embedding_purpose", "localmathrag_strong_embedding"},
             )
-            payload.setdefault("model", request.model or "bge-m3")
+            requested_model = request.model
+            payload["model"] = _runtime_embedding_model_name()
             request_start = time.monotonic()
-            runtime_request_timeout = EMBEDDING_CITATION_READY_TIMEOUT_SECONDS if purpose == "citation" and not document_request else 120.0
+            if document_request:
+                runtime_request_timeout = EMBEDDING_DOCUMENT_REQUEST_TIMEOUT_SECONDS
+            elif purpose == "citation":
+                runtime_request_timeout = EMBEDDING_CITATION_READY_TIMEOUT_SECONDS
+            else:
+                runtime_request_timeout = 120.0
             response = _post_runtime_json(runtime["target"]["base_url"], "/embeddings", payload, timeout=runtime_request_timeout)
-            response.setdefault("model", payload["model"])
+            response["model"] = requested_model or payload["model"]
             embedding_seconds = round(time.monotonic() - request_start, 3)
             response["runtime"] = {
                 "kind": "embedding",
@@ -4302,6 +4881,18 @@ def _openai_embeddings_inner(
             return response
     except Exception as exc:
         runtime = {"reason": str(exc)}
+
+    if quality_request:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": runtime.get("reason", "required embedding runtime is not ready"),
+                "runtime": runtime,
+                "document_request": document_request,
+                "quality_embedding": True,
+                "fallback": False,
+            },
+        )
 
     degradation = _record_runtime_degradation("embedding", runtime.get("reason", "runtime endpoint is not ready"))
     _schedule_chat_restore_after_embedding()
@@ -4428,6 +5019,9 @@ def list_recommended_models() -> dict[str, Any]:
         item["downloaded"] = item["file_name"] in local_names
         item["target_path"] = str(MODEL_DIR / item["file_name"])
         item["endpoint_status"] = endpoint_statuses.get((item.get("model_type") or ["chat"])[0], endpoint_statuses["chat"])
+        if _is_math_ocr_model(item):
+            item["runtime_config"] = _math_ocr_runtime_config()
+            item["configured"] = bool(endpoint_statuses["math_ocr"].get("configured"))
         item.setdefault("downloadable", False)
         job = _job_snapshot(item["id"])
         if job and job.get("status") in {"queued", "downloading"}:
@@ -4629,6 +5223,8 @@ def runtime_status(kind: str = "embedding") -> dict[str, Any]:
     resource_status = _runtime_resource_status(target["kind"])
     return {
         "kind": target["kind"],
+        "roles": _target_runtime_roles(target),
+        "priority": _runtime_priority(target),
         "ready": bool(status.get("endpoint_ok")),
         "endpoint_status": status,
         "resource_status": resource_status,
@@ -4657,7 +5253,7 @@ def download_model(request: DownloadModelRequest) -> dict[str, Any]:
         (model for model in RECOMMENDED_MODELS if model["id"] == request.id),
         None,
     )
-    is_snapshot = bool(selected and selected.get("download_kind") == "snapshot")
+    is_snapshot = bool(selected and selected.get("download_kind") in {"snapshot", "math_ocr_config"})
     url = request.url or (selected or {}).get("url")
     file_name = request.file_name or (selected or {}).get("file_name")
 
@@ -4676,12 +5272,20 @@ def download_model(request: DownloadModelRequest) -> dict[str, Any]:
     # Fast path: already downloaded, no job required.
     if is_snapshot:
         target_dir = MODEL_DIR / Path(selected["file_name"]).name
-        if (target_dir / MODEL_METADATA_NAME).exists():
-            return {"status": "exists", "model": _model_payload(target_dir)}
+        runtime_files = selected.get("math_ocr_files") if _is_math_ocr_model(selected) else None
+        runtime_complete = not runtime_files or all(
+            (target_dir / name).is_file() and (target_dir / name).stat().st_size > 0 for name in runtime_files
+        )
+        if (target_dir / MODEL_METADATA_NAME).exists() and runtime_complete:
+            model_payload = _model_payload(target_dir)
+            runtime_config = _persist_math_ocr_runtime_config(selected, model_payload) if _is_math_ocr_model(selected) else None
+            return {"status": "exists", "model": model_payload, "runtime_config": runtime_config}
     else:
         target = MODEL_DIR / Path(file_name).name
         if target.exists():
-            return {"status": "exists", "model": _model_payload(target)}
+            model_payload = _model_payload(target)
+            runtime_config = _persist_math_ocr_runtime_config(selected, model_payload) if _is_math_ocr_model(selected) else None
+            return {"status": "exists", "model": model_payload, "runtime_config": runtime_config}
 
     job_id = request.id or Path(file_name or "").name
     if not job_id:

@@ -1,0 +1,67 @@
+diff --git a/deepdoc/parser/figure_parser.py b/deepdoc/parser/figure_parser.py
+--- a/deepdoc/parser/figure_parser.py
++++ b/deepdoc/parser/figure_parser.py
+@@ -47,6 +47,7 @@ MATH_OCR_STATUS_CACHE_SECONDS = float(os.environ.get("LOCALMATHRAG_MATH_OCR_STAT
+ _MATH_OCR_STATUS_CHECKED_AT = 0.0
+ _MATH_OCR_STATUS_READY = False
++_MATH_OCR_STATUS = {}
+ 
+ 
+ def _runtime_ensure_url() -> str:
+@@ -67,7 +68,7 @@ def _math_ocr_enabled() -> bool:
+ 
+ 
+ def _math_ocr_service_ready() -> bool:
+-    global _MATH_OCR_STATUS_CHECKED_AT, _MATH_OCR_STATUS_READY
++    global _MATH_OCR_STATUS_CHECKED_AT, _MATH_OCR_STATUS_READY, _MATH_OCR_STATUS
+     now = time.monotonic()
+     if now - _MATH_OCR_STATUS_CHECKED_AT < MATH_OCR_STATUS_CACHE_SECONDS:
+         return _MATH_OCR_STATUS_READY
+@@ -76,6 +77,7 @@ def _math_ocr_service_ready() -> bool:
+     try:
+         with urllib.request.urlopen(MATH_OCR_STATUS_URL, timeout=MATH_OCR_STATUS_TIMEOUT_SECONDS) as response:
+             data = json.loads(response.read().decode("utf-8"))
++        _MATH_OCR_STATUS = data if isinstance(data, dict) else {}
+         _MATH_OCR_STATUS_READY = bool(data.get("configured") or data.get("endpoint_ok"))
+     except Exception as e:
+         logging.info("Math OCR auto check skipped: %s", e)
+@@ -83,6 +85,17 @@ def _math_ocr_service_ready() -> bool:
+     return _MATH_OCR_STATUS_READY
+ 
+ 
++def _math_ocr_backend_name() -> str:
++    _math_ocr_service_ready()
++    return str(_MATH_OCR_STATUS.get("backend") or "").strip().lower()
++
++
++def _rapid_equation_editor_ocr_allowed() -> bool:
++    value = os.environ.get("LOCALMATHRAG_ALLOW_RAPID_EQUATION_EDITOR_OCR", "0")
++    return value.strip().lower() in {"1", "true", "yes", "on"}
++
++
+ def _image_to_png_base64(img):
+     if img.mode not in {"RGB", "L"}:
+         img = img.convert("RGB")
+@@ -145,6 +158,24 @@ def _enhance_docx_chunks_with_math_ocr(chunks, idx_lst, callback=None):
+     if callback:
+         callback(0.69, "Local Math OCR enabled. Parsing Word formula images...")
+     candidate_indices = sorted(formula_indices) if formula_indices else idx_lst
++    if _math_ocr_backend_name() == "rapid_latex_ocr" and not _rapid_equation_editor_ocr_allowed():
++        rapid_unsupported = {
++            idx
++            for idx in candidate_indices
++            if any(
++                str(source.get("prog_id") or "").lower().startswith("equation.")
++                for source in (chunks[idx].get("_docx_formula_sources") or [])
++                if isinstance(source, dict)
++            )
++        }
++        candidate_indices = [idx for idx in candidate_indices if idx not in rapid_unsupported]
++        if rapid_unsupported and callback:
++            callback(
++                0.69,
++                "RapidLaTeX OCR is not reliable for Equation Editor 3.0; preserving formula images and context.",
++            )
+     image_cache = {}
+     total_images = sum(
+         len(getattr(chunks[idx].get("image"), "_blobs", []) or []) or 1

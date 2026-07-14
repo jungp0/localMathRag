@@ -1,0 +1,130 @@
+diff --git a/rag/graphrag/general/index.py b/rag/graphrag/general/index.py
+--- a/rag/graphrag/general/index.py
++++ b/rag/graphrag/general/index.py
+@@ -24,6 +24,5 @@ from api.db.services.document_service import DocumentService
+ from api.db.services.task_service import has_canceled
+ from common.exceptions import TaskCanceledException
+-from common.connection_utils import timeout
+ from rag.graphrag.entity_resolution import EntityResolution
+ from rag.graphrag.adaptive import AdaptiveActivityWatchdog, resolve_execution_plan
+ from rag.graphrag.checkpoints import (
+@@ -77,4 +76,4 @@ DEFAULT_GRAPHRAG_STALL_OBSERVED_GAP_FACTOR = float(os.environ.get("LOCALMATHRA
+ DEFAULT_GRAPHRAG_MERGE_TIMEOUT_SECONDS = 0
+-DEFAULT_GRAPHRAG_RESOLUTION_TIMEOUT_SECONDS = 1800
+-DEFAULT_GRAPHRAG_COMMUNITY_TIMEOUT_SECONDS = 1800
++DEFAULT_GRAPHRAG_RESOLUTION_TIMEOUT_SECONDS = 0
++DEFAULT_GRAPHRAG_COMMUNITY_TIMEOUT_SECONDS = 0
+ DEFAULT_GRAPHRAG_LOCK_ACQUIRE_TIMEOUT_SECONDS = 600
+@@ -456,4 +455,9 @@ async def run_graphrag(
+     resolution_timeout_seconds = _bounded_int_config(graphrag_config, "resolution_timeout_seconds", DEFAULT_GRAPHRAG_RESOLUTION_TIMEOUT_SECONDS, 0, 86400)
+     community_timeout_seconds = _bounded_int_config(graphrag_config, "community_timeout_seconds", DEFAULT_GRAPHRAG_COMMUNITY_TIMEOUT_SECONDS, 0, 86400)
++    phase_stall_timeout_base_seconds = max(build_subgraph_min_timeout_seconds, llm_request_timeout_seconds * stall_timeout_factor)
++    resolution_stall_timeout_seconds = max(phase_stall_timeout_base_seconds, resolution_timeout_seconds)
++    resolution_stall_timeout_max_seconds = resolution_stall_timeout_seconds * stall_timeout_max_factor
++    community_stall_timeout_seconds = max(phase_stall_timeout_base_seconds, community_timeout_seconds)
++    community_stall_timeout_max_seconds = community_stall_timeout_seconds * stall_timeout_max_factor
+     lock_acquire_timeout_seconds = _lock_acquire_timeout_config(graphrag_config)
+ 
+@@ -801,29 +805,47 @@ async def run_graphrag(
+         if resolution_pending:
+             _has_cancel_and_exit(task_id, f"Task {task_id} cancelled before entity resolution.", callback)
+ 
++            active_resolution_watchdog = None
++
++            def set_active_resolution_watchdog(watchdog):
++                nonlocal active_resolution_watchdog
++                active_resolution_watchdog = watchdog
++
++            def resolution_callback(*args, **kwargs):
++                if active_resolution_watchdog is not None:
++                    active_resolution_watchdog.touch()
++                callback(*args, **kwargs)
++
+             async def run_resolution_attempt():
+                 graph_for_resolution = final_graph.copy()
+                 await resolve_entities(
+                     graph_for_resolution,
+                     subgraph_nodes,
+                     tenant_id,
+                     kb_id,
+                     None,
+                     chat_model,
+                     embedding_model,
+-                    callback,
++                    resolution_callback,
+                     task_id=task_id,
+                 )
+                 return graph_for_resolution
+ 
++            callback(msg=f"[GraphRAG] entity resolution start (inactivity_timeout={resolution_stall_timeout_seconds:.1f}s, attempts={resolution_retry_attempts})")
+             final_graph = await _run_with_retry(
+                 "entity resolution",
+                 run_resolution_attempt,
+                 attempts=resolution_retry_attempts,
+-                timeout_seconds=resolution_timeout_seconds,
++                timeout_seconds=0,
+                 backoff_seconds=retry_backoff_seconds,
+                 backoff_max_seconds=retry_backoff_max_seconds,
+                 callback=callback,
+                 task_id=task_id,
++                activity_watchdog_factory=lambda: AdaptiveActivityWatchdog(
++                    resolution_stall_timeout_seconds,
++                    resolution_stall_timeout_max_seconds,
++                    observed_gap_multiplier=stall_observed_gap_factor,
++                ),
++                activity_watchdog_setter=set_active_resolution_watchdog,
+             )
+             set_phase_marker(kb_id, PHASE_RESOLUTION)
+@@ -833,26 +855,44 @@ async def run_graphrag(
+         if community_pending:
+             _has_cancel_and_exit(task_id, f"Task {task_id} cancelled before community extraction.", callback)
+ 
++            active_community_watchdog = None
++
++            def set_active_community_watchdog(watchdog):
++                nonlocal active_community_watchdog
++                active_community_watchdog = watchdog
++
++            def community_callback(*args, **kwargs):
++                if active_community_watchdog is not None:
++                    active_community_watchdog.touch()
++                callback(*args, **kwargs)
++
+             async def run_community_attempt():
+                 await extract_community(
+                     final_graph.copy(),
+                     tenant_id,
+                     kb_id,
+                     None,
+                     chat_model,
+                     embedding_model,
+-                    callback,
++                    community_callback,
+                     task_id=task_id,
+                 )
+ 
++            callback(msg=f"[GraphRAG] community extraction start (inactivity_timeout={community_stall_timeout_seconds:.1f}s, attempts={community_retry_attempts})")
+             await _run_with_retry(
+                 "community extraction",
+                 run_community_attempt,
+                 attempts=community_retry_attempts,
+-                timeout_seconds=community_timeout_seconds,
++                timeout_seconds=0,
+                 backoff_seconds=retry_backoff_seconds,
+                 backoff_max_seconds=retry_backoff_max_seconds,
+                 callback=callback,
+                 task_id=task_id,
++                activity_watchdog_factory=lambda: AdaptiveActivityWatchdog(
++                    community_stall_timeout_seconds,
++                    community_stall_timeout_max_seconds,
++                    observed_gap_multiplier=stall_observed_gap_factor,
++                ),
++                activity_watchdog_setter=set_active_community_watchdog,
+             )
+             set_phase_marker(kb_id, PHASE_COMMUNITY)
+@@ -1011,2 +1052,1 @@ async def merge_subgraph(
+-@timeout(60 * 30, 1)
+ async def resolve_entities(
+@@ -1057,2 +1097,1 @@ async def resolve_entities(
+-@timeout(60 * 30, 1)
+ async def extract_community(

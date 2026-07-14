@@ -1,0 +1,152 @@
+diff --git a/api/utils/file_utils.py b/api/utils/file_utils.py
+--- a/api/utils/file_utils.py
++++ b/api/utils/file_utils.py
+@@ -42,0 +43,39 @@ if LOCK_KEY_pdfplumber not in sys.modules:
++TEMPORARY_FILE_NAMES = frozenset({".ds_store", "desktop.ini", "thumbs.db"})
++TEMPORARY_FILE_SUFFIXES = (
++    ".tmp",
++    ".temp",
++    ".part",
++    ".partial",
++    ".crdownload",
++    ".download",
++    ".swp",
++    ".swo",
++    ".bak",
++    ".old",
++    ".orig",
++    ".lck",
++    ".lock",
++    ".dwl",
++    ".dwl2",
++    ".sv$",
++    ".ac$",
++)
++
++
++def is_temporary_file(filename) -> bool:
++    """Return whether an upload candidate is a known temporary or lock file."""
++    if filename is None or not isinstance(filename, str):
++        return False
++    basename = filename.replace("\\", "/").rsplit("/", 1)[-1].strip()
++    if not basename:
++        return False
++    normalized = basename.casefold()
++    return (
++        "$$" in basename
++        or basename.startswith("~$")
++        or normalized.startswith(".~lock.")
++        or (basename.startswith("#") and basename.endswith("#"))
++        or normalized in TEMPORARY_FILE_NAMES
++        or normalized.endswith(TEMPORARY_FILE_SUFFIXES)
++    )
++
+diff --git a/api/apps/restful_apis/document_api.py b/api/apps/restful_apis/document_api.py
+--- a/api/apps/restful_apis/document_api.py
++++ b/api/apps/restful_apis/document_api.py
+@@ -74 +74 @@ from common.misc_utils import get_uuid, thread_pool_exec
+-from api.utils.file_utils import filename_type, thumbnail
++from api.utils.file_utils import filename_type, is_temporary_file, thumbnail
+@@ -612,0 +613 @@ async def _upload_local_documents(kb, tenant_id):
++    upload_file_objs = []
+@@ -617,0 +619,3 @@ async def _upload_local_documents(kb, tenant_id):
++        if is_temporary_file(file_obj.filename):
++            logging.info("Skipping temporary dataset upload file: %s", file_obj.filename)
++            continue
+@@ -622,0 +627,4 @@ async def _upload_local_documents(kb, tenant_id):
++        upload_file_objs.append(file_obj)
++
++    if not upload_file_objs:
++        return get_result(data=[])
+@@ -627 +636 @@ async def _upload_local_documents(kb, tenant_id):
+-        file_objs,
++        upload_file_objs,
+diff --git a/api/apps/services/local_dataset_service.py b/api/apps/services/local_dataset_service.py
+--- a/api/apps/services/local_dataset_service.py
++++ b/api/apps/services/local_dataset_service.py
+@@ -27 +27 @@ from api.db.services.user_service import TenantService, UserService
+-from api.utils.file_utils import filename_type
++from api.utils.file_utils import filename_type, is_temporary_file
+@@ -185,0 +186,3 @@ def _scan_directory(path: Path, previous_entries: list[dict[str, Any]], previous
++            if child.is_file() and is_temporary_file(child_rel):
++                logging.info("LocalMathRAGFlow skipping temporary local dataset file: %s", child_rel)
++                continue
+@@ -214 +218 @@ def _scan_manifest() -> list[dict[str, Any]]:
+-    previous_entries = [
++    all_previous_entries = [
+@@ -219,0 +224,6 @@ def _scan_manifest() -> list[dict[str, Any]]:
++    temporary_previous_entries = [
++        entry
++        for entry in all_previous_entries
++        if entry.get("kind") == "file" and is_temporary_file(str(entry.get("path", "")))
++    ]
++    previous_entries = [entry for entry in all_previous_entries if entry not in temporary_previous_entries]
+@@ -221,0 +233,8 @@ def _scan_manifest() -> list[dict[str, Any]]:
++    for previous in temporary_previous_entries:
++        previous_path = str(previous.get("path", ""))
++        if filename_type(previous_path) == "other":
++            continue
++        deleted = dict(previous)
++        deleted["status"] = "deleted"
++        deleted.setdefault("doc_id", _doc_id(previous_path))
++        entries.append(deleted)
+@@ -289,0 +293,3 @@ def _upload_changed_files(kb, entries: list[dict[str, Any]], tenant_id: str) -> t
++        if is_temporary_file(rel):
++            logging.info("LocalMathRAGFlow skipping temporary local dataset file: %s", rel)
++            continue
+diff --git a/web/src/utils/file-util.ts b/web/src/utils/file-util.ts
+--- a/web/src/utils/file-util.ts
++++ b/web/src/utils/file-util.ts
+@@ -4,0 +5,42 @@ import fileManagerService from '@/services/file-manager-service';
++const temporaryUploadFileNames = new Set([
++  '.ds_store',
++  'desktop.ini',
++  'thumbs.db',
++]);
++const temporaryUploadFileSuffixes = [
++  '.tmp',
++  '.temp',
++  '.part',
++  '.partial',
++  '.crdownload',
++  '.download',
++  '.swp',
++  '.swo',
++  '.bak',
++  '.old',
++  '.orig',
++  '.lck',
++  '.lock',
++  '.dwl',
++  '.dwl2',
++  '.sv$',
++  '.ac$',
++];
++
++export const isTemporaryUploadFile = (file: File): boolean => {
++  const path = (file as File & { webkitRelativePath?: string })
++    .webkitRelativePath;
++  const basename = (path || file.name).replaceAll('\\', '/').split('/').pop();
++  if (!basename) return false;
++
++  const normalized = basename.toLocaleLowerCase();
++  return (
++    basename.includes('$$') ||
++    basename.startsWith('~$') ||
++    normalized.startsWith('.~lock.') ||
++    (basename.startsWith('#') && basename.endsWith('#')) ||
++    temporaryUploadFileNames.has(normalized) ||
++    temporaryUploadFileSuffixes.some((suffix) => normalized.endsWith(suffix))
++  );
++};
++
+diff --git a/web/src/components/file-uploader.tsx b/web/src/components/file-uploader.tsx
+--- a/web/src/components/file-uploader.tsx
++++ b/web/src/components/file-uploader.tsx
+@@ -17,0 +18 @@ import { cn, formatBytes } from '@/lib/utils';
++import { isTemporaryUploadFile } from '@/utils/file-util';
+@@ -274 +275,3 @@ export function FileUploader(props: FileUploaderProps) {
+-      const fileList = Array.from(e.target.files);
++      const fileList = Array.from(e.target.files).filter(
++        (file) => !isTemporaryUploadFile(file),
++      );

@@ -1,0 +1,369 @@
+diff --git a/rag/svr/localmathrag_toc_queue.py b/rag/svr/localmathrag_toc_queue.py
+new file mode 100644
+--- /dev/null
++++ b/rag/svr/localmathrag_toc_queue.py
+@@ -0,0 +1,231 @@
++# Copyright 2026 LocalMathRAGFlow contributors.
++# Licensed under the Apache License, Version 2.0.
++
++import asyncio
++import copy
++import json
++import logging
++import os
++import time
++from datetime import datetime
++
++import xxhash
++
++from api.db.joint_services.tenant_model_service import get_model_config_from_provider_instance
++from api.db.services.document_service import DocumentService
++from api.db.services.llm_service import LLMBundle
++from api.db.services.task_service import TaskService, has_canceled
++from common import settings
++from common.constants import LLMType
++from common.misc_utils import thread_pool_exec
++from rag.nlp import search
++from rag.prompts.generator import run_toc_from_text
++from rag.utils.redis_conn import REDIS_CONN
++
++
++TOC_QUEUE_NAME = "localmathrag.toc"
++TOC_CONSUMER_GROUP = "localmathrag_toc_workers"
++TOC_DEDUPE_TTL_SECONDS = max(3600, int(os.environ.get("LOCALMATHRAG_TOC_QUEUE_DEDUPE_TTL_SECONDS", "604800")))
++TOC_MAX_RETRIES = max(0, int(os.environ.get("LOCALMATHRAG_TOC_QUEUE_MAX_RETRIES", "2")))
++TOC_PENDING_IDLE_MS = max(30000, int(os.environ.get("LOCALMATHRAG_TOC_QUEUE_PENDING_IDLE_SECONDS", "120")) * 1000)
++TOC_QUEUE_TIMEOUT_SECONDS = max(30.0, float(os.environ.get("LOCALMATHRAG_TOC_QUEUE_TIMEOUT_SECONDS", "300")))
++TOC_RECOVERY_INTERVAL_SECONDS = max(5.0, float(os.environ.get("LOCALMATHRAG_TOC_QUEUE_RECOVERY_INTERVAL_SECONDS", "30")))
++
++
++def _dedupe_key(task_id: str) -> str:
++    return f"localmathrag:toc:queued:{task_id}"
++
++
++def enqueue_toc_task(job: dict) -> bool:
++    task_id = str(job.get("task_id") or "")
++    if not task_id:
++        return False
++    key = _dedupe_key(task_id)
++    try:
++        if not REDIS_CONN.REDIS.set(key, "1", ex=TOC_DEDUPE_TTL_SECONDS, nx=True):
++            return True
++        payload = {**job, "attempt": int(job.get("attempt", 0) or 0)}
++        if REDIS_CONN.queue_product(TOC_QUEUE_NAME, payload):
++            return True
++        REDIS_CONN.REDIS.delete(key)
++    except Exception as e:
++        logging.warning("Failed to enqueue background TOC task %s: %s", task_id, e)
++    return False
++
++
++def _ensure_consumer_group() -> None:
++    try:
++        REDIS_CONN.REDIS.xgroup_create(TOC_QUEUE_NAME, TOC_CONSUMER_GROUP, id="0", mkstream=True)
++    except Exception as e:
++        if "busygroup" not in str(e).lower():
++            raise
++
++
++def _recover_stale_pending() -> int:
++    recovered = 0
++    try:
++        pending = REDIS_CONN.REDIS.xpending_range(TOC_QUEUE_NAME, TOC_CONSUMER_GROUP, "-", "+", 10000)
++    except Exception as e:
++        logging.warning("Failed to inspect background TOC pending tasks: %s", e)
++        return 0
++    for item in pending:
++        if int(item.get("time_since_delivered", 0) or 0) < TOC_PENDING_IDLE_MS:
++            continue
++        message_id = item.get("message_id")
++        try:
++            entries = REDIS_CONN.REDIS.xrange(TOC_QUEUE_NAME, message_id, message_id)
++            if not entries:
++                REDIS_CONN.REDIS.xack(TOC_QUEUE_NAME, TOC_CONSUMER_GROUP, message_id)
++                continue
++            pipeline = REDIS_CONN.REDIS.pipeline(transaction=True)
++            pipeline.xadd(TOC_QUEUE_NAME, entries[0][1])
++            pipeline.xack(TOC_QUEUE_NAME, TOC_CONSUMER_GROUP, message_id)
++            pipeline.xdel(TOC_QUEUE_NAME, message_id)
++            pipeline.execute()
++            recovered += 1
++        except Exception as e:
++            logging.warning("Failed to recover background TOC message %s: %s", message_id, e)
++    return recovered
++
++
++async def _append_task_message(task_id: str, message: str) -> None:
++    if not task_id:
++        return
++    stamped = f"{datetime.now().strftime('%H:%M:%S')} {message}"
++    try:
++        await thread_pool_exec(TaskService.update_progress, task_id, {"progress": 1.0, "progress_msg": stamped})
++    except Exception:
++        logging.debug("Unable to append background TOC status to task %s", task_id, exc_info=True)
++
++
++async def _load_source_chunks(job: dict) -> tuple[list[dict], list[dict]]:
++    fields = [
++        "docnm_kwd",
++        "content_with_weight",
++        "doc_id",
++        "kb_id",
++        "page_num_int",
++        "position_int",
++        "top_int",
++        "toc_kwd",
++        "available_int",
++    ]
++    chunks = await thread_pool_exec(
++        settings.retriever.chunk_list,
++        job["doc_id"],
++        job["tenant_id"],
++        [job["kb_id"]],
++        fields=fields,
++        sort_by_position=True,
++        retrieve_all=True,
++    )
++    requested_ids = set(job.get("chunk_ids") or [])
++    existing_toc = [chunk for chunk in chunks if chunk.get("toc_kwd") == "toc"]
++    source = [
++        chunk
++        for chunk in chunks
++        if chunk.get("toc_kwd") != "toc" and (not requested_ids or chunk.get("id") in requested_ids)
++    ]
++    return source, existing_toc
++
++
++async def _build_toc_chunk(job: dict, docs: list[dict]) -> dict | None:
++    if not docs:
++        return None
++    model_config = get_model_config_from_provider_instance(job["tenant_id"], LLMType.CHAT, job["llm_id"])
++    with LLMBundle(job["tenant_id"], model_config, lang=job.get("language") or "Chinese") as chat_mdl:
++        toc = await asyncio.wait_for(
++            run_toc_from_text([doc["content_with_weight"] for doc in docs], chat_mdl),
++            timeout=TOC_QUEUE_TIMEOUT_SECONDS,
++        )
++    for index, item in enumerate(toc):
++        chunk_value = item.pop("chunk_id", None)
++        if chunk_value is None or str(chunk_value).strip() == "":
++            continue
++        try:
++            current = int(chunk_value)
++        except (TypeError, ValueError):
++            continue
++        if current < 0 or current >= len(docs):
++            continue
++        item["ids"] = [docs[current]["id"]]
++        if index + 1 < len(toc):
++            try:
++                following = int(toc[index + 1].get("chunk_id", current))
++            except (TypeError, ValueError):
++                following = current
++            item["ids"].extend(docs[pos]["id"] for pos in range(current + 1, min(following + 1, len(docs))))
++    if not toc:
++        return None
++    chunk = copy.deepcopy(docs[-1])
++    chunk["content_with_weight"] = json.dumps(toc, ensure_ascii=False)
++    chunk["toc_kwd"] = "toc"
++    chunk["available_int"] = 0
++    chunk["page_num_int"] = [100000000]
++    chunk["id"] = xxhash.xxh64((chunk["content_with_weight"] + str(job["doc_id"])).encode("utf-8", "surrogatepass")).hexdigest()
++    return chunk
++
++
++async def _store_toc_chunk(job: dict, chunk: dict | None, existing_toc: list[dict]) -> None:
++    if chunk is None:
++        return
++    index_name = search.index_name(job["tenant_id"])
++    existing_ids = [item["id"] for item in existing_toc if item.get("id")]
++    if existing_ids:
++        await thread_pool_exec(settings.docStoreConn.delete, {"id": existing_ids}, index_name, [job["kb_id"]])
++    result = await thread_pool_exec(settings.docStoreConn.insert, [chunk], index_name, job["kb_id"])
++    if result:
++        raise RuntimeError(f"Insert background TOC chunk failed: {result}")
++    if not existing_ids:
++        await thread_pool_exec(DocumentService.increment_chunk_num, job["doc_id"], job["kb_id"], 0, 1, 0)
++    elif len(existing_ids) > 1:
++        await thread_pool_exec(DocumentService.decrement_chunk_num, job["doc_id"], job["kb_id"], 0, len(existing_ids) - 1, 0)
++
++
++async def _process_toc_job(job: dict) -> bool:
++    if has_canceled(job["task_id"]):
++        return False
++    docs, existing_toc = await _load_source_chunks(job)
++    toc_chunk = await _build_toc_chunk(job, docs)
++    if has_canceled(job["task_id"]):
++        return False
++    await _store_toc_chunk(job, toc_chunk, existing_toc)
++    return True
++
++
++async def toc_queue_worker(consumer_name: str) -> None:
++    _ensure_consumer_group()
++    recovered = await asyncio.to_thread(_recover_stale_pending)
++    if recovered:
++        logging.info("Recovered %d stale background TOC tasks", recovered)
++    last_recovery = time.monotonic()
++    while True:
++        if time.monotonic() - last_recovery >= TOC_RECOVERY_INTERVAL_SECONDS:
++            recovered = await asyncio.to_thread(_recover_stale_pending)
++            if recovered:
++                logging.info("Recovered %d stale background TOC tasks", recovered)
++            last_recovery = time.monotonic()
++        redis_message = await asyncio.to_thread(
++            REDIS_CONN.queue_consumer,
++            TOC_QUEUE_NAME,
++            TOC_CONSUMER_GROUP,
++            consumer_name,
++        )
++        if not redis_message:
++            await asyncio.sleep(0.2)
++            continue
++        job = redis_message.get_message()
++        task_id = str(job.get("task_id") or "")
++        retry_queued = False
++        acknowledge = True
++        try:
++            completed = await _process_toc_job(job)
++            if completed:
++                await _append_task_message(task_id, "Background TOC generation done.")
++        except asyncio.CancelledError:
++            acknowledge = False
++            raise
++        except Exception as e:
++            attempt = int(job.get("attempt", 0) or 0)
++            logging.warning("Background TOC task %s failed on attempt %d: %s", task_id, attempt + 1, e)
++            if attempt < TOC_MAX_RETRIES:
++                retry_queued = REDIS_CONN.queue_product(TOC_QUEUE_NAME, {**job, "attempt": attempt + 1})
++            if not retry_queued:
++                await _append_task_message(task_id, f"Background TOC generation stopped after {attempt + 1} attempts: {e}")
++        finally:
++            if acknowledge:
++                redis_message.ack()
++                try:
++                    REDIS_CONN.REDIS.xdel(TOC_QUEUE_NAME, redis_message.get_msg_id())
++                except Exception:
++                    pass
++            if acknowledge and not retry_queued and task_id:
++                try:
++                    REDIS_CONN.REDIS.delete(_dedupe_key(task_id))
++                except Exception:
++                    pass
+diff --git a/rag/svr/task_executor_refactor/task_handler.py b/rag/svr/task_executor_refactor/task_handler.py
+--- a/rag/svr/task_executor_refactor/task_handler.py
++++ b/rag/svr/task_executor_refactor/task_handler.py
+@@ -53,6 +53,7 @@ from rag.svr.task_executor_refactor.recording_context import RecordingContext
+ from rag.svr.task_executor_refactor.task_context import TaskContext
+ from rag.svr.task_executor_limiter import toc_limiter
++from rag.svr.localmathrag_toc_queue import enqueue_toc_task
+ from rag.graphrag.general.index import run_graphrag_for_kb
+@@ -459,10 +460,7 @@ class TaskHandler:
+         logging.info(progress_message)
+         ctx.progress_cb(msg=progress_message)
+ 
+-        # Build TOC if needed
+-        toc_thread = None
+-        if ctx.parser_id.lower() == "naive" and ctx.parser_config.get("toc_extraction", False):
+-            toc_thread = asyncio.create_task(self._build_toc_guarded(ctx, chunks, ctx.progress_cb))
++        toc_requested = ctx.parser_id.lower() == "naive" and ctx.parser_config.get("toc_extraction", False)
+ 
+         # Insert chunks
+@@ -488,11 +486,6 @@ class TaskHandler:
+ 
+         ctx.progress_cb(msg="Indexing done ({:.2f}s).".format(timer() - start_ts))
+ 
+-        toc_chunk = await self._process_toc_thread(toc_thread)
+-        if toc_chunk:
+-            ctx.recording_context.record("toc_chunk", [toc_chunk])
+-            await post_processor.insert_toc_chunk(toc_chunk, chunk_service)
+-
+         if ctx.has_canceled_func(task_id):
+@@ -499,6 +492,21 @@ class TaskHandler:
+         else:
+             DocumentService.increment_chunk_num(task_doc_id, task_dataset_id, token_count, chunk_count, 0)
+ 
++        if toc_requested and not ctx.write_interceptor:
++            queued = enqueue_toc_task(
++                {
++                    "task_id": task_id,
++                    "doc_id": task_doc_id,
++                    "kb_id": task_dataset_id,
++                    "tenant_id": task_tenant_id,
++                    "llm_id": ctx.parser_config.get("llm_id") or ctx.llm_id,
++                    "language": ctx.language,
++                    "chunk_ids": [chunk["id"] for chunk in chunks],
++                }
++            )
++            ctx.progress_cb(msg="TOC queued for background generation." if queued else "TOC queue unavailable; document indexing is complete.")
++
+         task_time_cost = timer() - task_start_ts
+diff --git a/rag/svr/task_executor.py b/rag/svr/task_executor.py
+--- a/rag/svr/task_executor.py
++++ b/rag/svr/task_executor.py
+@@ -106,6 +106,7 @@ from rag.svr.task_executor_limiter import (
+     toc_limiter,
+ )
++from rag.svr.localmathrag_toc_queue import enqueue_toc_task, toc_queue_worker
+ from common import settings
+@@ -1423,7 +1424,7 @@ async def do_handle_task(task: dict):
+     task_parser_config = task["parser_config"]
+     task_start_ts = timer()
+-    toc_thread = None
++    toc_requested = False
+     raptor_cleanup_chunks = []
+@@ -1602,8 +1603,7 @@ async def do_handle_task(task: dict):
+         logging.info(progress_message)
+         progress_callback(msg=progress_message)
+-        if task["parser_id"].lower() == "naive" and task["parser_config"].get("toc_extraction", False):
+-            toc_thread = asyncio.create_task(build_TOC_guarded(task, chunks, progress_callback))
++        toc_requested = task["parser_id"].lower() == "naive" and task["parser_config"].get("toc_extraction", False)
+ 
+@@ -1677,17 +1677,20 @@ async def do_handle_task(task: dict):
+         progress_callback(msg="Indexing done ({:.2f}s).".format(timer() - start_ts))
+ 
+-        if toc_thread:
+-            d = await toc_thread
+-            if d:
+-                get_recording_context().record("toc_chunk", [d])
+-                if not await _maybe_insert_chunks([d]):
+-                    get_recording_context().record("toc_inserted", False)
+-                    return
+-                get_recording_context().record("toc_inserted", True)
+-                ret = DocumentService.increment_chunk_num(task_doc_id, task_dataset_id, 0, 1, 0)
+-                get_recording_context().save_func_return_value("DocumentService.increment_chunk_num", ret)
+-
+         if has_canceled(task_id):
+             progress_callback(-1, msg="Task has been canceled.")
+             return
++
++        if toc_requested:
++            queued = enqueue_toc_task(
++                {
++                    "task_id": task_id,
++                    "doc_id": task_doc_id,
++                    "kb_id": task_dataset_id,
++                    "tenant_id": task_tenant_id,
++                    "llm_id": task["llm_id"],
++                    "language": task_language,
++                    "chunk_ids": [chunk["id"] for chunk in chunks],
++                }
++            )
++            progress_callback(msg="TOC queued for background generation." if queued else "TOC queue unavailable; document indexing is complete.")
+ 
+@@ -1694,8 +1697,6 @@ async def do_handle_task(task: dict):
+ 
+     finally:
+-        if toc_thread is not None and not toc_thread.done():
+-            toc_thread.cancel()
+         if has_canceled(task_id):
+@@ -1987,6 +1988,7 @@ async def main():
+ 
+     report_task = asyncio.create_task(report_status())
++    toc_worker_task = asyncio.create_task(toc_queue_worker(f"{CONSUMER_NAME}_toc"))
+     tasks = []
+@@ -2001,6 +2003,8 @@ async def main():
+         report_task.cancel()
+         await asyncio.gather(report_task, return_exceptions=True)
++        toc_worker_task.cancel()
++        await asyncio.gather(toc_worker_task, return_exceptions=True)
+     logging.error("BUG!!! You should not reach here!!!")

@@ -1,0 +1,629 @@
+diff --git a/rag/raptor.py b/rag/raptor.py
+index d39964f..5dae39a 100644
+--- a/rag/raptor.py
++++ b/rag/raptor.py
+@@ -16,6 +16,7 @@
+ import asyncio
+ from dataclasses import dataclass, field
+ import logging
++import os
+ import re
+ 
+ import numpy as np
+@@ -24,7 +25,6 @@ from sklearn.cluster import AgglomerativeClustering
+ from sklearn.mixture import GaussianMixture
+ 
+ from api.db.services.task_service import has_canceled
+-from common.connection_utils import timeout
+ from common.exceptions import TaskCanceledException
+ from common.token_utils import truncate
+ from rag.graphrag.utils import (
+@@ -35,6 +35,7 @@ from rag.graphrag.utils import (
+     set_llm_cache,
+ )
+ from common.misc_utils import thread_pool_exec
++from rag.graphrag.adaptive import AdaptiveActivityWatchdog
+ from rag.utils.raptor_utils import (
+     AHC_CLUSTERING_METHOD,
+     GMM_CLUSTERING_METHOD,
+@@ -169,6 +170,11 @@ class RecursiveAbstractiveProcessing4TreeOrganizedRetrieval:
+         clustering_method=GMM_CLUSTERING_METHOD,
+         psi_exact_max_leaves=4096,
+         psi_bucket_size=1024,
++        inactivity_min_seconds=None,
++        inactivity_max_seconds=None,
++        retry_attempts=None,
++        retry_backoff_seconds=None,
++        retry_backoff_max_seconds=None,
+     ):
+         """Configure RAPTOR summarization, clustering, and Psi limits."""
+         self._max_cluster = max_cluster
+@@ -188,6 +194,40 @@ class RecursiveAbstractiveProcessing4TreeOrganizedRetrieval:
+         self._psi_exact_max_leaves = max(2, int(psi_exact_max_leaves or 4096))
+         self._psi_bucket_size = min(max(2, int(psi_bucket_size or 1024)), self._psi_exact_max_leaves)
+ 
++        def positive_float(value, default):
++            try:
++                parsed = float(value)
++            except (TypeError, ValueError):
++                return default
++            return parsed if parsed > 0 else default
++
++        derived_min_timeout = max(120.0, float(self._max_token) * 0.75)
++        min_timeout = positive_float(
++            inactivity_min_seconds or os.environ.get("LOCALMATHRAG_RAPTOR_MIN_INACTIVITY_SECONDS"),
++            derived_min_timeout,
++        )
++        max_timeout = positive_float(
++            inactivity_max_seconds or os.environ.get("LOCALMATHRAG_RAPTOR_MAX_INACTIVITY_SECONDS"),
++            max(1800.0, min_timeout * 4),
++        )
++        self._activity_watchdog = AdaptiveActivityWatchdog(min_timeout, max_timeout)
++        default_attempts = max(2, min(5, self._max_errors))
++        try:
++            self._retry_attempts = max(
++                1,
++                int(retry_attempts or os.environ.get("LOCALMATHRAG_RAPTOR_RETRY_ATTEMPTS") or default_attempts),
++            )
++        except (TypeError, ValueError):
++            self._retry_attempts = default_attempts
++        self._retry_backoff_seconds = positive_float(
++            retry_backoff_seconds or os.environ.get("LOCALMATHRAG_RAPTOR_RETRY_BACKOFF_SECONDS"),
++            1.0,
++        )
++        self._retry_backoff_max_seconds = positive_float(
++            retry_backoff_max_seconds or os.environ.get("LOCALMATHRAG_RAPTOR_RETRY_BACKOFF_MAX_SECONDS"),
++            max(30.0, self._retry_backoff_seconds),
++        )
++
+     def _check_task_canceled(self, task_id: str, message: str = ""):
+         """Raise if the current document task was canceled."""
+         if task_id and has_canceled(task_id):
+@@ -195,17 +235,42 @@ class RecursiveAbstractiveProcessing4TreeOrganizedRetrieval:
+             logging.info(log_msg)
+             raise TaskCanceledException(f"Task {task_id} was cancelled")
+ 
+-    @timeout(60 * 20)
++    async def _await_model_activity(self, awaitable):
++        """Wait for one model call using a learned inactivity deadline."""
++        self._activity_watchdog.touch()
++        operation = asyncio.ensure_future(awaitable)
++        try:
++            while True:
++                remaining = self._activity_watchdog.remaining_seconds()
++                if remaining <= 0:
++                    operation.cancel()
++                    await asyncio.gather(operation, return_exceptions=True)
++                    raise asyncio.TimeoutError(
++                        f"RAPTOR model call made no progress for {self._activity_watchdog.timeout_seconds:.1f}s"
++                    )
++                done, _ = await asyncio.wait({operation}, timeout=remaining)
++                if operation in done:
++                    result = await operation
++                    self._activity_watchdog.touch()
++                    return result
++        finally:
++            if not operation.done():
++                operation.cancel()
++                await asyncio.gather(operation, return_exceptions=True)
++
+     async def _chat(self, system, history, gen_conf):
+-        """Call the configured LLM with caching and short retries."""
++        """Call the configured LLM with adaptive inactivity limits and retries."""
+         cached = await thread_pool_exec(get_llm_cache, self._llm_model.llm_name, system, history, gen_conf)
+         if cached:
++            self._activity_watchdog.touch()
+             return cached
+ 
+         last_exc = None
+-        for attempt in range(3):
++        for attempt in range(self._retry_attempts):
+             try:
+-                response = await self._llm_model.async_chat(system, history, gen_conf)
++                response = await self._await_model_activity(
++                    self._llm_model.async_chat(system, history, gen_conf)
++                )
+                 response = re.sub(r"^.*</think>", "", response, flags=re.DOTALL)
+                 if response.find("**ERROR**") >= 0:
+                     raise Exception(response)
+@@ -213,19 +278,30 @@ class RecursiveAbstractiveProcessing4TreeOrganizedRetrieval:
+                 return response
+             except Exception as exc:
+                 last_exc = exc
+-                logging.warning("RAPTOR LLM call failed on attempt %d/3: %s", attempt + 1, exc)
+-                if attempt < 2:
+-                    await asyncio.sleep(1 + attempt)
++                logging.warning(
++                    "RAPTOR LLM call failed on attempt %d/%d: %s",
++                    attempt + 1,
++                    self._retry_attempts,
++                    exc,
++                )
++                if attempt + 1 < self._retry_attempts:
++                    wait = min(
++                        self._retry_backoff_max_seconds,
++                        self._retry_backoff_seconds * (2**attempt),
++                    )
++                    await asyncio.sleep(wait)
+ 
+         raise last_exc if last_exc else Exception("LLM chat failed without exception")
+ 
+-    @timeout(20)
+     async def _embedding_encode(self, txt):
+         """Encode text with the configured embedding model and cache result."""
+         response = await thread_pool_exec(get_embed_cache, self._embd_model.llm_name, txt)
+         if response is not None:
++            self._activity_watchdog.touch()
+             return response
+-        embds, _ = await thread_pool_exec(self._embd_model.encode, [txt])
++        embds, _ = await self._await_model_activity(
++            thread_pool_exec(self._embd_model.encode, [txt])
++        )
+         if len(embds) < 1 or len(embds[0]) < 1:
+             raise Exception("Embedding error: empty embeddings returned")
+         embds = embds[0]
+@@ -305,7 +381,6 @@ class RecursiveAbstractiveProcessing4TreeOrganizedRetrieval:
+             labels = np.array([remap[int(lbl)] for lbl in new_labels])
+         return labels
+ 
+-    @timeout(60 * 20)
+     async def _summarize_texts(self, texts: list[str], callback=None, task_id: str = ""):
+         """Summarize a cluster and return text plus embedding when successful."""
+         self._check_task_canceled(task_id, "summarization")
+@@ -660,7 +735,6 @@ class RecursiveAbstractiveProcessing4TreeOrganizedRetrieval:
+         layers = [(0, len(chunks))]
+         start, end = 0, len(chunks)
+ 
+-        @timeout(60 * 20)
+         async def summarize(ck_idx: list[int]):
+             """Summarize one classic RAPTOR cluster into the chunk list."""
+             nonlocal chunks
+@@ -720,6 +794,25 @@ class RecursiveAbstractiveProcessing4TreeOrganizedRetrieval:
+                     lbls = [np.where(prob > self._threshold)[0] for prob in probs]
+                     lbls = [lbl[0] if isinstance(lbl, np.ndarray) else lbl for lbl in lbls]
+ 
++            # A RAPTOR layer must strictly reduce the node count. GMM may
++            # legitimately prefer one component per input (for example 3→3),
++            # which otherwise creates an endless sequence of identical-sized
++            # layers until an unrelated task timeout kills the build.
++            if n_clusters >= len(reduced_embeddings):
++                n_clusters = max(1, len(reduced_embeddings) - 1)
++                logging.warning(
++                    "RAPTOR forced a reducing layer: inputs=%d clusters=%d",
++                    len(reduced_embeddings),
++                    n_clusters,
++                )
++                if n_clusters == 1:
++                    lbls = [0 for _ in range(len(reduced_embeddings))]
++                else:
++                    lbls = AgglomerativeClustering(
++                        n_clusters=n_clusters,
++                        linkage="ward",
++                    ).fit_predict(reduced_embeddings)
++
+             if n_clusters == 1:
+                 lbls = [0 for _ in range(len(reduced_embeddings))]
+             else:
+diff --git a/rag/svr/task_executor_refactor/chunk_service.py b/rag/svr/task_executor_refactor/chunk_service.py
+index d0fdd83..eedda8e 100644
+--- a/rag/svr/task_executor_refactor/chunk_service.py
++++ b/rag/svr/task_executor_refactor/chunk_service.py
+@@ -251,6 +251,7 @@ class ChunkService:
+         task_dataset_id: str,
+         chunks: List[Dict[str, Any]],
+         doc_bulk_size: int = None,
++        report_progress: bool = True,
+     ) -> bool:
+         """Insert chunks into document store.
+ 
+@@ -274,7 +275,14 @@ class ChunkService:
+             return False
+ 
+         # Insert main chunks
+-        return await self._insert_main_chunks(task_id, task_tenant_id, task_dataset_id, chunks, doc_bulk_size)
++        return await self._insert_main_chunks(
++            task_id,
++            task_tenant_id,
++            task_dataset_id,
++            chunks,
++            doc_bulk_size,
++            report_progress,
++        )
+ 
+     @classmethod
+     def _create_mother_chunks(cls, chunks: List[Dict]) -> List[Dict]:
+@@ -359,6 +367,7 @@ class ChunkService:
+         task_dataset_id: str,
+         chunks: List[Dict],
+         doc_bulk_size: int,
++        report_progress: bool = True,
+     ) -> bool:
+         """Insert main chunks in batches with cancellation handling."""
+         for b in range(0, len(chunks), doc_bulk_size):
+@@ -376,7 +385,7 @@ class ChunkService:
+                 self._task_context.progress_cb(-1, msg="Task has been canceled.")
+                 return False
+ 
+-            if b % 128 == 0:
++            if report_progress and b % 128 == 0:
+                 self._task_context.progress_cb(prog=0.8 + 0.1 * (b + 1) / len(chunks),msg="")
+ 
+             if doc_store_result:
+diff --git a/rag/svr/task_executor_refactor/raptor_service.py b/rag/svr/task_executor_refactor/raptor_service.py
+index c1695b9..6fb9e9e 100644
+--- a/rag/svr/task_executor_refactor/raptor_service.py
++++ b/rag/svr/task_executor_refactor/raptor_service.py
+@@ -24,14 +24,13 @@ import copy
+ import logging
+ import os
+ from datetime import datetime
+-from typing import Dict, List, Optional, Set, Tuple
++from typing import Awaitable, Callable, Dict, List, Optional, Set, Tuple
+ 
+ import numpy as np
+ 
+ from api.db.services.document_service import DocumentService
+ from api.db.services.task_service import GRAPH_RAPTOR_FAKE_DOC_ID
+ from common import settings
+-from common.connection_utils import timeout
+ from common.constants import PAGERANK_FLD
+ from common.misc_utils import thread_pool_exec
+ from common.token_utils import num_tokens_from_string
+@@ -69,7 +68,6 @@ class RaptorService:
+         """
+         self._task_context = ctx
+ 
+-    @timeout(3600)
+     async def run_raptor_for_kb(
+         self,
+         kb_parser_config: Dict,
+@@ -77,6 +75,9 @@ class RaptorService:
+         embd_mdl,
+         vector_size: int,
+         doc_ids: List[str],
++        checkpoint_cb: Optional[
++            Callable[[str, List[Dict], int, Optional[str]], Awaitable[bool]]
++        ] = None,
+     ) -> Tuple[List[Dict], int, List[Tuple[str, Optional[str]]]]:
+         """Generate RAPTOR summaries for selected documents.
+ 
+@@ -108,7 +109,8 @@ class RaptorService:
+             res, tk_count = await self._run_file_level_raptor(
+                 raptor_config, tree_builder, clustering_method,
+                 chat_mdl, embd_mdl, vctr_nm, doc_ids, doc_info_by_id,
+-                max_errors, res, tk_count, cleanup_raptor_chunks
++                max_errors, res, tk_count, cleanup_raptor_chunks,
++                checkpoint_cb,
+             )
+         else:
+             res, tk_count = await self._run_dataset_level_raptor(
+@@ -138,7 +140,7 @@ class RaptorService:
+     async def _run_file_level_raptor(
+         self, raptor_config, tree_builder, clustering_method,
+         chat_mdl, embd_mdl, vctr_nm, doc_ids, doc_info_by_id,
+-        max_errors, res, tk_count, cleanup_raptor_chunks
++        max_errors, res, tk_count, cleanup_raptor_chunks, checkpoint_cb=None
+     ):
+         """Run RAPTOR at file level (per document)."""
+         ctx = self._task_context
+@@ -179,17 +181,29 @@ class RaptorService:
+             if not chunks:
+                 continue
+ 
+-            before_generate = len(res)
+             new_chunks, new_tk_count = await self._generate_raptor(
+                 chunks, doc_id, raptor_config, chat_mdl, embd_mdl,
+                 tree_builder, clustering_method, max_errors, doc_info_by_id
+             )
+-            res.extend(new_chunks)
+             tk_count += new_tk_count
+ 
+-            if len(res) > before_generate:
++            if new_chunks:
+                 has_file_level_target = True
+-                if existing_methods:
++                if checkpoint_cb:
++                    keep_method = tree_builder if existing_methods else None
++                    if not await checkpoint_cb(
++                        doc_id,
++                        new_chunks,
++                        new_tk_count,
++                        keep_method,
++                    ):
++                        raise RuntimeError(f"Unable to persist RAPTOR checkpoint for doc {doc_id}")
++                    self._task_context.progress_cb(
++                        msg=f"[RAPTOR] doc:{doc_id} checkpoint persisted ({len(new_chunks)} chunks)."
++                    )
++                else:
++                    res.extend(new_chunks)
++                if existing_methods and not checkpoint_cb:
+                     self._schedule_raptor_cleanup(
+                         doc_id, tree_builder, cleanup_raptor_chunks
+                     )
+@@ -387,6 +401,11 @@ class RaptorService:
+             clustering_method=clustering_method,
+             psi_exact_max_leaves=raptor_ext_config.get("psi_exact_max_leaves", 4096),
+             psi_bucket_size=raptor_ext_config.get("psi_bucket_size", 1024),
++            inactivity_min_seconds=raptor_ext_config.get("inactivity_min_seconds"),
++            inactivity_max_seconds=raptor_ext_config.get("inactivity_max_seconds"),
++            retry_attempts=raptor_ext_config.get("retry_attempts"),
++            retry_backoff_seconds=raptor_ext_config.get("retry_backoff_seconds"),
++            retry_backoff_max_seconds=raptor_ext_config.get("retry_backoff_max_seconds"),
+         )
+ 
+         original_length = len(chunks)
+diff --git a/rag/svr/task_executor.py b/rag/svr/task_executor.py
+--- a/rag/svr/task_executor.py
++++ b/rag/svr/task_executor.py
+@@ -1093,7 +1093,6 @@ async def delete_raptor_chunks(doc_id: str, tenant_id: str, kb_id: str, keep_me
+     return len(chunk_ids)
+ 
+ 
+-@timeout(3600)
+ async def run_raptor_for_kb(row, kb_parser_config, chat_mdl, embd_mdl, vector_size, callback=None, doc_ids=[]):
+     """Generate RAPTOR summaries for selected documents in a knowledge base."""
+     fake_doc_id = GRAPH_RAPTOR_FAKE_DOC_ID
+@@ -1157,6 +1156,11 @@ async def run_raptor_for_kb(row, kb_parser_config, chat_mdl, embd_mdl, vector_s
+             clustering_method=clustering_method,
+             psi_exact_max_leaves=raptor_ext_config.get("psi_exact_max_leaves", 4096),
+             psi_bucket_size=raptor_ext_config.get("psi_bucket_size", 1024),
++            inactivity_min_seconds=raptor_ext_config.get("inactivity_min_seconds"),
++            inactivity_max_seconds=raptor_ext_config.get("inactivity_max_seconds"),
++            retry_attempts=raptor_ext_config.get("retry_attempts"),
++            retry_backoff_seconds=raptor_ext_config.get("retry_backoff_seconds"),
++            retry_backoff_max_seconds=raptor_ext_config.get("retry_backoff_max_seconds"),
+         )
+         original_length = len(chunks)
+         chunks, layers = await raptor(chunks, kb_parser_config["raptor"]["random_seed"], callback, row["id"])
+@@ -1439,8 +1443,19 @@ async def insert_chunks(task_id, task_tenant_id, task_dataset_id, chunks, progre
+     return True
+ 
+ 
+-@timeout(60 * 60 * 3, 1)
+ async def do_handle_task(task):
++    """Run auxiliary indexes without a fixed wall clock; bound regular ingestion."""
++    if task.get("task_type", "") in AUXILIARY_INDEX_TASK_TYPES:
++        return await _do_handle_task_impl(task)
++    return await _do_handle_task_bounded(task)
++
++
++@timeout(60 * 60 * 3, 1)
++async def _do_handle_task_bounded(task):
++    return await _do_handle_task_impl(task)
++
++
++async def _do_handle_task_impl(task):
+     task_type = task.get("task_type", "")
+ 
+     if task_type == "memory":
+@@ -1763,7 +1779,7 @@ async def do_handle_task(task):
+         logging.info("Chunk doc({}), page({}-{}), chunks({}), token({}), elapsed:{:.2f}".format(task_document_name, task_from_page, task_to_page, len(chunks), token_count, task_time_cost))
+ 
+     finally:
+-        if has_canceled(task_id):
++        if task_type not in AUXILIARY_INDEX_TASK_TYPES and has_canceled(task_id):
+             try:
+                 exists = await thread_pool_exec(
+                     settings.docStoreConn.index_exist,
+diff --git a/rag/svr/task_executor_refactor/task_handler.py b/rag/svr/task_executor_refactor/task_handler.py
+index a22d407..7ec75f3 100644
+--- a/rag/svr/task_executor_refactor/task_handler.py
++++ b/rag/svr/task_executor_refactor/task_handler.py
+@@ -93,7 +96,10 @@ class TaskHandler:
+             task_tenant_id = self._task_context.tenant_id
+             task_dataset_id = self._task_context.kb_id
+             task_doc_id = self._task_context.doc_id
+-            if self._task_context.has_canceled_func(task_id):
++            if (
++                self._task_context.task_type not in {"graphrag", "raptor", "mindmap"}
++                and self._task_context.has_canceled_func(task_id)
++            ):
+                 try:
+                     exists = await thread_pool_exec(
+                         settings.docStoreConn.index_exist,
+@@ -112,8 +118,18 @@ class TaskHandler:
+                     logging.exception(
+                         f"Remove doc({task_doc_id}) from docStore failed when task({task_id}) canceled, exception: {e}")
+ 
+-    @timeout(60 * 60 * 3, 1)
+     async def handle(self) -> None:
++        """Run auxiliary indexes without a fixed wall clock; bound regular ingestion."""
++        if self._task_context.task_type in {"graphrag", "raptor", "mindmap"}:
++            await self._handle_impl()
++            return
++        await self._handle_bounded()
++
++    @timeout(60 * 60 * 3, 1)
++    async def _handle_bounded(self) -> None:
++        await self._handle_impl()
++
++    async def _handle_impl(self) -> None:
+         """Handle a document processing task."""
+         ctx = self._task_context
+         task_type = ctx.task_type
+@@ -278,6 +294,43 @@ class TaskHandler:
+ 
+             # Run RAPTOR
+             raptor_service = RaptorService(ctx=ctx)
++            chunk_service = ChunkService(ctx=ctx)
++            checkpoint_stats = {"chunks": 0, "tokens": 0}
++
++            async def persist_document_checkpoint(
++                doc_id: str,
++                document_chunks: List[Dict],
++                document_tokens: int,
++                keep_method: Optional[str],
++            ) -> bool:
++                if ctx.has_canceled_func(ctx.id):
++                    raise TaskCanceledException(f"Task {ctx.id} was cancelled")
++                inserted = await chunk_service.insert_chunks(
++                    ctx.id,
++                    task_tenant_id,
++                    task_dataset_id,
++                    document_chunks,
++                    report_progress=False,
++                )
++                if not inserted:
++                    return False
++                if keep_method:
++                    await self._delete_raptor_chunks(
++                        doc_id,
++                        task_tenant_id,
++                        task_dataset_id,
++                        keep_method,
++                    )
++                DocumentService.increment_chunk_num(
++                    doc_id,
++                    task_dataset_id,
++                    document_tokens,
++                    len(document_chunks),
++                    0,
++                )
++                checkpoint_stats["chunks"] += len(document_chunks)
++                checkpoint_stats["tokens"] += document_tokens
++                return True
+ 
+             async with ctx.kg_limiter:
+                 chunks, token_count, raptor_cleanup_chunks = await raptor_service.run_raptor_for_kb(
+@@ -286,6 +339,7 @@ class TaskHandler:
+                     embd_mdl=embedding_model,
+                     vector_size=vector_size,
+                     doc_ids=ctx.doc_ids,
++                    checkpoint_cb=None if ctx.write_interceptor else persist_document_checkpoint,
+                 )
+ 
+             ctx.recording_context.record("raptor_chunks", chunks)
+@@ -294,23 +348,12 @@ class TaskHandler:
+             # Insert RAPTOR chunks
+             if chunks:
+                 task_doc_id = (ctx.doc_ids or [GRAPH_RAPTOR_FAKE_DOC_ID])[0]
+-                chunk_service = ChunkService(ctx=ctx)
+                 insert_result = await chunk_service.insert_chunks(ctx.id, task_tenant_id, task_dataset_id, chunks)
+                 if insert_result:
+                     ctx.recording_context.record("insertion_result", "success")
+                 else:
+                     ctx.recording_context.record("insertion_result", "failed")
+-
+-                # Cleanup stale RAPTOR chunks
+-                cleaned_chunks = 0
+-                for cleanup_doc_id, keep_method in raptor_cleanup_chunks:
+-                    ret = await self._delete_raptor_chunks(
+-                        cleanup_doc_id, task_tenant_id, task_dataset_id, keep_method
+-                    )
+-                    cleaned_chunks += ret
+-
+-                if cleaned_chunks:
+-                    ctx.progress_cb(msg=f"Cleaned up {cleaned_chunks} stale RAPTOR chunks.")
++                    raise RuntimeError("Unable to persist RAPTOR chunks")
+ 
+                 # Update document stats
+                 if ctx.write_interceptor:
+@@ -318,6 +361,18 @@ class TaskHandler:
+                 else:
+                     DocumentService.increment_chunk_num(task_doc_id, task_dataset_id, token_count, len(chunks), 0)
+ 
++            # Cleanup is deliberately after all required inserts/checkpoints.
++            cleaned_chunks = 0
++            for cleanup_doc_id, keep_method in raptor_cleanup_chunks:
++                ret = await self._delete_raptor_chunks(
++                    cleanup_doc_id, task_tenant_id, task_dataset_id, keep_method
++                )
++                cleaned_chunks += ret
++            if cleaned_chunks:
++                ctx.progress_cb(msg=f"Cleaned up {cleaned_chunks} stale RAPTOR chunks.")
++
++            ctx.recording_context.record("raptor_checkpoint_stats", checkpoint_stats)
++
+             ctx.recording_context.record("task_status", "completed")
+             ctx.progress_cb(prog=1.0, msg="RAPTOR done")
+ 
+diff --git a/web/src/pages/dataset/dataset/generate-button/generate.tsx b/web/src/pages/dataset/dataset/generate-button/generate.tsx
+index cfc5c4f..685adb1 100644
+--- a/web/src/pages/dataset/dataset/generate-button/generate.tsx
++++ b/web/src/pages/dataset/dataset/generate-button/generate.tsx
+@@ -18,7 +18,7 @@ import { formatDate } from '@/utils/date';
+ import { UseMutateAsyncFunction } from '@tanstack/react-query';
+ import { t } from 'i18next';
+ import { lowerFirst } from 'lodash';
+-import { CirclePause, Trash2, WandSparkles } from 'lucide-react';
++import { CheckCircle, CirclePause, Trash2, WandSparkles } from 'lucide-react';
+ import { useMemo, useState } from 'react';
+ import { useTranslation } from 'react-i18next';
+ import { ProcessingType } from '../../dataset-overview/dataset-common';
+@@ -82,7 +82,9 @@ const MenuItem: React.FC<{
+       ? 100
+       : status === generateStatus.running
+         ? data.progress * 100
+-        : 0;
++        : status === generateStatus.completed
++          ? 100
++          : 0;
+ 
+   return (
+     <DropdownMenuItem
+@@ -107,10 +109,7 @@ const MenuItem: React.FC<{
+       <div
+         className="flex items-start gap-2 flex-col w-full"
+         onClick={() => {
+-          if (
+-            status === generateStatus.start ||
+-            status === generateStatus.completed
+-          ) {
++          if (status === generateStatus.start) {
+             runGenerate({ type });
+           }
+         }}
+@@ -122,12 +121,30 @@ const MenuItem: React.FC<{
+           />
+           {t(`knowledgeDetails.${lowerFirst(type)}`)}
+         </div>
+-        {(status === generateStatus.start ||
+-          status === generateStatus.completed) && (
++        {status === generateStatus.start && (
+           <div className="text-text-secondary text-sm">
+             {t(`knowledgeDetails.generate${type}`)}
+           </div>
+         )}
++        {status === generateStatus.completed && (
++          <div className="flex w-full items-center justify-between px-2.5 py-1">
++            <span className="flex items-center gap-1.5 text-sm text-state-success">
++              <CheckCircle size={16} />
++              {t('knowledgeDetails.completed')}
++            </span>
++            <button
++              type="button"
++              className="flex items-center gap-1 text-sm text-accent-primary hover:underline"
++              onClick={(e) => {
++                e.stopPropagation();
++                runGenerate({ type });
++              }}
++            >
++              <IconFontFill name="reparse" />
++              {t('knowledgeDetails.generate')}
++            </button>
++          </div>
++        )}
+         {(status === generateStatus.running ||
+           status === generateStatus.failed) && (
+           <div className="flex justify-between items-center w-full px-2.5 py-1">
+diff --git a/web/src/pages/dataset/dataset/generate-button/hook.ts b/web/src/pages/dataset/dataset/generate-button/hook.ts
+index a79dd47..d3cb093 100644
+--- a/web/src/pages/dataset/dataset/generate-button/hook.ts
++++ b/web/src/pages/dataset/dataset/generate-button/hook.ts
+@@ -169,13 +169,11 @@ export const useDatasetGenerate = () => {
+     }) => {
+       const { data } = await agentService.cancelDataflow(task_id);
+ 
+-      // For GraphRAG, pause must preserve partial progress (subgraphs,
+-      // entities, relations, community reports) so the next run_graphrag
+-      // call can resume instead of redoing hours of LLM extraction. Raptor
+-      // keeps the prior wipe-on-pause behaviour for now.
++      // Pausing auxiliary indexes must preserve durable checkpoints so the
++      // next run can resume instead of repeating completed LLM work.
+       const unbindData = await handleUnbindTask({
+         type: GenerateTypeMap[type as GenerateType],
+-        wipe: type === GenerateType.KnowledgeGraph ? false : undefined,
++        wipe: false,
+       });
+       if (data.code === 0 && unbindData.code === 0) {
+         // message.success(t('message.operated'));

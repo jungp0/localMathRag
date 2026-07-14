@@ -1,0 +1,54 @@
+diff --git a/rag/svr/localmathrag_priority_queue.py b/rag/svr/localmathrag_priority_queue.py
+--- a/rag/svr/localmathrag_priority_queue.py
++++ b/rag/svr/localmathrag_priority_queue.py
+@@ -168,4 +168,22 @@ def release_auxiliary_index_lease(token: str | None) -> bool:
+     try:
+         return REDIS_CONN.delete_if_equal(AUXILIARY_INDEX_LOCK_KEY, str(token))
+     except Exception:
+         return False
++
++
++def release_stale_auxiliary_index_locks(task_id: str | None, kb_id: str | None = None) -> dict[str, bool]:
++    """Release only locks still owned by the task being cancelled or replaced."""
++    task_id = str(task_id or "")
++    if not task_id:
++        return {"auxiliary": False, "graphrag": False}
++
++    released = {"auxiliary": release_auxiliary_index_lease(task_id), "graphrag": False}
++    if kb_id:
++        try:
++            released["graphrag"] = REDIS_CONN.delete_if_equal(
++                f"graphrag_task_{kb_id}",
++                f"batch_merge:{task_id}",
++            )
++        except Exception:
++            released["graphrag"] = False
++    return released
+diff --git a/api/apps/services/dataset_api_service.py b/api/apps/services/dataset_api_service.py
+--- a/api/apps/services/dataset_api_service.py
++++ b/api/apps/services/dataset_api_service.py
+@@ -32,7 +32,7 @@ from api.db.services.task_service import GRAPH_RAPTOR_FAKE_DOC_ID, TaskService
+ from common.constants import FileSource, StatusEnum
+ from api.utils.api_utils import deep_merge, get_parser_config, remap_dictionary_keys, verify_embedding_availability
+ from api.apps.services.local_dataset_service import refresh_local_dataset
+-from rag.svr.localmathrag_priority_queue import remove_stale_auxiliary_index_messages
++from rag.svr.localmathrag_priority_queue import remove_stale_auxiliary_index_messages, release_stale_auxiliary_index_locks
+ 
+ _VALID_INDEX_TYPES = {"graph", "raptor", "mindmap"}
+ 
+@@ -527,6 +527,7 @@ def start_index(dataset_id: str, tenant_id: str, index_type: str):
+         except Exception as exc:
+             logging.warning("Unable to mark prior %s task %s cancelled: %s", display_name, existing_task_id, exc)
+         remove_stale_auxiliary_index_messages(task_ids={existing_task_id})
++        release_stale_auxiliary_index_locks(existing_task_id, dataset_id if index_type == "graph" else None)
+         TaskService.delete_by_id(existing_task_id)
+ 
+     documents, _ = DocumentService.get_by_kb_id(
+@@ -891,6 +892,7 @@ def delete_index(dataset_id: str, tenant_id: str, index_type: str, wipe: bool =
+         except Exception as e:
+             logging.exception(e)
+         remove_stale_auxiliary_index_messages(task_ids={task_id})
++        release_stale_auxiliary_index_locks(task_id, dataset_id if index_type == "graph" else None)
+         TaskService.delete_by_id(task_id)
+ 
+     if wipe and index_type == "graph":

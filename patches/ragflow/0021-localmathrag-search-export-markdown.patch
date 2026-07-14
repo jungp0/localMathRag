@@ -1,0 +1,245 @@
+diff --git a/web/src/pages/next-search/search-view.tsx b/web/src/pages/next-search/search-view.tsx
+--- a/web/src/pages/next-search/search-view.tsx
++++ b/web/src/pages/next-search/search-view.tsx
+@@ -7,15 +7,17 @@ import { Input } from '@/components/originui/input';
+ import { SkeletonCard } from '@/components/skeleton-card';
+ import { TopSelect } from '@/components/top-select';
+ import { Button } from '@/components/ui/button';
++import message from '@/components/ui/message';
+ import {
+   Popover,
+   PopoverContent,
+   PopoverTrigger,
+ } from '@/components/ui/popover';
+ import { Progress } from '@/components/ui/progress';
++import { downloadFileFromBlob } from '@/utils/file-util';
+ import { IReference } from '@/interfaces/database/chat';
+ import { cn } from '@/lib/utils';
+ import { isEmpty } from 'lodash';
+-import { ListTree, Search, X } from 'lucide-react';
++import { Clipboard, Download, ListTree, Search, X } from 'lucide-react';
+ import { Dispatch, SetStateAction, useEffect, useState } from 'react';
+ import { useTranslation } from 'react-i18next';
+ import { ISearchAppDetailProps } from '../next-searches/hooks';
+@@ -34,6 +36,96 @@ const formatMetadataValue = (value: unknown) => {
+   if (typeof value === 'object') return JSON.stringify(value);
+   return String(value);
+ };
++
++const normalizeExportText = (value: unknown) =>
++  String(value ?? '')
++    .replace(/\r\n/g, '\n')
++    .trim();
++
++const sanitizeFileName = (value: string) =>
++  value
++    .replace(/[\\/:*?"<>|]/g, '-')
++    .replace(/\s+/g, '-')
++    .slice(0, 80)
++    .replace(/^-+|-+$/g, '') || 'search-results';
++
++const buildSearchExportMarkdown = ({
++  searchName,
++  question,
++  summary,
++  chunks,
++  total,
++}: {
++  searchName?: string;
++  question: string;
++  summary?: string;
++  chunks: any[];
++  total: number;
++}) => {
++  const lines = [
++    '# Search Results',
++    '',
++    `- Search: ${searchName || '-'}`,
++    `- Query: ${question || '-'}`,
++    `- Exported: ${new Date().toLocaleString()}`,
++    `- Total results: ${total ?? chunks.length}`,
++    '',
++    '## AI Summary',
++    '',
++    normalizeExportText(summary) || '_No AI summary._',
++    '',
++    '## Content List',
++    '',
++  ];
++
++  if (!chunks?.length) {
++    lines.push('_No retrieved content._', '');
++    return lines.join('\n');
++  }
++
++  chunks.forEach((chunk, index) => {
++    const docName = chunk.docnm_kwd || chunk.doc_name || chunk.document_name;
++    lines.push(`### ${index + 1}. ${docName || 'Document'}`, '');
++    if (chunk.chunk_id) lines.push(`- Chunk ID: ${chunk.chunk_id}`);
++    if (typeof chunk.similarity === 'number') {
++      lines.push(`- Similarity: ${chunk.similarity.toFixed(4)}`);
++    }
++    if (typeof chunk.vector_similarity === 'number') {
++      lines.push(`- Vector similarity: ${chunk.vector_similarity.toFixed(4)}`);
++    }
++    if (typeof chunk.term_similarity === 'number') {
++      lines.push(`- Term similarity: ${chunk.term_similarity.toFixed(4)}`);
++    }
++    if (
++      chunk.document_metadata &&
++      Object.keys(chunk.document_metadata).length > 0
++    ) {
++      lines.push('- Metadata:');
++      Object.entries(chunk.document_metadata).forEach(([key, value]) => {
++        lines.push(`  - ${key}: ${formatMetadataValue(value)}`);
++      });
++    }
++    lines.push('', normalizeExportText(chunk.content_with_weight), '');
++  });
++
++  return lines.join('\n');
++};
++
++const copyTextToClipboard = async (text: string) => {
++  if (navigator.clipboard?.writeText) {
++    await navigator.clipboard.writeText(text);
++    return;
++  }
++  const textarea = document.createElement('textarea');
++  textarea.value = text;
++  textarea.style.position = 'fixed';
++  textarea.style.opacity = '0';
++  document.body.appendChild(textarea);
++  textarea.select();
++  document.execCommand('copy');
++  document.body.removeChild(textarea);
++};
++
+ export default function SearchingView({
+   setIsSearching,
+   searchData,
+@@ -80,6 +172,38 @@ export default function SearchingView({
+     0,
+     Math.min(100, Number(searchProgress?.percent ?? 0)),
+   );
++  const canExport =
++    !isSearchStrEmpty && !sendingLoading && (!!answer.answer || chunks?.length > 0);
++  const canShowMindMap =
++    !mindMapVisible &&
++    !isFirstRender &&
++    !isSearchStrEmpty &&
++    !isEmpty(searchData.search_config.kb_ids) &&
++    searchData.search_config.query_mindmap;
++
++  const buildExportMarkdown = () =>
++    buildSearchExportMarkdown({
++      searchName: searchData.name,
++      question: searchStr,
++      summary: answer.answer,
++      chunks: chunks ?? [],
++      total,
++    });
++
++  const handleCopyMarkdown = async () => {
++    try {
++      await copyTextToClipboard(buildExportMarkdown());
++      message.success('Copied search results');
++    } catch {
++      message.error('Failed to copy search results');
++    }
++  };
++
++  const handleDownloadMarkdown = () => {
++    const markdown = buildExportMarkdown();
++    const fileName = `${sanitizeFileName(searchStr)}-${new Date()
++      .toISOString()
++      .slice(0, 10)}.md`;
++    downloadFileFromBlob(
++      new Blob([markdown], { type: 'text/markdown;charset=utf-8' }),
++      fileName,
++    );
++  };
+ 
+   useEffect(() => {
+     setSearchText(searchStr);
+@@ -301,26 +447,60 @@ export default function SearchingView({
+               )}
+           </div>
+ 
+-          {!mindMapVisible &&
+-            !isFirstRender &&
+-            !isSearchStrEmpty &&
+-            !isEmpty(searchData.search_config.kb_ids) &&
+-            searchData.search_config.query_mindmap && (
+-              <Popover>
+-                <PopoverTrigger asChild>
+-                  <Button
+-                    onClick={showMindMapModal}
+-                    variant={'outline'}
+-                    className="absolute top-16 translate-y-2 right-10 z-30 rounded-full size-6"
+-                  >
+-                    <ListTree />
+-                  </Button>
+-                </PopoverTrigger>
+-                <PopoverContent className="w-fit">
+-                  {t('chunk.mind')}
+-                </PopoverContent>
+-              </Popover>
+-            )}
++          {(canShowMindMap || canExport) && (
++            <div className="absolute top-16 translate-y-2 right-10 z-30 flex items-center gap-3">
++              {canShowMindMap && (
++                <Popover>
++                  <PopoverTrigger asChild>
++                    <Button
++                      onClick={showMindMapModal}
++                      variant={'outline'}
++                      className="rounded-full size-9 p-0"
++                    >
++                      <ListTree size={16} />
++                    </Button>
++                  </PopoverTrigger>
++                  <PopoverContent className="w-fit">
++                    {t('chunk.mind')}
++                  </PopoverContent>
++                </Popover>
++              )}
++              {canExport && (
++                <Popover>
++                  <PopoverTrigger asChild>
++                    <Button
++                      variant="outline"
++                      size="sm"
++                      className="size-9 rounded-full p-0"
++                      onClick={handleCopyMarkdown}
++                    >
++                      <Clipboard size={16} />
++                    </Button>
++                  </PopoverTrigger>
++                  <PopoverContent className="w-fit">
++                    Copy Markdown
++                  </PopoverContent>
++                </Popover>
++              )}
++              {canExport && (
++                <Popover>
++                  <PopoverTrigger asChild>
++                    <Button
++                      variant="outline"
++                      size="sm"
++                      className="size-9 rounded-full p-0"
++                      onClick={handleDownloadMarkdown}
++                    >
++                      <Download size={16} />
++                    </Button>
++                  </PopoverTrigger>
++                  <PopoverContent className="w-fit">
++                    Download Markdown
++                  </PopoverContent>
++                </Popover>
++              )}
++            </div>
++          )}
+         </div>
+         {mindMapVisible && (
+           <div className="flex-1 h-[88dvh] z-30 ml-32 mt-5">

@@ -4,8 +4,16 @@ FROM ${RAGFLOW_BASE_IMAGE}
 USER root
 WORKDIR /ragflow
 
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libwmf-bin \
+    && rm -rf /var/lib/apt/lists/*
+
 ENV LOCALMATHRAG_LOCAL_ONLY=1
 ENV LOCALMATHRAG_DISABLE_LOGIN=1
+ENV LOCALMATHRAG_MTEF_PARSER=/usr/local/bin/localmathrag-mtef
+
+COPY services/mtef_parser/localmathrag-mtef-linux-amd64 /usr/local/bin/localmathrag-mtef
+RUN chmod 0755 /usr/local/bin/localmathrag-mtef
 
 COPY docker/ragflow-localize-conf.py /tmp/ragflow-localize-conf.py
 RUN python /tmp/ragflow-localize-conf.py
@@ -21,14 +29,35 @@ COPY third_party/ragflow/api/apps/restful_apis/bot_api.py /ragflow/api/apps/rest
 COPY third_party/ragflow/api/apps/restful_apis/chat_api.py /ragflow/api/apps/restful_apis/chat_api.py
 COPY third_party/ragflow/api/apps/restful_apis/document_api.py /ragflow/api/apps/restful_apis/document_api.py
 COPY third_party/ragflow/api/apps/restful_apis/search_api.py /ragflow/api/apps/restful_apis/search_api.py
+COPY third_party/ragflow/api/apps/restful_apis/task_api.py /ragflow/api/apps/restful_apis/task_api.py
 COPY third_party/ragflow/api/db/services/dialog_service.py /ragflow/api/db/services/dialog_service.py
+COPY third_party/ragflow/api/db/services/document_service.py /ragflow/api/db/services/document_service.py
 COPY third_party/ragflow/api/db/services/task_service.py /ragflow/api/db/services/task_service.py
+COPY third_party/ragflow/api/utils/file_utils.py /ragflow/api/utils/file_utils.py
 COPY third_party/ragflow/api/utils/validation_utils.py /ragflow/api/utils/validation_utils.py
+COPY third_party/ragflow/common/metadata_utils.py /ragflow/common/metadata_utils.py
 COPY third_party/ragflow/deepdoc/parser/figure_parser.py /ragflow/deepdoc/parser/figure_parser.py
 COPY third_party/ragflow/rag/app/naive.py /ragflow/rag/app/naive.py
+COPY third_party/ragflow/rag/graphrag/adaptive.py /ragflow/rag/graphrag/adaptive.py
+COPY third_party/ragflow/rag/graphrag/general/index.py /ragflow/rag/graphrag/general/index.py
+COPY third_party/ragflow/rag/graphrag/general/extractor.py /ragflow/rag/graphrag/general/extractor.py
+COPY third_party/ragflow/rag/graphrag/general/graph_extractor.py /ragflow/rag/graphrag/general/graph_extractor.py
+COPY third_party/ragflow/rag/graphrag/light/graph_extractor.py /ragflow/rag/graphrag/light/graph_extractor.py
+COPY third_party/ragflow/rag/graphrag/ner/graph_extractor.py /ragflow/rag/graphrag/ner/graph_extractor.py
 COPY third_party/ragflow/rag/llm/chat_model.py /ragflow/rag/llm/chat_model.py
 COPY third_party/ragflow/rag/llm/embedding_model.py /ragflow/rag/llm/embedding_model.py
 COPY third_party/ragflow/rag/llm/rerank_model.py /ragflow/rag/llm/rerank_model.py
+COPY third_party/ragflow/rag/nlp/__init__.py /ragflow/rag/nlp/__init__.py
 COPY third_party/ragflow/rag/nlp/search.py /ragflow/rag/nlp/search.py
+COPY third_party/ragflow/rag/prompts/generator.py /ragflow/rag/prompts/generator.py
+COPY third_party/ragflow/rag/raptor.py /ragflow/rag/raptor.py
 COPY third_party/ragflow/rag/svr/task_executor.py /ragflow/rag/svr/task_executor.py
+COPY third_party/ragflow/rag/svr/task_executor_limiter.py /ragflow/rag/svr/task_executor_limiter.py
+COPY third_party/ragflow/rag/svr/localmathrag_priority_queue.py /ragflow/rag/svr/localmathrag_priority_queue.py
+COPY third_party/ragflow/rag/svr/localmathrag_toc_builder.py /ragflow/rag/svr/localmathrag_toc_builder.py
+COPY third_party/ragflow/rag/svr/localmathrag_toc_queue.py /ragflow/rag/svr/localmathrag_toc_queue.py
+COPY third_party/ragflow/rag/svr/task_executor_refactor/chunk_service.py /ragflow/rag/svr/task_executor_refactor/chunk_service.py
+COPY third_party/ragflow/rag/svr/task_executor_refactor/raptor_service.py /ragflow/rag/svr/task_executor_refactor/raptor_service.py
+COPY third_party/ragflow/rag/svr/task_executor_refactor/task_handler.py /ragflow/rag/svr/task_executor_refactor/task_handler.py
+COPY third_party/ragflow/rag/utils/lazy_image.py /ragflow/rag/utils/lazy_image.py
 COPY third_party/ragflow/web/dist /ragflow/web/dist

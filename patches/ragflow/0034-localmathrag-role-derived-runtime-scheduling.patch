@@ -1,0 +1,132 @@
+diff --git a/api/apps/services/models_api_service.py b/api/apps/services/models_api_service.py
+--- a/api/apps/services/models_api_service.py
++++ b/api/apps/services/models_api_service.py
+@@ -48,6 +48,18 @@ MODEL_TAG_TO_TYPE = {
+     "ocr": "ocr",
+ }
+ 
++MODEL_TYPE_TO_RUNTIME_ROLE = {
++    "chat": "chat",
++    "embedding": "embedding",
++    "rerank": "rerank",
++    "asr": "asr",
++    "speech2text": "asr",
++    "vision": "vision",
++    "image2text": "vision",
++    "tts": "tts",
++    "ocr": "ocr",
++}
++
+ LOCALMATHRAG_RUNTIME_SWITCH_URL = os.getenv(
+@@ -71,25 +83,32 @@ def _is_local_openai_compatible(provider_name: str, base_url: str | None) -> bo
+     )
+ 
+ 
+-def _is_local_vlm_endpoint(base_url: str | None) -> bool:
++def _local_runtime_kind_from_endpoint(base_url: str | None) -> str | None:
+     normalized = (base_url or "").lower()
+-    return "localmathrag-vlm" in normalized or ":8083" in normalized
++    endpoint_kinds = (
++        ("vision", ("localmathrag-vlm", ":8083")),
++        ("embedding", ("localmathrag-embedding", ":8081")),
++        ("rerank", ("localmathrag-rerank", ":8082")),
++        ("asr", ("localmathrag-asr", ":8084")),
++        ("tts", ("localmathrag-tts", ":8085")),
++        ("chat", ("localmathrag-llama", "llama-cpp", ":8080")),
++    )
++    return next((kind for kind, markers in endpoint_kinds if any(marker in normalized for marker in markers)), None)
+ 
+ 
+ def _runtime_kind_for_model_type(
+     model_type: str,
+     base_url: str | None = None,
+-    shared_chat_vision: bool = False,
+ ) -> str | None:
+     normalized = MODEL_TAG_TO_TYPE.get(model_type, model_type)
+-    if normalized == "chat" and _is_local_vlm_endpoint(base_url):
+-        return "vision"
++    endpoint_kind = _local_runtime_kind_from_endpoint(base_url)
++    if endpoint_kind:
++        return endpoint_kind
+     if normalized in {"chat", "embedding", "rerank", "asr", "tts"}:
+         return normalized
+@@ -102,12 +121,29 @@ def _instance_base_url(instance_obj) -> str:
+     return str(extra.get("base_url") or "")
+ 
+ 
+-def _shares_chat_and_vision_default(tenant, provider_name: str, instance_name: str, model_name: str, model_type: str) -> bool:
+-    if model_type not in {"chat", "vision"}:
+-        return False
+-    other_field = "img2txt_id" if model_type == "chat" else "llm_id"
+-    expected = f"{model_name}@{instance_name}@{provider_name}"
+-    return getattr(tenant, other_field, None) == expected
++def _runtime_roles_for_selection(tenant, provider_name: str, instance_name: str, model_name: str, model_type: str) -> list[str]:
++    """Return every configured role that resolves to this exact model instance."""
++    selected = f"{model_name}@{instance_name}@{provider_name}"
++    roles = []
++    for configured_type, field_name in MODEL_TYPE_TO_FIELD.items():
++        value = selected if configured_type == model_type else getattr(tenant, field_name, None)
++        if value == selected:
++            role = MODEL_TYPE_TO_RUNTIME_ROLE.get(configured_type, configured_type)
++            if role not in roles:
++                roles.append(role)
++    requested_role = MODEL_TYPE_TO_RUNTIME_ROLE.get(model_type, model_type)
++    if requested_role not in roles:
++        roles.append(requested_role)
++    return roles
+ 
+ 
+ def _switch_local_runtime_model_if_needed(
+@@ -116,7 +152,7 @@ def _switch_local_runtime_model_if_needed(
+     instance_name: str,
+     model_name: str,
+     model_type: str,
+-    shared_chat_vision: bool = False,
++    roles: list[str] | None = None,
+ ) -> dict | None:
+@@ -131,7 +167,7 @@ def _switch_local_runtime_model_if_needed(
+     base_url = _instance_base_url(instance_obj)
+     if not _is_local_openai_compatible(provider_name, base_url):
+         return None
+-    kind = _runtime_kind_for_model_type(model_type, base_url, shared_chat_vision)
++    kind = _runtime_kind_for_model_type(model_type, base_url)
+     if not kind:
+         return None
+@@ -139,9 +175,10 @@ def _switch_local_runtime_model_if_needed(
+     payload = {
+         "kind": kind,
+         "model": model_name,
+-        "start": kind in {"chat", "rerank"} or model_type == "chat",
++        "roles": roles or [MODEL_TYPE_TO_RUNTIME_ROLE.get(model_type, model_type)],
++        "replacing_roles": [MODEL_TYPE_TO_RUNTIME_ROLE.get(model_type, model_type)],
++        "start": "chat" in (roles or []) or kind in {"chat", "rerank"},
+         "timeout_seconds": float(os.getenv("LOCALMATHRAG_RUNTIME_SWITCH_TIMEOUT_SECONDS", "240")),
+     }
+@@ -459,12 +496,20 @@ def set_tenant_default_models(tenant_id: str, model_provider: str, model_instan
+         return False, "model_provider, model_instance and model_name must be specified together"
+ 
+     if default_model:
++        roles = _runtime_roles_for_selection(
++            tenant,
++            model_provider,
++            model_instance,
++            model_name,
++            model_type,
++        )
+         switch_result = _switch_local_runtime_model_if_needed(
+             tenant_id,
+             model_provider,
+             model_instance,
+             model_name,
+            model_type,
++            roles,
+         )
+@@ -171,7 +216,7 @@ def _runtime_switch_failure_message(result: dict) -> str:
+     resource = result.get("resource_status") if isinstance(result.get("resource_status"), dict) else {}
+     available = resource.get("available_memory_gb")
+     required = resource.get("min_available_memory_gb")
+-    if isinstance(available, (int, float)) and isinstance(required, (int, float)):
++    if isinstance(available, (int, float)) and isinstance(required, (int, float)) and required > 0:
+         return (
+             f"Local runtime model switch failed: {kind} requires at least {required:.1f}GB available memory, "
+             f"but only {available:.1f}GB is available. Close memory-heavy applications or choose a smaller model."

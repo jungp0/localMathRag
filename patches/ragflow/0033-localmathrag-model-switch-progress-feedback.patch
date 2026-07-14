@@ -1,0 +1,129 @@
+diff --git a/web/src/pages/user-setting/setting-model/components/system-setting.tsx b/web/src/pages/user-setting/setting-model/components/system-setting.tsx
+--- a/web/src/pages/user-setting/setting-model/components/system-setting.tsx
++++ b/web/src/pages/user-setting/setting-model/components/system-setting.tsx
+@@ -9,8 +9,8 @@ import {
+   useSetDefaultModel,
+ } from '@/hooks/use-llm-request';
+ import { parseModelValue } from '@/utils/llm-util';
+-import { CircleQuestionMark } from 'lucide-react';
+-import { useCallback, useMemo } from 'react';
++import { CircleQuestionMark, Loader2 } from 'lucide-react';
++import { useCallback, useEffect, useMemo, useState } from 'react';
+ 
+ interface ModelFieldItemProps {
+   id: string;
+@@ -19,6 +19,9 @@ interface ModelFieldItemProps {
+   tooltip?: string;
+   isRequired?: boolean;
++  isSwitching?: boolean;
++  isCurrentSwitch?: boolean;
++  switchingElapsed?: number;
+   onChange: (id: string, value: string) => void;
+ }
+@@ -29,6 +32,9 @@ function ModelFieldItem({
+   id,
+   isRequired,
++  isSwitching = false,
++  isCurrentSwitch = false,
++  switchingElapsed = 0,
+   onChange,
+ }: ModelFieldItemProps) {
+@@ -55,6 +61,17 @@ function ModelFieldItem({
+           showSearch
+           allowClear={id !== 'llm_id'}
++          disabled={isSwitching}
+         />
++        {isCurrentSwitch && (
++          <p
++            className="mt-2 flex items-center gap-1.5 text-xs text-text-secondary"
++            role="status"
++          >
++            <Loader2 className="size-3.5 animate-spin" />
++            正在切换并启动模型（已等待 {switchingElapsed} 秒）。首次加载可能需要几分钟，请勿关闭页面。
++          </p>
++        )}
+       </div>
+     </div>
+   );
+@@ -67,7 +84,24 @@ function SystemSetting() {
+   const { t } = useTranslate('setting');
+   const defaultModelDictionary = useFetchDefaultModelDictionary();
+-  const { setDefaultModel } = useSetDefaultModel();
++  const { setDefaultModel, loading: isSwitching } = useSetDefaultModel();
++  const [switchingField, setSwitchingField] = useState<string>();
++  const [switchStartedAt, setSwitchStartedAt] = useState<number>();
++  const [switchingElapsed, setSwitchingElapsed] = useState(0);
++
++  useEffect(() => {
++    if (!switchStartedAt) {
++      setSwitchingElapsed(0);
++      return;
++    }
++
++    const updateElapsed = () =>
++      setSwitchingElapsed(Math.floor((Date.now() - switchStartedAt) / 1000));
++    updateElapsed();
++    const timer = window.setInterval(updateElapsed, 1000);
++    return () => window.clearInterval(timer);
++  }, [switchStartedAt]);
+ 
+   const handleFieldChange = useCallback(
+     async (field: string, value: string) => {
+@@ -75,17 +109,28 @@ function SystemSetting() {
+       const modelType = FieldToModelType[field];
+       if (!modelType) return;
+ 
+-      if (!value) {
+-        await setDefaultModel({
+-          model_provider: '',
+-          model_instance: '',
+-          model_name: '',
+-          model_type: modelType,
+-        });
+-      } else {
+-        const parsed = parseModelValue(value);
+-        if (!parsed) return;
+-        await setDefaultModel({ ...parsed, model_type: modelType });
++      setSwitchingField(field);
++      setSwitchStartedAt(Date.now());
++      try {
++        if (!value) {
++          await setDefaultModel({
++            model_provider: '',
++            model_instance: '',
++            model_name: '',
++            model_type: modelType,
++          });
++        } else {
++          const parsed = parseModelValue(value);
++          if (!parsed) return;
++          await setDefaultModel({ ...parsed, model_type: modelType });
++        }
++      } finally {
++        setSwitchingField(undefined);
++        setSwitchStartedAt(undefined);
+       }
+     },
+     [setDefaultModel],
+@@ -156,6 +201,11 @@ function SystemSetting() {
+             {...item}
+             onChange={handleFieldChange}
++            isSwitching={isSwitching}
++            isCurrentSwitch={switchingField === item.id}
++            switchingElapsed={
++              switchingField === item.id ? switchingElapsed : 0
++            }
+           />
+         ))}
+       </div>
+diff --git a/web/src/hooks/use-llm-request.tsx b/web/src/hooks/use-llm-request.tsx
+--- a/web/src/hooks/use-llm-request.tsx
++++ b/web/src/hooks/use-llm-request.tsx
+@@ -489,6 +489,9 @@ export const useSetDefaultModel = () => {
+ 
+   const { isPending: loading, mutateAsync } = useMutation({
+     mutationKey: [LLMApiAction.SetDefaultModel],
++    onError: () => {
++      message.error('切换模型失败，请检查本地运行时状态后重试。');
++    },
+     mutationFn: async (params: ISetDefaultModelRequestBody) => {
