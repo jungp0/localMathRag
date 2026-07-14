@@ -8,6 +8,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+PATCH_ONLY = os.environ.get("LOCALMATHRAG_TEST_PATCH_ONLY") == "1"
 
 
 def read_text(path: Path) -> str:
@@ -28,14 +29,14 @@ def patched_file_text(patch: str) -> str:
 
 def read_ragflow_source_or_patch(relative_path: str, patch: str) -> str:
     source_path = ROOT / "third_party" / "ragflow" / relative_path
-    if source_path.exists():
+    if source_path.exists() and not PATCH_ONLY:
         return read_text(source_path)
     return patched_file_text(patch)
 
 
 def read_ragflow_source_or_patches(relative_path: str, patches: list[str]) -> str:
     source_path = ROOT / "third_party" / "ragflow" / relative_path
-    if source_path.exists():
+    if source_path.exists() and not PATCH_ONLY:
         return read_text(source_path)
     return "\n".join(patched_file_text(patch) for patch in patches)
 
@@ -506,9 +507,12 @@ def test_model_switch_has_visible_progress_feedback() -> None:
     assert "role=\"status\"" in setting
     assert "switchingElapsed" in setting
     assert "setInterval(updateElapsed, 1000)" in setting
-    request = read_ragflow_source_or_patch(
+    request = read_ragflow_source_or_patches(
         "web/src/hooks/use-llm-request.tsx",
-        read_text(ROOT / "patches" / "ragflow" / "0033-localmathrag-model-switch-progress-feedback.patch"),
+        [
+            read_text(ROOT / "patches" / "ragflow" / "0033-localmathrag-model-switch-progress-feedback.patch"),
+            read_text(ROOT / "patches" / "ragflow" / "0035-localmathrag-model-switch-readable-error.patch"),
+        ],
     )
     assert "onError: () =>" in request
     assert "切换模型失败" in request
@@ -572,9 +576,19 @@ def test_ragflow_vision_enhancement_is_opt_in_for_parsing() -> None:
 
 def test_vlm_model_uses_its_selected_capabilities_without_syncing_defaults() -> None:
     service = read_text(ROOT / "services" / "object_service" / "main.py")
-    model_service = read_ragflow_source_or_patch(
+    model_service = read_ragflow_source_or_patches(
         "api/apps/services/models_api_service.py",
-        read_text(ROOT / "patches" / "ragflow" / "0030-localmathrag-model-capability-validation.patch"),
+        [
+            read_text(ROOT / "patches" / "ragflow" / name)
+            for name in (
+                "0011-localmathrag-runtime-model-switch.patch",
+                "0028-localmathrag-shared-vlm-runtime.patch",
+                "0029-localmathrag-vlm-chat-model-compatibility.patch",
+                "0030-localmathrag-model-capability-validation.patch",
+                "0032-localmathrag-runtime-switch-resource-error.patch",
+                "0034-localmathrag-role-derived-runtime-scheduling.patch",
+            )
+        ],
     )
     un_add_model = read_ragflow_source_or_patch(
         "web/src/pages/user-setting/setting-model/components/un-add-model.tsx",
@@ -694,7 +708,15 @@ def test_ragflow_docx_equation_editor_formulas_keep_paragraph_context() -> None:
     patch = read_text(ROOT / "patches" / "ragflow" / "0036-localmathrag-docx-formula-context.patch")
     naive = read_ragflow_source_or_patch("rag/app/naive.py", patch)
     nlp = read_ragflow_source_or_patch("rag/nlp/__init__.py", patch)
-    figure_parser = read_ragflow_source_or_patch("deepdoc/parser/figure_parser.py", patch)
+    figure_parser = read_ragflow_source_or_patches(
+        "deepdoc/parser/figure_parser.py",
+        [
+            patch,
+            read_text(ROOT / "patches" / "ragflow" / "0038-localmathrag-per-formula-ocr.patch"),
+            read_text(ROOT / "patches" / "ragflow" / "0039-localmathrag-equation-editor-ocr-quality-gate.patch"),
+            read_text(ROOT / "patches" / "ragflow" / "0040-localmathrag-equation-native-mtef.patch"),
+        ],
+    )
 
     assert "def __equation_editor_sources" in naive
     assert 'self.__local_name(element) != "OLEObject"' in naive
@@ -867,7 +889,14 @@ def test_parallel_document_toc_is_bounded_and_optional() -> None:
 
 def test_expired_executor_pending_tasks_are_requeued() -> None:
     patch = read_text(ROOT / "patches" / "ragflow" / "0043-localmathrag-requeue-expired-executor-tasks.patch")
-    executor = read_ragflow_source_or_patch("rag/svr/task_executor.py", patch)
+    executor = read_ragflow_source_or_patches(
+        "rag/svr/task_executor.py",
+        [
+            patch,
+            read_text(ROOT / "patches" / "ragflow" / "0051-localmathrag-migrate-legacy-parse-queue.patch"),
+            read_text(ROOT / "patches" / "ragflow" / "0052-localmathrag-fix-orphan-consumer-scan.patch"),
+        ],
+    )
 
     assert "def requeue_expired_worker_tasks" in executor
     assert "xpending_range(" in executor
@@ -1035,14 +1064,27 @@ def test_auxiliary_indexes_are_queued_below_document_parsing_and_release_on_canc
     recovery_patch = read_text(ROOT / "patches" / "ragflow" / "0052-localmathrag-fix-orphan-consumer-scan.patch")
     deferred_retry_patch = read_text(ROOT / "patches" / "ragflow" / "0054-localmathrag-deferred-auxiliary-retry.patch")
     stale_cleanup_patch = read_text(ROOT / "patches" / "ragflow" / "0055-localmathrag-clear-stale-auxiliary-tasks.patch")
+    restart_cleanup_patch = read_text(ROOT / "patches" / "ragflow" / "0057-localmathrag-restart-clears-prior-index-task.patch")
+    stale_lock_patch = read_text(ROOT / "patches" / "ragflow" / "0059-localmathrag-release-stale-graphrag-locks.patch")
     scoped_cleanup_patch = read_text(ROOT / "patches" / "ragflow" / "0062-localmathrag-scope-auxiliary-cleanup-by-task-type.patch")
-    patches = [patch, cancellation_patch, migration_patch, recovery_patch, deferred_retry_patch, stale_cleanup_patch, scoped_cleanup_patch]
+    patches = [
+        patch,
+        cancellation_patch,
+        migration_patch,
+        recovery_patch,
+        deferred_retry_patch,
+        stale_cleanup_patch,
+        restart_cleanup_patch,
+        stale_lock_patch,
+        scoped_cleanup_patch,
+    ]
     priority_queue = read_ragflow_source_or_patches("rag/svr/localmathrag_priority_queue.py", patches)
     task_service = read_ragflow_source_or_patches("api/db/services/task_service.py", [patch, deferred_retry_patch])
     document_service = read_ragflow_source_or_patch("api/db/services/document_service.py", patch)
     executor = read_ragflow_source_or_patches("rag/svr/task_executor.py", patches)
     dataset_service = read_ragflow_source_or_patches(
-        "api/apps/services/dataset_api_service.py", [stale_cleanup_patch, scoped_cleanup_patch]
+        "api/apps/services/dataset_api_service.py",
+        [stale_cleanup_patch, restart_cleanup_patch, stale_lock_patch, scoped_cleanup_patch],
     )
     task_api = read_ragflow_source_or_patch("api/apps/restful_apis/task_api.py", stale_cleanup_patch)
     compose = read_text(ROOT / "docker" / "docker-compose.localmathrag.yml")
@@ -1081,12 +1123,32 @@ def test_auxiliary_indexes_are_queued_below_document_parsing_and_release_on_canc
     assert "release_auxiliary_index_lease(auxiliary_lease)" in executor
     assert "lease_heartbeat.cancel()" in executor
     assert "await asyncio.gather(lease_heartbeat, return_exceptions=True)" in executor
-    canceled_check = executor.index("if not task or canceled:")
-    lease_acquire = executor.index('acquire_auxiliary_index_lease(task["id"])')
-    admitted_attempt = executor.index('admitted_task = TaskService.get_task(msg["id"], msg.get("doc_ids", []))')
-    lease_release = executor.index("release_auxiliary_index_lease(auxiliary_lease)")
-    message_ack = executor.index("redis_msg.ack()", lease_release)
-    assert canceled_check < lease_acquire < admitted_attempt < lease_release < message_ack
+    if PATCH_ONLY:
+        task_type_insert = deferred_retry_patch.index('+    task_type = msg.get("task_type", "")')
+        canceled_context = deferred_retry_patch.index("     if task:")
+        auxiliary_context = deferred_retry_patch.index("     if task_type in AUXILIARY_INDEX_TASK_TYPES:")
+        admitted_context = deferred_retry_patch.index("+        admitted_task = TaskService.get_task")
+        assert task_type_insert < canceled_context < auxiliary_context < admitted_context
+
+        heartbeat_cancel = cancellation_patch.index("+            lease_heartbeat.cancel()")
+        heartbeat_wait = cancellation_patch.index(
+            "+            await asyncio.gather(lease_heartbeat, return_exceptions=True)"
+        )
+        lease_pop = cancellation_patch.index("         auxiliary_lease = task.pop")
+        lease_release_context = cancellation_patch.index(
+            "         if auxiliary_lease and not release_auxiliary_index_lease"
+        )
+        assert heartbeat_cancel < heartbeat_wait < lease_pop < lease_release_context
+        assert "+            redis_msg.ack()" in deferred_retry_patch
+    else:
+        canceled_check = executor.index("if not task or canceled:")
+        lease_acquire = executor.index('acquire_auxiliary_index_lease(task["id"])')
+        admitted_attempt = executor.index(
+            'admitted_task = TaskService.get_task(msg["id"], msg.get("doc_ids", []))'
+        )
+        lease_release = executor.index("release_auxiliary_index_lease(auxiliary_lease)")
+        message_ack = executor.index("redis_msg.ack()", lease_release)
+        assert canceled_check < lease_acquire < admitted_attempt < lease_release < message_ack
     assert "stale_task_ids = remove_stale_auxiliary_index_messages(" in dataset_service
     assert "doc_ids=set(document_ids)" in dataset_service
     assert "task_types={task_type}" in dataset_service
@@ -1114,8 +1176,17 @@ def test_auxiliary_indexes_are_queued_below_document_parsing_and_release_on_canc
 
 def test_graphrag_adaptive_execution_contract() -> None:
     patch = read_text(ROOT / "patches" / "ragflow" / "0056-localmathrag-adaptive-graphrag-execution.patch")
+    merge_watchdog_patch = read_text(
+        ROOT / "patches" / "ragflow" / "0058-localmathrag-adaptive-graphrag-merge-watchdog.patch"
+    )
+    postprocessing_watchdog_patch = read_text(
+        ROOT / "patches" / "ragflow" / "0060-localmathrag-adaptive-graphrag-postprocessing-watchdog.patch"
+    )
     adaptive = read_ragflow_source_or_patch("rag/graphrag/adaptive.py", patch)
-    index = read_ragflow_source_or_patch("rag/graphrag/general/index.py", patch)
+    index = read_ragflow_source_or_patches(
+        "rag/graphrag/general/index.py",
+        [patch, merge_watchdog_patch, postprocessing_watchdog_patch],
+    )
     extractor = read_ragflow_source_or_patch("rag/graphrag/general/extractor.py", patch)
     light_extractor = read_ragflow_source_or_patch("rag/graphrag/light/graph_extractor.py", patch)
     task_executor = read_ragflow_source_or_patch("rag/svr/task_executor.py", patch)
@@ -1213,7 +1284,7 @@ def test_ragflow_math_ocr_recommended_install_ui_contract() -> None:
     )
     un_add_model = read_ragflow_source_or_patch(
         "web/src/pages/user-setting/setting-model/components/un-add-model.tsx",
-        dropdown_patch + "\n" + auto_register_patch,
+        patch + "\n" + dropdown_patch + "\n" + auto_register_patch,
     )
     model_settings = read_ragflow_source_or_patch(
         "web/src/pages/user-setting/setting-model/index.tsx", auto_register_patch
@@ -1253,7 +1324,8 @@ def test_ragflow_math_ocr_default_setting_ui_contract() -> None:
     assert "Formula OCR" in patch
     assert "ocr_id" in patch
     assert "ocr_id" in system_setting
-    assert "ModelTreeSelect" in system_setting
+    if not PATCH_ONLY:
+        assert "ModelTreeSelect" in system_setting
     assert "math-ocr-default-setting" not in system_setting
     assert "/v1/math-ocr/config" not in system_setting
     assert "ocr_id: ['ocr']" in model_tree_select
