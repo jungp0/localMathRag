@@ -1,7 +1,12 @@
 diff --git a/web/src/components/llm-select/llm-label.tsx b/web/src/components/llm-select/llm-label.tsx
 --- a/web/src/components/llm-select/llm-label.tsx
 +++ b/web/src/components/llm-select/llm-label.tsx
-@@ -10,7 +10,8 @@ export const LLMLabel = ({ value }: IProps) => {
+@@ -5,29 +5,36 @@ import { LlmIcon } from '../svg-icon';
+ interface IProps {
+   value?: string;
+ }
+ 
+ export const LLMLabel = ({ value }: IProps) => {
    const parsed = value ? parseModelValue(value) : null;
    const modelName = parsed?.model_name;
    const instanceName = parsed?.model_instance;
@@ -14,7 +19,12 @@ diff --git a/web/src/components/llm-select/llm-label.tsx b/web/src/components/ll
 +      : modelName;
  
    if (!modelName) return null;
-@@ -23,7 +24,9 @@ export const LLMLabel = ({ value }: IProps) => {
+ 
+   return (
+     <div className="flex items-center gap-1.5 min-w-0">
+       <LlmIcon
+         name={iconName}
+         width={22}
          height={22}
          imgClass="size-[22px] flex-shrink-0"
        />
@@ -23,10 +33,23 @@ diff --git a/web/src/components/llm-select/llm-label.tsx b/web/src/components/ll
 +        {displayName}
 +      </span>
        {instanceName && (
+         <span className="text-slate-400 truncate flex-shrink-0">
+           {instanceName}
+         </span>
+       )}
+     </div>
+   );
+ };
 diff --git a/web/src/components/model-tree-select.tsx b/web/src/components/model-tree-select.tsx
 --- a/web/src/components/model-tree-select.tsx
 +++ b/web/src/components/model-tree-select.tsx
-@@ -61,6 +61,7 @@ export function buildModelTree(
+@@ -57,31 +57,35 @@ export function buildModelTree(
+   return Array.from(providerMap.entries()).map(([provider, instances]) => ({
+     id: provider,
+     title: provider,
+     children: Array.from(instances.entries()).map(([instance, models]) => ({
+       id: `${provider}||${instance}`,
+       title: instance,
        children: models.reduce<TreeSelectNode[]>((acc, m) => {
          const modelName = getRealModelName(m.name);
 +        const displayName =
@@ -34,7 +57,6 @@ diff --git a/web/src/components/model-tree-select.tsx b/web/src/components/model
 +            ? modelName
 +            : `${m.provider_name}/${modelName}`;
          const id = `${modelName}@${m.instance_name}@${m.provider_name}`;
-@@ -69,7 +70,7 @@ export function buildModelTree(
          if (seenLeafIds.has(id)) return acc;
          seenLeafIds.add(id);
          const leafNode: TreeSelectNode = {
@@ -42,10 +64,20 @@ diff --git a/web/src/components/model-tree-select.tsx b/web/src/components/model
 -          title: modelName,
 +          title: displayName,
            label: (
-@@ -80,7 +81,7 @@ export function buildModelTree(
+             <span className="flex items-center gap-1.5 truncate">
+               <LlmIcon
+                 name={m.provider_name}
+                 width={22}
                  height={22}
                  imgClass="size-[22px] flex-shrink-0"
                />
 -              <span className="truncate">{modelName}</span>
 +              <span className="truncate">{displayName}</span>
              </span>
+           ),
+           data: {
+             provider_name: m.provider_name,
+             instance_name: m.instance_name,
+             model_name: modelName,
+           },
+         };

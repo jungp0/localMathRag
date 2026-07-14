@@ -481,17 +481,19 @@ def test_local_model_configuration_uses_provider_facing_name() -> None:
 
 
 def test_model_labels_include_provider_without_changing_model_identity() -> None:
+    patch = read_text(ROOT / "patches" / "ragflow" / "0031-localmathrag-model-display-provider.patch")
     label = read_ragflow_source_or_patch(
         "web/src/components/llm-select/llm-label.tsx",
-        read_text(ROOT / "patches" / "ragflow" / "0031-localmathrag-model-display-provider.patch"),
+        patch,
     )
     tree = read_ragflow_source_or_patch(
         "web/src/components/model-tree-select.tsx",
-        read_text(ROOT / "patches" / "ragflow" / "0031-localmathrag-model-display-provider.patch"),
+        patch,
     )
     assert "providerName !== 'OpenAI-API-Compatible'" in label
     assert "m.provider_name === 'OpenAI-API-Compatible'" in tree
     assert "model_name: modelName" in tree
+    assert "model_name: modelName" in patched_file_text(patch)
 
 
 def test_model_switch_has_visible_progress_feedback() -> None:
